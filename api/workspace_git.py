@@ -81,7 +81,10 @@ def _workspace_pathspec(ctx: GitContext) -> str:
 
 
 def _repo_rel(ctx: GitContext, workspace_rel: str) -> str:
-    target = safe_resolve_ws(ctx.workspace, workspace_rel or ".")
+    try:
+        target = safe_resolve_ws(ctx.workspace, workspace_rel or ".")
+    except ValueError as exc:
+        raise GitWorkspaceError(str(exc)) from exc
     try:
         repo_rel = target.relative_to(ctx.repo_root).as_posix()
     except ValueError as exc:
@@ -146,8 +149,30 @@ def _parse_numstat(text: str, ctx: GitContext) -> dict[str, tuple[int, int, bool
     return stats
 
 
+def _parse_path_list(text: str, ctx: GitContext) -> set[str]:
+    paths: set[str] = set()
+    for raw_path in text.split("\0"):
+        if not raw_path:
+            continue
+        workspace_path = _workspace_rel(ctx, raw_path)
+        if workspace_path is not None:
+            paths.add(workspace_path)
+    return paths
+
+
+def _collect_diff_paths(ctx: GitContext, cached: bool) -> set[str] | None:
+    args = ["diff", "--name-only", "-z", "--ignore-cr-at-eol"]
+    if cached:
+        args.append("--cached")
+    args.extend(["--", _workspace_pathspec(ctx)])
+    result = _run_git(ctx, args, check=False)
+    if result.returncode != 0:
+        return None
+    return _parse_path_list(result.stdout, ctx)
+
+
 def _collect_numstat(ctx: GitContext, cached: bool) -> dict[str, tuple[int, int, bool]]:
-    args = ["diff", "--numstat"]
+    args = ["diff", "--numstat", "--ignore-cr-at-eol"]
     if cached:
         args.append("--cached")
     args.extend(["--", _workspace_pathspec(ctx)])
@@ -196,6 +221,8 @@ def git_status(workspace: str | Path) -> dict:
     )
     staged_stats = _collect_numstat(ctx, cached=True)
     unstaged_stats = _collect_numstat(ctx, cached=False)
+    staged_diff_paths = _collect_diff_paths(ctx, cached=True)
+    unstaged_diff_paths = _collect_diff_paths(ctx, cached=False)
 
     branch = ""
     upstream = ""
@@ -275,13 +302,26 @@ def git_status(workspace: str | Path) -> dict:
         if untracked:
             additions, deletions, binary = _count_untracked_file(ctx.workspace / workspace_path)
 
+        staged = (x not in {".", "?"}) and not untracked
+        unstaged = (y not in {".", " "}) and not untracked
+        if staged and staged_diff_paths is not None and not renamed:
+            staged = workspace_path in staged_diff_paths or (
+                old_workspace_path is not None and old_workspace_path in staged_diff_paths
+            )
+        if unstaged and unstaged_diff_paths is not None and not renamed:
+            unstaged = workspace_path in unstaged_diff_paths or (
+                old_workspace_path is not None and old_workspace_path in unstaged_diff_paths
+            )
+        if not (staged or unstaged or untracked or conflict or renamed):
+            continue
+
         files[workspace_path] = {
             "path": workspace_path,
             "old_path": old_workspace_path,
             "workspace_path": workspace_path,
             "status": _status_code(xy, untracked=untracked, renamed=renamed),
-            "staged": (x not in {".", "?"}) and not untracked,
-            "unstaged": (y not in {".", " "}) and not untracked,
+            "staged": staged,
+            "unstaged": unstaged,
             "untracked": untracked,
             "conflict": conflict,
             "additions": additions,

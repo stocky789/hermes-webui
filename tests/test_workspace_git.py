@@ -110,6 +110,40 @@ def test_git_status_handles_staged_unstaged_untracked_deleted_and_renamed(tmp_pa
     assert status["totals"]["changed"] >= 5
 
 
+def test_git_status_ignores_crlf_only_worktree_noise(tmp_path):
+    from api.workspace_git import git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8", newline="\n")
+    _commit_all(repo)
+
+    (repo / "tracked.txt").write_text("one\r\ntwo\r\n", encoding="utf-8", newline="")
+
+    raw = _git(repo, "status", "--porcelain", "--", "tracked.txt")
+    assert raw.startswith(" M")
+
+    status = git_status(repo)
+    assert status["totals"]["changed"] == 0
+    assert status["files"] == []
+
+
+def test_git_status_keeps_real_edit_with_crlf_endings(tmp_path):
+    from api.workspace_git import git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8", newline="\n")
+    _commit_all(repo)
+
+    (repo / "tracked.txt").write_text("one\r\ntwo\r\nthree\r\n", encoding="utf-8", newline="")
+
+    status = git_status(repo)
+    by_path = {item["path"]: item for item in status["files"]}
+    assert status["totals"]["changed"] == 1
+    assert by_path["tracked.txt"]["unstaged"] is True
+    assert by_path["tracked.txt"]["additions"] == 1
+    assert by_path["tracked.txt"]["deletions"] == 0
+
+
 def test_git_status_scopes_nested_workspace_to_that_directory(tmp_path):
     from api.workspace_git import git_status
 
@@ -271,6 +305,7 @@ def test_workspace_git_static_contracts():
         "openGitDiff",
         "renderGitDiff",
         "stageGitPath",
+        "stageGitAllChanges",
         "unstageGitPath",
         "discardGitPath",
         "commitGitChanges",
@@ -284,8 +319,11 @@ def test_workspace_git_static_contracts():
     assert "showConfirmDialog" in discard_body
     assert "confirm(" not in discard_body.replace("showConfirmDialog(", "")
     assert "file-git-status" in ui_js
-    for cls in [".workspace-tabs", ".git-change-row", ".git-diff-line", ".git-commit-box"]:
+    assert "_gitStageableFiles" in workspace_js
+    assert "git-stat-add" in workspace_js and "git-stat-del" in workspace_js
+    for cls in [".workspace-tabs", ".git-change-row", ".git-diff-line", ".git-commit-box", ".git-stage-all-btn"]:
         assert cls in style
+    assert ".git-stat-add" in style and ".git-stat-del" in style
 
     for token in [
         'data-i18n="git_files"',
@@ -296,5 +334,5 @@ def test_workspace_git_static_contracts():
         assert token in index
 
     i18n = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
-    for key in ["git_files", "git_changes", "git_commit_message", "git_delete_untracked_confirm"]:
+    for key in ["git_files", "git_changes", "git_stage_all", "git_commit_message", "git_delete_untracked_confirm"]:
         assert i18n.count(f"{key}:") >= 11

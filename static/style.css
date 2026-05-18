@@ -1472,7 +1472,7 @@
   .workspace-tab.active{background:var(--accent-bg);border-color:var(--accent-bg-strong,var(--border2));color:var(--accent-text);}
   .git-changes-view{display:flex;flex:1;min-height:0;flex-direction:column;gap:10px;padding:10px;overflow:hidden;}
   .git-changes-list{display:flex;flex:1;min-height:0;flex-direction:column;gap:10px;overflow:auto;}
-  .git-summary{font-family:"SF Mono",ui-monospace,monospace;font-size:11px;color:var(--muted);padding:4px 2px;}
+  .git-summary{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:"SF Mono",ui-monospace,monospace;font-size:11px;color:var(--muted);padding:4px 2px;}
   .git-change-group{display:flex;flex-direction:column;gap:3px;}
   .git-change-group-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:2px 2px 4px;}
   .git-change-row{display:grid;grid-template-columns:30px minmax(0,1fr) auto auto;align-items:center;gap:7px;min-height:34px;padding:5px 6px;border-radius:6px;color:var(--text);cursor:pointer;}
@@ -1481,10 +1481,13 @@
   .git-change-status{justify-self:center;}
   .git-change-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;}
   .git-change-stats{font-family:"SF Mono",ui-monospace,monospace;font-size:10px;color:var(--muted);white-space:nowrap;}
+  .git-stat-add{color:var(--success,#86C08B);}
+  .git-stat-del{color:var(--error,#F87171);}
   .git-change-actions,.git-diff-actions{display:flex;align-items:center;gap:5px;}
   .mini-btn{height:24px;padding:0 7px;border:1px solid var(--border2);border-radius:5px;background:transparent;color:var(--muted);font-size:11px;font-weight:600;cursor:pointer;}
   .mini-btn:hover{background:var(--hover-bg);color:var(--text);}
   .mini-btn.danger{color:var(--error);}
+  .git-stage-all-btn{flex:0 0 auto;color:var(--text);}
   .git-empty{padding:18px 10px;color:var(--muted);font-size:12px;text-align:center;line-height:1.45;}
   .git-empty.error{color:var(--error);}
   .git-commit-box{display:none;flex-direction:column;gap:7px;border-top:1px solid var(--border);padding-top:10px;flex-shrink:0;}

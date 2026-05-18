@@ -205,6 +205,27 @@ function _gitGroupFiles(kind){
   });
 }
 
+function _gitStageableFiles(){
+  return _gitFiles().filter(f=>!f.conflict&&(f.unstaged||f.untracked));
+}
+
+function _gitStatsEl(file){
+  const stats=document.createElement('span');
+  stats.className='git-change-stats';
+  if(file.binary){
+    stats.textContent=t('git_binary_file');
+    return stats;
+  }
+  const additions=document.createElement('span');
+  additions.className='git-stat-add';
+  additions.textContent=`+${file.additions||0}`;
+  const deletions=document.createElement('span');
+  deletions.className='git-stat-del';
+  deletions.textContent=`-${file.deletions||0}`;
+  stats.append(additions,' ',deletions);
+  return stats;
+}
+
 function _gitChangeRow(file, kind){
   const row=document.createElement('div');
   row.className='git-change-row';
@@ -219,10 +240,7 @@ function _gitChangeRow(file, kind){
   name.className='git-change-path';
   name.textContent=file.old_path?`${file.old_path} \u2192 ${file.path}`:file.path;
   row.appendChild(name);
-  const stats=document.createElement('span');
-  stats.className='git-change-stats';
-  stats.textContent=file.binary?t('git_binary_file'):`+${file.additions||0} -${file.deletions||0}`;
-  row.appendChild(stats);
+  row.appendChild(_gitStatsEl(file));
   const actions=document.createElement('span');
   actions.className='git-change-actions';
   if(kind==='staged'){
@@ -272,7 +290,18 @@ function renderGitChanges(){
   const summary=document.createElement('div');
   summary.className='git-summary';
   const totals=status.totals||{};
-  summary.textContent=[status.branch||'HEAD',status.upstream,`${totals.changed||0} ${t('git_changed')}`,status.ahead?`\u2191${status.ahead}`:'',status.behind?`\u2193${status.behind}`:''].filter(Boolean).join(' \u00b7 ');
+  const summaryText=document.createElement('span');
+  summaryText.textContent=[status.branch||'HEAD',status.upstream,`${totals.changed||0} ${t('git_changed')}`,status.ahead?`\u2191${status.ahead}`:'',status.behind?`\u2193${status.behind}`:''].filter(Boolean).join(' \u00b7 ');
+  summary.appendChild(summaryText);
+  const stageable=_gitStageableFiles();
+  if(stageable.length){
+    const stageAll=document.createElement('button');
+    stageAll.className='mini-btn git-stage-all-btn';
+    stageAll.type='button';
+    stageAll.textContent=t('git_stage_all')||'Stage all';
+    stageAll.onclick=()=>stageGitAllChanges();
+    summary.appendChild(stageAll);
+  }
   list.appendChild(summary);
   const groups=[
     ['conflicts',t('git_conflicts')],
@@ -669,6 +698,18 @@ async function stageGitPath(path){
     S.git.status=data.git;
     renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
     if(S.git.selectedDiff&&S.git.selectedDiff.path===path)openGitDiff(path,'staged');
+  }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
+}
+
+async function stageGitAllChanges(){
+  if(!S.session)return;
+  const paths=_gitStageableFiles().map(f=>f.path);
+  if(!paths.length)return;
+  try{
+    const data=await api('/api/git/stage',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths})});
+    S.git.status=data.git;
+    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    if(S.git.selectedDiff&&paths.includes(S.git.selectedDiff.path))openGitDiff(S.git.selectedDiff.path,'staged');
   }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
 }
 
