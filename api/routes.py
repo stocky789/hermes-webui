@@ -4012,6 +4012,12 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/list":
         return _handle_list_dir(handler, parsed)
 
+    if parsed.path == "/api/git/status":
+        return _handle_git_status(handler, parsed)
+
+    if parsed.path == "/api/git/diff":
+        return _handle_git_diff(handler, parsed)
+
     if parsed.path == "/api/personalities":
         # Read personalities from config.yaml agent.personalities section
         # (matches hermes-agent CLI behavior, not filesystem SOUL.md approach)
@@ -5176,6 +5182,19 @@ def handle_post(handler, parsed) -> bool:
 
         with cron_profile_context():
             return _handle_cron_resume(handler, body)
+
+    # ── Git workspace ops (POST) ──
+    if parsed.path == "/api/git/stage":
+        return _handle_git_stage(handler, body)
+
+    if parsed.path == "/api/git/unstage":
+        return _handle_git_unstage(handler, body)
+
+    if parsed.path == "/api/git/discard":
+        return _handle_git_discard(handler, body)
+
+    if parsed.path == "/api/git/commit":
+        return _handle_git_commit(handler, body)
 
     # ── File ops (POST) ──
     if parsed.path == "/api/file/delete":
@@ -8350,6 +8369,132 @@ def _handle_cron_resume(handler, body):
     if result:
         return j(handler, {"ok": True, "job": result})
     return bad(handler, "Job not found", 404)
+
+
+def _git_session_workspace(handler, session_id: str):
+    if not session_id:
+        bad(handler, "session_id required")
+        return None
+    try:
+        s = get_session(session_id)
+    except KeyError:
+        bad(handler, "Session not found", 404)
+        return None
+    return Path(s.workspace)
+
+
+def _handle_git_status(handler, parsed):
+    qs = parse_qs(parsed.query)
+    workspace = _git_session_workspace(handler, qs.get("session_id", [""])[0])
+    if workspace is None:
+        return True
+    try:
+        from api.workspace_git import GitWorkspaceError, git_status
+
+        return j(handler, {"git": git_status(workspace)})
+    except GitWorkspaceError as e:
+        return bad(handler, _sanitize_error(e), 400)
+
+
+def _handle_git_diff(handler, parsed):
+    qs = parse_qs(parsed.query)
+    workspace = _git_session_workspace(handler, qs.get("session_id", [""])[0])
+    if workspace is None:
+        return True
+    path = qs.get("path", [""])[0]
+    kind = qs.get("kind", ["unstaged"])[0]
+    if not path:
+        return bad(handler, "path required")
+    try:
+        from api.workspace_git import GitWorkspaceError, git_diff
+
+        return j(handler, {"diff": git_diff(workspace, path, kind)})
+    except GitWorkspaceError as e:
+        return bad(handler, _sanitize_error(e), 400)
+
+
+def _git_paths_from_body(body) -> list[str]:
+    raw_paths = body.get("paths")
+    if raw_paths is None and body.get("path"):
+        raw_paths = [body.get("path")]
+    if isinstance(raw_paths, str):
+        raw_paths = [raw_paths]
+    if not isinstance(raw_paths, list):
+        raise ValueError("paths must be a list")
+    return [str(path) for path in raw_paths]
+
+
+def _handle_git_stage(handler, body):
+    try:
+        require(body, "session_id")
+        paths = _git_paths_from_body(body)
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_stage
+
+        return j(handler, {"ok": True, "git": git_stage(workspace, paths)})
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return bad(handler, _sanitize_error(e), 400)
+
+
+def _handle_git_unstage(handler, body):
+    try:
+        require(body, "session_id")
+        paths = _git_paths_from_body(body)
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_unstage
+
+        return j(handler, {"ok": True, "git": git_unstage(workspace, paths)})
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return bad(handler, _sanitize_error(e), 400)
+
+
+def _handle_git_discard(handler, body):
+    try:
+        require(body, "session_id")
+        paths = _git_paths_from_body(body)
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_discard
+
+        return j(
+            handler,
+            {
+                "ok": True,
+                "git": git_discard(
+                    workspace,
+                    paths,
+                    delete_untracked=bool(body.get("delete_untracked")),
+                ),
+            },
+        )
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return bad(handler, _sanitize_error(e), 400)
+
+
+def _handle_git_commit(handler, body):
+    try:
+        require(body, "session_id", "message")
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_commit
+
+        return j(handler, git_commit(workspace, body.get("message", "")))
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return bad(handler, _sanitize_error(e), 400)
 
 
 def _handle_file_delete(handler, body):

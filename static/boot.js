@@ -901,6 +901,8 @@ function clearPreview(opts={}){
   const pp=$('previewPathText');if(pp)pp.textContent='';
   const ft=$('fileTree');if(ft)ft.style.display='';
   _previewCurrentPath='';_previewCurrentMode='';_previewDirty=false;
+  if(S.git)S.git.selectedDiff=null;
+  if(typeof renderWorkspacePanelTabState==='function')renderWorkspacePanelTabState();
   if(closePanelAfter)closeWorkspacePanel();
   else if(keepPanelOpen&&_workspacePanelMode==='preview')openWorkspacePanel('browse');
   else syncWorkspacePanelUI();

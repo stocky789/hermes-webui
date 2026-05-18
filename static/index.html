@@ -1264,8 +1264,19 @@
         <button class="panel-icon-btn close-preview has-tooltip has-tooltip--bottom" id="btnClearPreview" data-tooltip="Close preview"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
       </div>
     </div>
+    <div class="workspace-tabs" id="workspaceGitTabs" hidden>
+      <button class="workspace-tab active" id="btnWorkspaceFilesTab" type="button" onclick="switchWorkspacePanelTab('files')" data-i18n="git_files">Files</button>
+      <button class="workspace-tab" id="btnWorkspaceChangesTab" type="button" onclick="switchWorkspacePanelTab('changes')" data-i18n="git_changes">Changes</button>
+    </div>
     <div class="breadcrumb-bar" id="breadcrumbBar" style="display:none"></div>
     <div class="file-tree" id="fileTree"></div>
+    <div class="git-changes-view" id="gitChangesView" style="display:none">
+      <div id="gitChangesList" class="git-changes-list"></div>
+      <div class="git-commit-box" id="gitCommitBox">
+        <textarea id="gitCommitMessage" rows="3" placeholder="Commit message" data-i18n-placeholder="git_commit_message"></textarea>
+        <button class="sm-btn" id="btnGitCommit" type="button" onclick="commitGitChanges()" data-i18n="git_commit">Commit</button>
+      </div>
+    </div>
     <div id="wsEmptyState" style="display:none;flex:1;align-items:center;justify-content:center;padding:24px 16px;text-align:center;color:var(--muted);font-size:12px;line-height:1.6"></div>
     <div class="preview-area" id="previewArea">
       <div class="preview-path" id="previewPath">
@@ -1285,6 +1296,7 @@
       <div class="preview-html-wrap" id="previewHtmlWrap" style="display:none;flex:1;border-radius:8px;overflow:hidden;border:1px solid var(--border2)">
         <iframe id="previewHtmlIframe" style="width:100%;height:100%;border:none;background:#fff" sandbox="allow-scripts" title="HTML preview"></iframe>
       </div>
+      <div class="git-diff-view" id="gitDiffView" style="display:none"></div>
       <textarea id="previewEditArea" style="display:none;flex:1;width:100%;background:var(--code-bg);color:var(--pre-text);border:1px solid var(--border2);border-radius:8px;padding:12px;font-family:'SF Mono',ui-monospace,monospace;font-size:12px;line-height:1.6;resize:none;outline:none" oninput="_previewDirty=true;updateEditBtn()"></textarea>
     </div>
   </aside>

@@ -90,30 +90,219 @@ async function loadDir(path){
         clearPreview({keepPanelOpen:true});
       }
     }
-    // Fetch git info for workspace root (non-blocking)
-    if(!path||path==='.') _refreshGitBadge();
+    // Fetch git status for workspace root (non-blocking)
+    if(!path||path==='.') refreshGitStatus();
   }catch(e){console.warn('loadDir',e);}
 }
 
 async function _refreshGitBadge(){
+  return refreshGitStatus();
+}
+
+function _ensureGitState(){
+  if(!S.git)S.git={status:null,selectedTab:'files',selectedDiff:null,loading:false};
+  return S.git;
+}
+
+function renderGitBadge(status){
   const badge=$('gitBadge');
-  if(!badge||!S.session)return;
+  const tabs=$('workspaceGitTabs');
+  if(!badge)return;
+  if(!status||!status.is_git){
+    badge.style.display='none';
+    badge.textContent='';
+    if(tabs)tabs.hidden=true;
+    return;
+  }
+  if(tabs)tabs.hidden=false;
+  const totals=status.totals||{};
+  let text=status.branch||'git';
+  if((totals.changed||0)>0) text+=` \u00b7 ${totals.changed}\u2206`;
+  if(status.behind>0) text+=` \u2193${status.behind}`;
+  if(status.ahead>0) text+=` \u2191${status.ahead}`;
+  badge.textContent=text;
+  badge.className='git-badge'+((totals.changed||0)>0?' dirty':'');
+  badge.style.display='';
+  const changesTab=$('btnWorkspaceChangesTab');
+  if(changesTab){
+    changesTab.textContent=(totals.changed||0)>0?`${t('git_changes')} ${totals.changed}`:t('git_changes');
+  }
+}
+
+async function refreshGitStatus(){
+  const git=_ensureGitState();
+  if(!S.session){
+    git.status=null;
+    git.selectedTab='files';
+    renderGitBadge(null);
+    renderWorkspacePanelTabState();
+    return null;
+  }
+  git.loading=true;
   try{
-    const data=await api(`/api/git-info?session_id=${encodeURIComponent(S.session.session_id)}`);
-    if(data.git&&data.git.is_git){
-      const g=data.git;
-      let text=g.branch||'git';
-      if(g.dirty>0) text+=` \u00b7 ${g.dirty}\u2206`; // middot + delta
-      if(g.behind>0) text+=` \u2193${g.behind}`;
-      if(g.ahead>0) text+=` \u2191${g.ahead}`;
-      badge.textContent=text;
-      badge.className='git-badge'+(g.dirty>0?' dirty':'');
-      badge.style.display='';
-    } else {
-      badge.style.display='none';
-      badge.textContent='';
-    }
-  }catch(e){badge.style.display='none';}
+    const data=await api(`/api/git/status?session_id=${encodeURIComponent(S.session.session_id)}`);
+    git.status=data.git||null;
+    if(!git.status||!git.status.is_git)git.selectedTab='files';
+    renderGitBadge(git.status);
+    renderGitChanges();
+    if(typeof renderFileTree==='function')renderFileTree();
+    return git.status;
+  }catch(e){
+    git.status=null;
+    git.selectedTab='files';
+    renderGitBadge(null);
+    renderGitChanges();
+    return null;
+  }finally{
+    git.loading=false;
+    renderWorkspacePanelTabState();
+  }
+}
+
+function renderWorkspacePanelTabState(){
+  const git=_ensureGitState();
+  const filesTab=$('btnWorkspaceFilesTab'), changesTab=$('btnWorkspaceChangesTab');
+  const changesView=$('gitChangesView'), fileTree=$('fileTree'), emptyEl=$('wsEmptyState');
+  const previewVisible=$('previewArea')&&$('previewArea').classList.contains('visible');
+  if(filesTab)filesTab.classList.toggle('active',git.selectedTab!=='changes');
+  if(changesTab)changesTab.classList.toggle('active',git.selectedTab==='changes');
+  if(git.selectedTab==='changes'){
+    if(fileTree)fileTree.style.display='none';
+    if(emptyEl)emptyEl.style.display='none';
+    if(changesView)changesView.style.display=previewVisible?'none':'flex';
+  }else{
+    if(changesView)changesView.style.display='none';
+    if(fileTree&&!previewVisible)fileTree.style.display='';
+  }
+}
+
+function switchWorkspacePanelTab(tab){
+  const git=_ensureGitState();
+  git.selectedTab=tab==='changes'?'changes':'files';
+  if(git.selectedTab==='changes'){
+    if($('previewArea'))$('previewArea').classList.remove('visible');
+    git.selectedDiff=null;
+    renderGitChanges();
+  }
+  renderWorkspacePanelTabState();
+}
+
+function _gitFiles(){
+  const status=_ensureGitState().status;
+  return (status&&Array.isArray(status.files))?status.files:[];
+}
+
+function _gitStatusForPath(path){
+  return _gitFiles().find(f=>f.path===path)||null;
+}
+
+function _gitGroupFiles(kind){
+  return _gitFiles().filter(f=>{
+    if(kind==='conflicts')return f.conflict;
+    if(kind==='staged')return f.staged&&!f.conflict;
+    if(kind==='untracked')return f.untracked&&!f.conflict;
+    return (f.unstaged&&!f.untracked&&!f.conflict);
+  });
+}
+
+function _gitChangeRow(file, kind){
+  const row=document.createElement('div');
+  row.className='git-change-row';
+  row.tabIndex=0;
+  row.onclick=()=>openGitDiff(file.path,kind==='staged'?'staged':'unstaged');
+  row.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();row.click();}};
+  const status=document.createElement('span');
+  status.className='git-change-status';
+  status.textContent=file.status||'M';
+  row.appendChild(status);
+  const name=document.createElement('span');
+  name.className='git-change-path';
+  name.textContent=file.old_path?`${file.old_path} \u2192 ${file.path}`:file.path;
+  row.appendChild(name);
+  const stats=document.createElement('span');
+  stats.className='git-change-stats';
+  stats.textContent=file.binary?t('git_binary_file'):`+${file.additions||0} -${file.deletions||0}`;
+  row.appendChild(stats);
+  const actions=document.createElement('span');
+  actions.className='git-change-actions';
+  if(kind==='staged'){
+    const unstage=document.createElement('button');
+    unstage.className='mini-btn';
+    unstage.textContent=t('git_unstage');
+    unstage.onclick=e=>{e.stopPropagation();unstageGitPath(file.path);};
+    actions.appendChild(unstage);
+  }else if(kind==='conflicts'){
+    const open=document.createElement('button');
+    open.className='mini-btn';
+    open.textContent=t('open');
+    open.onclick=e=>{e.stopPropagation();openFile(file.path);};
+    actions.appendChild(open);
+  }else{
+    const stage=document.createElement('button');
+    stage.className='mini-btn';
+    stage.textContent=t('git_stage');
+    stage.onclick=e=>{e.stopPropagation();stageGitPath(file.path);};
+    actions.appendChild(stage);
+    const discard=document.createElement('button');
+    discard.className='mini-btn danger';
+    discard.textContent=file.untracked?t('delete_title'):t('git_discard');
+    discard.onclick=e=>{e.stopPropagation();discardGitPath(file.path,{untracked:!!file.untracked});};
+    actions.appendChild(discard);
+  }
+  row.appendChild(actions);
+  return row;
+}
+
+function renderGitChanges(){
+  const list=$('gitChangesList');
+  const commitBox=$('gitCommitBox');
+  const commitBtn=$('btnGitCommit');
+  if(!list)return;
+  list.innerHTML='';
+  const status=_ensureGitState().status;
+  if(!status||!status.is_git){
+    const empty=document.createElement('div');
+    empty.className='git-empty';
+    empty.textContent=t('git_not_repo');
+    list.appendChild(empty);
+    if(commitBox)commitBox.style.display='none';
+    renderWorkspacePanelTabState();
+    return;
+  }
+  const summary=document.createElement('div');
+  summary.className='git-summary';
+  const totals=status.totals||{};
+  summary.textContent=[status.branch||'HEAD',status.upstream,`${totals.changed||0} ${t('git_changed')}`,status.ahead?`\u2191${status.ahead}`:'',status.behind?`\u2193${status.behind}`:''].filter(Boolean).join(' \u00b7 ');
+  list.appendChild(summary);
+  const groups=[
+    ['conflicts',t('git_conflicts')],
+    ['staged',t('git_staged')],
+    ['unstaged',t('git_unstaged')],
+    ['untracked',t('git_untracked')],
+  ];
+  let rendered=0;
+  for(const [kind,label] of groups){
+    const files=_gitGroupFiles(kind);
+    if(!files.length)continue;
+    const group=document.createElement('section');
+    group.className='git-change-group';
+    const header=document.createElement('div');
+    header.className='git-change-group-title';
+    header.textContent=label;
+    group.appendChild(header);
+    files.forEach(file=>group.appendChild(_gitChangeRow(file,kind)));
+    list.appendChild(group);
+    rendered+=files.length;
+  }
+  if(!rendered){
+    const empty=document.createElement('div');
+    empty.className='git-empty';
+    empty.textContent=t('git_no_changes');
+    list.appendChild(empty);
+  }
+  if(commitBox)commitBox.style.display=(totals.staged||0)>0?'flex':'none';
+  if(commitBtn)commitBtn.disabled=!(totals.staged||0);
+  renderWorkspacePanelTabState();
 }
 
 function navigateUp(){
@@ -146,23 +335,26 @@ let _previewCurrentMode = '';  // 'code' | 'md' | 'image' | 'html' | 'pdf' | 'au
 let _previewDirty = false;     // true when edits are unsaved
 
 function showPreview(mode){
-  // mode: 'code' | 'image' | 'md' | 'html' | 'pdf' | 'audio' | 'video'
+  // mode: 'code' | 'image' | 'md' | 'html' | 'pdf' | 'audio' | 'video' | 'gitdiff'
   $('previewCode').style.display     = mode==='code'  ? '' : 'none';
   $('previewImgWrap').style.display  = mode==='image' ? '' : 'none';
   const mediaWrap=$('previewMediaWrap'); if(mediaWrap) mediaWrap.style.display = (mode==='audio'||mode==='video') ? '' : 'none';
   const pdfWrap=$('previewPdfWrap'); if(pdfWrap) pdfWrap.style.display = mode==='pdf' ? '' : 'none';
   $('previewMd').style.display       = mode==='md'    ? '' : 'none';
   $('previewHtmlWrap').style.display = mode==='html'  ? '' : 'none';
+  const diffView=$('gitDiffView'); if(diffView) diffView.style.display = mode==='gitdiff' ? 'flex' : 'none';
   $('previewEditArea').style.display = 'none';  // start in read-only
   const badge=$('previewBadge');
   badge.className='preview-badge '+mode;
-  badge.textContent = mode==='image'?'image':mode==='audio'?'audio':mode==='video'?'video':mode==='pdf'?'pdf':mode==='md'?'md':mode==='html'?'html':fileExt($('previewPathText').textContent)||'text';
+  badge.textContent = mode==='image'?'image':mode==='audio'?'audio':mode==='video'?'video':mode==='pdf'?'pdf':mode==='md'?'md':mode==='html'?'html':mode==='gitdiff'?'diff':fileExt($('previewPathText').textContent)||'text';
   _previewCurrentMode = mode;
   _previewDirty = false;
   updateEditBtn();
   // Show "Open in browser" button for iframe-backed document previews
   const openBtn=$('btnOpenInBrowser');
   if(openBtn) openBtn.style.display = (mode==='html'||mode==='pdf')?'inline-flex':'none';
+  const downloadBtn=$('btnDownloadFile');
+  if(downloadBtn) downloadBtn.style.display = mode==='gitdiff'?'none':'inline-flex';
 }
 
 function updateEditBtn(){
@@ -195,6 +387,7 @@ async function toggleEditMode(){
       if(_previewCurrentMode==='code') $('previewCode').style.display='';
       else $('previewMd').style.display='';
       showToast(t('saved'));
+      refreshGitStatus();
     }catch(e){setStatus(t('save_failed')+e.message);}
   }else{
     // Enter edit mode: populate textarea with current content
@@ -366,4 +559,164 @@ function openInBrowser(){
   if(!_previewCurrentPath||!S.session) return;
   const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(_previewCurrentPath)}`;
   window.open(url,'_blank');
+}
+
+async function openGitDiff(path,kind='unstaged'){
+  if(!S.session)return;
+  const git=_ensureGitState();
+  git.selectedTab='changes';
+  git.selectedDiff={path,kind};
+  $('previewPathText').textContent=`Changes / ${path}`;
+  $('previewArea').classList.add('visible');
+  $('fileTree').style.display='none';
+  const changesView=$('gitChangesView'); if(changesView) changesView.style.display='none';
+  const diffView=$('gitDiffView');
+  if(diffView){
+    diffView.innerHTML='';
+    const loading=document.createElement('div');
+    loading.className='git-empty';
+    loading.textContent='Loading diff...';
+    diffView.appendChild(loading);
+  }
+  _previewCurrentPath=path;
+  showPreview('gitdiff');
+  renderWorkspacePanelTabState();
+  try{
+    const data=await api(`/api/git/diff?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&kind=${encodeURIComponent(kind)}`);
+    renderGitDiff(data.diff);
+  }catch(e){
+    if(diffView){
+      diffView.innerHTML='';
+      const err=document.createElement('div');
+      err.className='git-empty error';
+      err.textContent=e.message||t('git_commit_failed');
+      diffView.appendChild(err);
+    }
+  }
+}
+
+function renderGitDiff(diff){
+  const view=$('gitDiffView');
+  if(!view)return;
+  view.innerHTML='';
+  if(!diff)return;
+  if(diff.binary){
+    const msg=document.createElement('div');
+    msg.className='git-empty';
+    msg.textContent=t('git_binary_file');
+    view.appendChild(msg);
+    return;
+  }
+  if(diff.too_large){
+    const msg=document.createElement('div');
+    msg.className='git-diff-warning';
+    msg.textContent=t('git_diff_too_large');
+    view.appendChild(msg);
+  }
+  const text=diff.diff||'';
+  if(!text.trim()){
+    const msg=document.createElement('div');
+    msg.className='git-empty';
+    msg.textContent=t('git_no_changes');
+    view.appendChild(msg);
+    return;
+  }
+  const actions=document.createElement('div');
+  actions.className='git-diff-actions';
+  const state=_gitStatusForPath(diff.path);
+  if(diff.kind==='staged'){
+    const unstage=document.createElement('button');
+    unstage.className='mini-btn';
+    unstage.textContent=t('git_unstage');
+    unstage.onclick=()=>unstageGitPath(diff.path);
+    actions.appendChild(unstage);
+  }else{
+    const stage=document.createElement('button');
+    stage.className='mini-btn';
+    stage.textContent=t('git_stage');
+    stage.onclick=()=>stageGitPath(diff.path);
+    actions.appendChild(stage);
+    if(state){
+      const discard=document.createElement('button');
+      discard.className='mini-btn danger';
+      discard.textContent=state.untracked?t('delete_title'):t('git_discard');
+      discard.onclick=()=>discardGitPath(diff.path,{untracked:!!state.untracked});
+      actions.appendChild(discard);
+    }
+  }
+  const open=document.createElement('button');
+  open.className='mini-btn';
+  open.textContent=t('open_file');
+  open.onclick=()=>openFile(diff.path);
+  actions.appendChild(open);
+  view.appendChild(actions);
+  for(const lineText of text.split('\n')){
+    const line=document.createElement('div');
+    line.className='git-diff-line';
+    if(lineText.startsWith('@@'))line.classList.add('git-diff-hunk');
+    else if(lineText.startsWith('+')&&!lineText.startsWith('+++'))line.classList.add('git-diff-add');
+    else if(lineText.startsWith('-')&&!lineText.startsWith('---'))line.classList.add('git-diff-del');
+    else if(lineText.startsWith('diff --git')||lineText.startsWith('index ')||lineText.startsWith('---')||lineText.startsWith('+++'))line.classList.add('git-diff-meta');
+    line.textContent=lineText||' ';
+    view.appendChild(line);
+  }
+}
+
+async function stageGitPath(path){
+  if(!S.session)return;
+  try{
+    const data=await api('/api/git/stage',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:[path]})});
+    S.git.status=data.git;
+    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    if(S.git.selectedDiff&&S.git.selectedDiff.path===path)openGitDiff(path,'staged');
+  }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
+}
+
+async function unstageGitPath(path){
+  if(!S.session)return;
+  try{
+    const data=await api('/api/git/unstage',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:[path]})});
+    S.git.status=data.git;
+    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    if(S.git.selectedDiff&&S.git.selectedDiff.path===path)openGitDiff(path,'unstaged');
+  }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
+}
+
+async function discardGitPath(path,opts={}){
+  if(!S.session)return;
+  const untracked=!!opts.untracked;
+  const ok=await showConfirmDialog({
+    title:untracked?t('delete_confirm',path):t('git_discard_confirm_title'),
+    message:untracked?t('git_delete_untracked_confirm',path):t('git_discard_confirm_message',path),
+    confirmLabel:untracked?t('delete_title'):t('git_discard'),
+    danger:true,
+    focusCancel:true
+  });
+  if(!ok)return;
+  try{
+    const data=await api('/api/git/discard',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:[path],delete_untracked:untracked})});
+    S.git.status=data.git;
+    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    if(S.git.selectedDiff&&S.git.selectedDiff.path===path){
+      $('previewArea').classList.remove('visible');
+      S.git.selectedDiff=null;
+      renderWorkspacePanelTabState();
+    }
+    await loadDir(S.currentDir);
+  }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
+}
+
+async function commitGitChanges(){
+  if(!S.session)return;
+  const input=$('gitCommitMessage');
+  const message=(input&&input.value||'').trim();
+  if(!message){showToast(t('git_commit_message'),2200);return;}
+  try{
+    const data=await api('/api/git/commit',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,message})});
+    if(input)input.value='';
+    S.git.status=data.status;
+    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    showToast(`${t('git_committed')} ${data.commit}`,2600);
+    await loadDir(S.currentDir);
+  }catch(e){showToast(`${t('git_commit_failed')}: ${e.message}`,4000,'error');}
 }
