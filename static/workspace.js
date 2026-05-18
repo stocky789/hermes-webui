@@ -100,7 +100,7 @@ async function _refreshGitBadge(){
 }
 
 function _ensureGitState(){
-  if(!S.git)S.git={status:null,selectedTab:'files',selectedDiff:null,loading:false,syncing:null};
+  if(!S.git)S.git={status:null,selectedTab:'files',selectedDiff:null,loading:false,syncing:null,generatingCommitMessage:false};
   return S.git;
 }
 
@@ -283,6 +283,7 @@ function renderGitChanges(){
   const list=$('gitChangesList');
   const commitBox=$('gitCommitBox');
   const commitBtn=$('btnGitCommit');
+  const generateBtn=$('btnGitGenerateCommitMessage');
   if(!list)return;
   list.innerHTML='';
   const status=_ensureGitState().status;
@@ -351,7 +352,13 @@ function renderGitChanges(){
     list.appendChild(empty);
   }
   if(commitBox)commitBox.style.display=(totals.staged||0)>0?'flex':'none';
-  if(commitBtn)commitBtn.disabled=!(totals.staged||0);
+  const hasStaged=(totals.staged||0)>0;
+  const generating=!!_ensureGitState().generatingCommitMessage;
+  if(commitBtn)commitBtn.disabled=!hasStaged||generating;
+  if(generateBtn){
+    generateBtn.disabled=!hasStaged||generating;
+    generateBtn.textContent=generating?'Generating...':'Generate message';
+  }
   renderWorkspacePanelTabState();
 }
 
@@ -776,6 +783,29 @@ async function commitGitChanges(){
     showToast(`${t('git_committed')} ${data.commit}`,2600);
     await loadDir(S.currentDir);
   }catch(e){showToast(`${t('git_commit_failed')}: ${e.message}`,4000,'error');}
+}
+
+async function generateGitCommitMessage(){
+  if(!S.session)return;
+  const git=_ensureGitState();
+  if(git.generatingCommitMessage)return;
+  git.generatingCommitMessage=true;
+  renderGitChanges();
+  try{
+    const data=await api('/api/git/commit-message',{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
+    const input=$('gitCommitMessage');
+    if(input){
+      input.value=data.message||'';
+      input.focus();
+      input.selectionStart=input.selectionEnd=input.value.length;
+    }
+    if(data.truncated)showToast('Generated from a truncated staged diff',3200);
+  }catch(e){
+    showToast(`Commit message generation failed: ${e.message}`,4000,'error');
+  }finally{
+    git.generatingCommitMessage=false;
+    renderGitChanges();
+  }
 }
 
 async function runGitRemoteAction(action){

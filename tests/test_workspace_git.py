@@ -261,6 +261,35 @@ def test_git_stage_unstage_discard_and_commit(tmp_path):
     assert committed["status"]["totals"]["changed"] == 0
 
 
+def test_staged_commit_message_prompt_uses_only_staged_diff(tmp_path):
+    from api.workspace_git import (
+        GitWorkspaceError,
+        clean_generated_commit_message,
+        staged_commit_message_prompt,
+    )
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+
+    (repo / "tracked.txt").write_text("one\nstaged\n", encoding="utf-8")
+    _git(repo, "add", "tracked.txt")
+    (repo / "tracked.txt").write_text("one\nstaged\nunstaged\n", encoding="utf-8")
+
+    prompt = staged_commit_message_prompt(repo)
+    assert prompt["truncated"] is False
+    assert "tracked.txt" in prompt["user_prompt"]
+    assert "+staged" in prompt["user_prompt"]
+    assert "unstaged" not in prompt["user_prompt"]
+    assert "Never mention AI, Cursor, Zed, agents" in prompt["system_prompt"]
+
+    _git(repo, "restore", "--staged", "tracked.txt")
+    with pytest.raises(GitWorkspaceError):
+        staged_commit_message_prompt(repo)
+
+    assert clean_generated_commit_message("```text\nSubject\n\n- Body\n```") == "Subject\n\n- Body"
+
+
 def test_git_fetch_pull_and_push_with_upstream(tmp_path):
     from api.workspace_git import git_fetch, git_pull, git_push, git_status
 
@@ -349,6 +378,7 @@ def test_workspace_git_static_contracts():
         "gitChangesList",
         "gitCommitBox",
         "gitCommitMessage",
+        "btnGitGenerateCommitMessage",
         "btnGitCommit",
         "gitDiffView",
     ]:
@@ -364,6 +394,7 @@ def test_workspace_git_static_contracts():
         "unstageGitPath",
         "discardGitPath",
         "commitGitChanges",
+        "generateGitCommitMessage",
         "runGitRemoteAction",
         "switchWorkspacePanelTab",
     ]:
@@ -386,13 +417,17 @@ def test_workspace_git_static_contracts():
         ".git-summary-text",
         ".git-summary-actions",
         ".git-sync-btn",
+        ".git-commit-actions",
+        ".git-commit-primary",
     ]:
         assert cls in style
     assert ".git-stat-add" in style and ".git-stat-del" in style
     routes = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
     for route in ["/api/git/fetch", "/api/git/pull", "/api/git/push"]:
         assert route in routes
+    assert "/api/git/commit-message" in routes
     assert "`/api/git/${action}`" in workspace_js
+    assert "'/api/git/commit-message'" in workspace_js
 
     for token in [
         'data-i18n="git_files"',

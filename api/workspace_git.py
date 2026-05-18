@@ -22,6 +22,7 @@ GIT_TIMEOUT = 5
 GIT_REMOTE_TIMEOUT = 60
 STATUS_FILE_LIMIT = 500
 DIFF_SIZE_LIMIT = 512 * 1024
+COMMIT_MESSAGE_DIFF_LIMIT = 64 * 1024
 
 
 class GitWorkspaceError(RuntimeError):
@@ -510,6 +511,99 @@ def git_discard(workspace: str | Path, paths: Iterable[str], *, delete_untracked
             continue
         _run_git(ctx, ["restore", "--worktree", "--", repo_rel], check=True)
     return git_status(workspace)
+
+
+COMMIT_MESSAGE_SYSTEM_PROMPT = """When writing commit messages, PR titles, or PR descriptions:
+
+- Inspect the staged diff before suggesting a commit message.
+- Do not use vague subjects like "update", "improve", "refine", "misc changes", "fix stuff", or "various changes".
+- For large commits, write a concise subject plus a short body with 2-5 bullets summarizing the main areas changed.
+- The subject should describe the actual user-facing result or bug fixed, not just broad implementation activity.
+- Keep wording short, clear, and natural.
+- Never mention AI, Cursor, Zed, agents, or similar tooling in commits, branch names, PR titles, or PR descriptions.
+- Never add your own thoughts or questions into the commit message, the commit message is definitive in nature.
+
+Return only the commit message text. Do not wrap it in Markdown fences.
+""".strip()
+
+
+def _staged_diff_text(ctx: GitContext) -> tuple[str, bool]:
+    result = _run_git(
+        ctx,
+        [
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--unified=3",
+            "--",
+            _workspace_pathspec(ctx),
+        ],
+        check=True,
+    )
+    diff = result.stdout or ""
+    encoded = diff.encode("utf-8", errors="replace")
+    if len(encoded) <= COMMIT_MESSAGE_DIFF_LIMIT:
+        return diff, False
+    return encoded[:COMMIT_MESSAGE_DIFF_LIMIT].decode("utf-8", errors="replace"), True
+
+
+def staged_commit_message_prompt(workspace: str | Path) -> dict:
+    ctx = resolve_git_context(workspace)
+    if ctx is None:
+        raise GitWorkspaceError("Workspace is not a Git repository")
+    status = git_status(workspace)
+    if int((status.get("totals") or {}).get("staged") or 0) <= 0:
+        raise GitWorkspaceError("Stage changes before generating a commit message")
+    diff, truncated = _staged_diff_text(ctx)
+    if not diff.strip():
+        raise GitWorkspaceError("No staged diff is available")
+    staged_files = [f for f in status.get("files", []) if f.get("staged")]
+    file_lines = []
+    for item in staged_files[:80]:
+        stats = (
+            "binary"
+            if item.get("binary")
+            else f"+{item.get('additions') or 0} -{item.get('deletions') or 0}"
+        )
+        file_lines.append(f"- {item.get('status') or 'M'} {item.get('path')} ({stats})")
+    if len(staged_files) > 80:
+        file_lines.append(f"- ... {len(staged_files) - 80} more staged file(s)")
+    user_prompt = (
+        "Write a commit message for the staged Git diff below.\n\n"
+        f"Branch: {status.get('branch') or 'HEAD'}\n"
+        f"Staged files ({len(staged_files)}):\n"
+        + "\n".join(file_lines)
+        + (
+            "\n\nDiff was truncated for size; summarize only what is visible.\n"
+            if truncated
+            else "\n"
+        )
+        + "\nStaged diff:\n```diff\n"
+        + diff
+        + "\n```"
+    )
+    return {
+        "system_prompt": COMMIT_MESSAGE_SYSTEM_PROMPT,
+        "user_prompt": user_prompt,
+        "truncated": truncated,
+        "status": status,
+    }
+
+
+def clean_generated_commit_message(message: str) -> str:
+    text = str(message or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    if (text.startswith('"') and text.endswith('"')) or (
+        text.startswith("'") and text.endswith("'")
+    ):
+        text = text[1:-1].strip()
+    return text
 
 
 def git_commit(workspace: str | Path, message: str) -> dict:

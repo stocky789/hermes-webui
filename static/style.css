@@ -1497,7 +1497,9 @@
   .git-empty.error{color:var(--error);}
   .git-commit-box{display:none;flex-direction:column;gap:7px;border-top:1px solid var(--border);padding-top:10px;flex-shrink:0;}
   .git-commit-box textarea{width:100%;box-sizing:border-box;resize:vertical;min-height:62px;max-height:120px;background:var(--input-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:8px;font:12px/1.45 var(--font-ui);}
-  .git-commit-box button{align-self:flex-end;}
+  .git-commit-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;}
+  .git-commit-primary{min-height:30px;padding:0 13px;border-color:var(--accent-bg-strong,var(--border2));background:var(--accent-bg);color:var(--accent-text);font-weight:700;}
+  .git-commit-primary:hover{background:var(--accent-bg-strong,var(--hover-bg));color:var(--accent-text);}
   .git-diff-view{display:flex;flex:1;min-height:0;flex-direction:column;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--code-bg);}
   .git-diff-actions{position:sticky;top:0;z-index:1;padding:7px;border-bottom:1px solid var(--border);background:var(--surface);}
   .git-diff-warning{padding:8px 10px;color:var(--warning);font-size:12px;border-bottom:1px solid var(--border);}

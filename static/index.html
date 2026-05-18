@@ -1274,7 +1274,10 @@
       <div id="gitChangesList" class="git-changes-list"></div>
       <div class="git-commit-box" id="gitCommitBox">
         <textarea id="gitCommitMessage" rows="3" placeholder="Commit message" data-i18n-placeholder="git_commit_message"></textarea>
-        <button class="sm-btn" id="btnGitCommit" type="button" onclick="commitGitChanges()" data-i18n="git_commit">Commit</button>
+        <div class="git-commit-actions">
+          <button class="mini-btn" id="btnGitGenerateCommitMessage" type="button" onclick="generateGitCommitMessage()">Generate message</button>
+          <button class="sm-btn git-commit-primary" id="btnGitCommit" type="button" onclick="commitGitChanges()" data-i18n="git_commit">Commit</button>
+        </div>
       </div>
     </div>
     <div id="wsEmptyState" style="display:none;flex:1;align-items:center;justify-content:center;padding:24px 16px;text-align:center;color:var(--muted);font-size:12px;line-height:1.6"></div>

@@ -5193,6 +5193,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/git/discard":
         return _handle_git_discard(handler, body)
 
+    if parsed.path == "/api/git/commit-message":
+        return _handle_git_commit_message(handler, body)
+
     if parsed.path == "/api/git/commit":
         return _handle_git_commit(handler, body)
 
@@ -8489,6 +8492,130 @@ def _handle_git_discard(handler, body):
         return bad(handler, str(e))
     except GitWorkspaceError as e:
         return bad(handler, _sanitize_error(e), 400)
+
+
+def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) -> str:
+    from api import profiles as profiles_api
+
+    active_profile = profiles_api.get_active_profile_name() or "default"
+    with profiles_api.profile_env_for_background_worker(
+        active_profile,
+        "git commit message",
+        logger_override=logger,
+    ):
+        from api.config import (
+            get_effective_default_model,
+            model_with_provider_context,
+            resolve_custom_provider_connection,
+            resolve_model_provider,
+        )
+
+        session_model = str(getattr(session, "model", "") or "").strip()
+        session_provider = str(getattr(session, "model_provider", "") or "").strip() or None
+        model_for_resolution = (
+            model_with_provider_context(session_model, session_provider)
+            if session_model
+            else get_effective_default_model()
+        )
+        _main_model, _main_provider, _main_base_url = resolve_model_provider(model_for_resolution)
+        _main_api_key = None
+        try:
+            from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                resolve_runtime_provider,
+                requested=_main_provider,
+            )
+            _main_api_key = _rt.get("api_key")
+            if not _main_provider:
+                _main_provider = _rt.get("provider")
+            if not _main_base_url:
+                _main_base_url = _rt.get("base_url")
+        except Exception as _e:
+            logger.debug("git commit message runtime provider resolution failed: %s", _e)
+        if isinstance(_main_provider, str) and _main_provider.startswith("custom:"):
+            _cp_key, _cp_base = resolve_custom_provider_connection(_main_provider)
+            if not _main_api_key and _cp_key:
+                _main_api_key = _cp_key
+            if not _main_base_url and _cp_base:
+                _main_base_url = _cp_base
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        main_runtime = {
+            "provider": _main_provider,
+            "model": _main_model,
+            "base_url": _main_base_url,
+            "api_key": _main_api_key,
+        }
+        try:
+            from agent.auxiliary_client import get_text_auxiliary_client
+
+            aux_client, aux_model = get_text_auxiliary_client(
+                "compression",
+                main_runtime=main_runtime,
+            )
+            if aux_client is not None and aux_model:
+                response = aux_client.chat.completions.create(
+                    model=aux_model,
+                    messages=messages,
+                )
+                return str(response.choices[0].message.content or "").strip()
+        except Exception as _e:
+            logger.debug("git commit message auxiliary model failed; falling back to main model: %s", _e)
+
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model=_main_model,
+            provider=_main_provider,
+            base_url=_main_base_url,
+            api_key=_main_api_key,
+            platform="webui",
+            quiet_mode=True,
+            enabled_toolsets=[],
+            session_id=f"git-commit-message-{uuid.uuid4().hex[:8]}",
+        )
+        result = agent.run_conversation(
+            user_message=user_prompt,
+            system_message=system_prompt,
+            conversation_history=[],
+            task_id=f"git-commit-message-{uuid.uuid4().hex[:8]}",
+        )
+        return str(result.get("final_response") or "").strip()
+
+
+def _handle_git_commit_message(handler, body):
+    from api.workspace_git import (
+        GitWorkspaceError,
+        clean_generated_commit_message,
+        staged_commit_message_prompt,
+    )
+
+    try:
+        require(body, "session_id")
+        session = get_session(body["session_id"])
+        workspace = Path(session.workspace)
+
+        prompt = staged_commit_message_prompt(workspace)
+        message = clean_generated_commit_message(
+            _llm_git_commit_message(prompt["system_prompt"], prompt["user_prompt"], session=session)
+        )
+        if not message:
+            raise GitWorkspaceError("No commit message was generated")
+        return j(handler, {"ok": True, "message": message, "truncated": bool(prompt.get("truncated"))})
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return bad(handler, _sanitize_error(e), 400)
+    except Exception as e:
+        logger.exception("git commit message generation failed")
+        return bad(handler, _sanitize_error(e), 500)
 
 
 def _handle_git_commit(handler, body):
