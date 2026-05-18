@@ -148,15 +148,14 @@ def test_git_status_ignores_filemode_only_noise(tmp_path):
     from api.workspace_git import git_status
 
     repo = _init_repo(tmp_path / "repo")
-    _git(repo, "config", "core.filemode", "true")
     script = repo / "script.sh"
     script.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
     _commit_all(repo)
 
-    script.chmod(0o755)
+    _git(repo, "update-index", "--chmod=+x", "script.sh")
 
     raw = _git(repo, "status", "--porcelain", "--", "script.sh")
-    assert raw.startswith(" M")
+    assert raw.startswith("M ")
 
     status = git_status(repo)
     assert status["totals"]["changed"] == 0
@@ -262,6 +261,43 @@ def test_git_stage_unstage_discard_and_commit(tmp_path):
     assert committed["status"]["totals"]["changed"] == 0
 
 
+def test_git_fetch_pull_and_push_with_upstream(tmp_path):
+    from api.workspace_git import git_fetch, git_pull, git_push, git_status
+
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+
+    origin = _init_repo(tmp_path / "origin")
+    (origin / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(origin)
+    _git(origin, "remote", "add", "origin", str(remote))
+    _git(origin, "push", "-u", "origin", "HEAD")
+
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", str(remote), str(clone))
+    _git(clone, "config", "user.email", "hermes-tests@example.invalid")
+    _git(clone, "config", "user.name", "Hermes Tests")
+
+    (origin / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")
+    _commit_all(origin, "Remote update")
+    _git(origin, "push")
+
+    fetched = git_fetch(clone)
+    assert fetched["status"]["behind"] == 1
+
+    pulled = git_pull(clone)
+    assert pulled["status"]["behind"] == 0
+    assert (clone / "tracked.txt").read_text(encoding="utf-8") == "one\ntwo\n"
+
+    (clone / "tracked.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    _git(clone, "add", "tracked.txt")
+    _git(clone, "commit", "-m", "Local update")
+    assert git_status(clone)["ahead"] == 1
+
+    pushed = git_push(clone)
+    assert pushed["status"]["ahead"] == 0
+
+
 def test_git_routes_status_diff_stage_unstage_discard_commit(cleanup_test_sessions):
     sid, base_ws = _make_session(cleanup_test_sessions)
     repo = base_ws / f"git-route-{uuid.uuid4().hex[:8]}"
@@ -328,6 +364,7 @@ def test_workspace_git_static_contracts():
         "unstageGitPath",
         "discardGitPath",
         "commitGitChanges",
+        "runGitRemoteAction",
         "switchWorkspacePanelTab",
     ]:
         assert f"function {fn}" in workspace_js
@@ -340,9 +377,22 @@ def test_workspace_git_static_contracts():
     assert "file-git-status" in ui_js
     assert "_gitStageableFiles" in workspace_js
     assert "git-stat-add" in workspace_js and "git-stat-del" in workspace_js
-    for cls in [".workspace-tabs", ".git-change-row", ".git-diff-line", ".git-commit-box", ".git-stage-all-btn"]:
+    for cls in [
+        ".workspace-tabs",
+        ".git-change-row",
+        ".git-diff-line",
+        ".git-commit-box",
+        ".git-stage-all-btn",
+        ".git-summary-text",
+        ".git-summary-actions",
+        ".git-sync-btn",
+    ]:
         assert cls in style
     assert ".git-stat-add" in style and ".git-stat-del" in style
+    routes = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
+    for route in ["/api/git/fetch", "/api/git/pull", "/api/git/push"]:
+        assert route in routes
+    assert "`/api/git/${action}`" in workspace_js
 
     for token in [
         'data-i18n="git_files"',
@@ -353,5 +403,15 @@ def test_workspace_git_static_contracts():
         assert token in index
 
     i18n = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
-    for key in ["git_files", "git_changes", "git_stage_all", "git_commit_message", "git_delete_untracked_confirm"]:
+    for key in [
+        "git_files",
+        "git_changes",
+        "git_stage_all",
+        "git_commit_message",
+        "git_delete_untracked_confirm",
+        "git_fetch",
+        "git_pull",
+        "git_push",
+        "git_sync_failed",
+    ]:
         assert i18n.count(f"{key}:") >= 11

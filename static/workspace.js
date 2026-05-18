@@ -100,7 +100,7 @@ async function _refreshGitBadge(){
 }
 
 function _ensureGitState(){
-  if(!S.git)S.git={status:null,selectedTab:'files',selectedDiff:null,loading:false};
+  if(!S.git)S.git={status:null,selectedTab:'files',selectedDiff:null,loading:false,syncing:null};
   return S.git;
 }
 
@@ -209,6 +209,14 @@ function _gitStageableFiles(){
   return _gitFiles().filter(f=>!f.conflict&&(f.unstaged||f.untracked));
 }
 
+function _setGitStatus(status){
+  const git=_ensureGitState();
+  git.status=status||null;
+  renderGitBadge(git.status);
+  renderGitChanges();
+  if(typeof renderFileTree==='function')renderFileTree();
+}
+
 function _gitStatsEl(file){
   const stats=document.createElement('span');
   stats.className='git-change-stats';
@@ -291,8 +299,20 @@ function renderGitChanges(){
   summary.className='git-summary';
   const totals=status.totals||{};
   const summaryText=document.createElement('span');
+  summaryText.className='git-summary-text';
   summaryText.textContent=[status.branch||'HEAD',status.upstream,`${totals.changed||0} ${t('git_changed')}`,status.ahead?`\u2191${status.ahead}`:'',status.behind?`\u2193${status.behind}`:''].filter(Boolean).join(' \u00b7 ');
   summary.appendChild(summaryText);
+  const summaryActions=document.createElement('span');
+  summaryActions.className='git-summary-actions';
+  for(const [action,label] of [['fetch',t('git_fetch')],['pull',t('git_pull')],['push',t('git_push')]]){
+    const btn=document.createElement('button');
+    btn.className='mini-btn git-sync-btn';
+    btn.type='button';
+    btn.textContent=label;
+    btn.disabled=_ensureGitState().syncing===action;
+    btn.onclick=()=>runGitRemoteAction(action);
+    summaryActions.appendChild(btn);
+  }
   const stageable=_gitStageableFiles();
   if(stageable.length){
     const stageAll=document.createElement('button');
@@ -300,8 +320,9 @@ function renderGitChanges(){
     stageAll.type='button';
     stageAll.textContent=t('git_stage_all')||'Stage all';
     stageAll.onclick=()=>stageGitAllChanges();
-    summary.appendChild(stageAll);
+    summaryActions.appendChild(stageAll);
   }
+  summary.appendChild(summaryActions);
   list.appendChild(summary);
   const groups=[
     ['conflicts',t('git_conflicts')],
@@ -695,8 +716,7 @@ async function stageGitPath(path){
   if(!S.session)return;
   try{
     const data=await api('/api/git/stage',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:[path]})});
-    S.git.status=data.git;
-    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    _setGitStatus(data.git);
     if(S.git.selectedDiff&&S.git.selectedDiff.path===path)openGitDiff(path,'staged');
   }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
 }
@@ -707,8 +727,7 @@ async function stageGitAllChanges(){
   if(!paths.length)return;
   try{
     const data=await api('/api/git/stage',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths})});
-    S.git.status=data.git;
-    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    _setGitStatus(data.git);
     if(S.git.selectedDiff&&paths.includes(S.git.selectedDiff.path))openGitDiff(S.git.selectedDiff.path,'staged');
   }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
 }
@@ -717,8 +736,7 @@ async function unstageGitPath(path){
   if(!S.session)return;
   try{
     const data=await api('/api/git/unstage',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:[path]})});
-    S.git.status=data.git;
-    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    _setGitStatus(data.git);
     if(S.git.selectedDiff&&S.git.selectedDiff.path===path)openGitDiff(path,'unstaged');
   }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
 }
@@ -736,8 +754,7 @@ async function discardGitPath(path,opts={}){
   if(!ok)return;
   try{
     const data=await api('/api/git/discard',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:[path],delete_untracked:untracked})});
-    S.git.status=data.git;
-    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    _setGitStatus(data.git);
     if(S.git.selectedDiff&&S.git.selectedDiff.path===path){
       $('previewArea').classList.remove('visible');
       S.git.selectedDiff=null;
@@ -755,9 +772,27 @@ async function commitGitChanges(){
   try{
     const data=await api('/api/git/commit',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,message})});
     if(input)input.value='';
-    S.git.status=data.status;
-    renderGitBadge(S.git.status);renderGitChanges();renderFileTree();
+    _setGitStatus(data.status);
     showToast(`${t('git_committed')} ${data.commit}`,2600);
     await loadDir(S.currentDir);
   }catch(e){showToast(`${t('git_commit_failed')}: ${e.message}`,4000,'error');}
+}
+
+async function runGitRemoteAction(action){
+  if(!S.session||!['fetch','pull','push'].includes(action))return;
+  const git=_ensureGitState();
+  git.syncing=action;
+  renderGitChanges();
+  try{
+    const data=await api(`/api/git/${action}`,{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
+    _setGitStatus(data.status);
+    const label=action==='fetch'?t('git_fetched'):action==='pull'?t('git_pulled'):t('git_pushed');
+    showToast(label,2600);
+    await loadDir(S.currentDir);
+  }catch(e){
+    showToast(`${t('git_sync_failed')}: ${e.message}`,4000,'error');
+  }finally{
+    git.syncing=null;
+    renderGitChanges();
+  }
 }

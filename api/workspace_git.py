@@ -19,6 +19,7 @@ from api.workspace import safe_resolve_ws
 
 
 GIT_TIMEOUT = 5
+GIT_REMOTE_TIMEOUT = 60
 STATUS_FILE_LIMIT = 500
 DIFF_SIZE_LIMIT = 512 * 1024
 
@@ -521,3 +522,46 @@ def git_commit(workspace: str | Path, message: str) -> dict:
     _run_git(ctx, ["commit", "-m", msg], timeout=10, check=True)
     sha = _run_git(ctx, ["rev-parse", "--short", "HEAD"], check=True).stdout.strip()
     return {"ok": True, "commit": sha, "status": git_status(workspace)}
+
+
+def _branch_name(ctx: GitContext) -> str:
+    branch = _run_git(ctx, ["branch", "--show-current"], check=True).stdout.strip()
+    if not branch:
+        raise GitWorkspaceError("Cannot push from a detached HEAD")
+    return branch
+
+
+def _remote_message(result: subprocess.CompletedProcess[str]) -> str:
+    return (result.stdout or result.stderr or "").strip()
+
+
+def git_fetch(workspace: str | Path) -> dict:
+    ctx = resolve_git_context(workspace)
+    if ctx is None:
+        raise GitWorkspaceError("Workspace is not a Git repository")
+    result = _run_git(ctx, ["fetch", "--prune"], timeout=GIT_REMOTE_TIMEOUT, check=True)
+    return {"ok": True, "message": _remote_message(result), "status": git_status(workspace)}
+
+
+def git_pull(workspace: str | Path) -> dict:
+    ctx = resolve_git_context(workspace)
+    if ctx is None:
+        raise GitWorkspaceError("Workspace is not a Git repository")
+    result = _run_git(ctx, ["pull", "--ff-only"], timeout=GIT_REMOTE_TIMEOUT, check=True)
+    return {"ok": True, "message": _remote_message(result), "status": git_status(workspace)}
+
+
+def git_push(workspace: str | Path) -> dict:
+    ctx = resolve_git_context(workspace)
+    if ctx is None:
+        raise GitWorkspaceError("Workspace is not a Git repository")
+    status = git_status(workspace)
+    args = ["push"]
+    if not status.get("upstream"):
+        branch = _branch_name(ctx)
+        remotes = _run_git(ctx, ["remote"], check=True).stdout.split()
+        if "origin" not in remotes:
+            raise GitWorkspaceError("No upstream branch or origin remote is configured")
+        args.extend(["-u", "origin", branch])
+    result = _run_git(ctx, args, timeout=GIT_REMOTE_TIMEOUT, check=True)
+    return {"ok": True, "message": _remote_message(result), "status": git_status(workspace)}

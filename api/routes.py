@@ -5196,6 +5196,15 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/git/commit":
         return _handle_git_commit(handler, body)
 
+    if parsed.path == "/api/git/fetch":
+        return _handle_git_remote_action(handler, body, "fetch")
+
+    if parsed.path == "/api/git/pull":
+        return _handle_git_remote_action(handler, body, "pull")
+
+    if parsed.path == "/api/git/push":
+        return _handle_git_remote_action(handler, body, "push")
+
     # ── File ops (POST) ──
     if parsed.path == "/api/file/delete":
         return _handle_file_delete(handler, body)
@@ -8491,6 +8500,26 @@ def _handle_git_commit(handler, body):
         from api.workspace_git import GitWorkspaceError, git_commit
 
         return j(handler, git_commit(workspace, body.get("message", "")))
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return bad(handler, _sanitize_error(e), 400)
+
+
+def _handle_git_remote_action(handler, body, action: str):
+    try:
+        require(body, "session_id")
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_fetch, git_pull, git_push
+
+        actions = {
+            "fetch": git_fetch,
+            "pull": git_pull,
+            "push": git_push,
+        }
+        return j(handler, actions[action](workspace))
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
