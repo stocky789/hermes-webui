@@ -144,6 +144,25 @@ def test_git_status_keeps_real_edit_with_crlf_endings(tmp_path):
     assert by_path["tracked.txt"]["deletions"] == 0
 
 
+def test_git_status_ignores_filemode_only_noise(tmp_path):
+    from api.workspace_git import git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    _git(repo, "config", "core.filemode", "true")
+    script = repo / "script.sh"
+    script.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    _commit_all(repo)
+
+    script.chmod(0o755)
+
+    raw = _git(repo, "status", "--porcelain", "--", "script.sh")
+    assert raw.startswith(" M")
+
+    status = git_status(repo)
+    assert status["totals"]["changed"] == 0
+    assert status["files"] == []
+
+
 def test_git_status_scopes_nested_workspace_to_that_directory(tmp_path):
     from api.workspace_git import git_status
 

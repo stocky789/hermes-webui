@@ -314,6 +314,8 @@ def git_status(workspace: str | Path) -> dict:
             )
         if not (staged or unstaged or untracked or conflict or renamed):
             continue
+        if not (untracked or conflict or renamed or binary) and additions == 0 and deletions == 0:
+            continue
 
         files[workspace_path] = {
             "path": workspace_path,
