@@ -727,6 +727,8 @@ def test_workspace_git_static_contracts():
         "renderWorkspaceMarkdown",
         "postProcessWorkspaceMarkdown",
         "refreshGitBranches",
+        "_autoRefreshWorkspaceGitStatus",
+        "_installWorkspaceGitAutoRefresh",
         "renderGitBranchControl",
         "toggleGitBranchMenu",
         "closeGitBranchMenu",
@@ -752,6 +754,9 @@ def test_workspace_git_static_contracts():
     assert "_isWorkspaceMarkdownPath" in ui_js
     assert "e.stopPropagation()" in ui_js
     assert "_gitStageableFiles" in workspace_js
+    assert "GIT_AUTO_REFRESH_MS" in workspace_js
+    assert "_workspacePanelOpenForAutoRefresh" in workspace_js
+    assert "refreshGitStatus({auto:true,refreshBranches:false})" in workspace_js
     assert "branchMenuOpen" in workspace_js
     assert "branchFilter" in workspace_js
     assert "_isSelectableRemoteBranch" in workspace_js
@@ -773,6 +778,8 @@ def test_workspace_git_static_contracts():
     assert "selectionKey:scopeKey" in workspace_js
     assert "_gitGroupHeader" in workspace_js
     assert "checkbox.indeterminate" in workspace_js
+    assert "_gitSyncLabel" in workspace_js
+    assert "Push local commits" in workspace_js and "Pull remote commits" in workspace_js
     assert "stagedOnly" in workspace_js
     assert "openFile(diff.path,{returnTo:'changes'})" in workspace_js
     assert "openFile(file.path,{returnTo:'changes'})" in workspace_js
