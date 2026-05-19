@@ -460,11 +460,6 @@ def git_status(workspace: str | Path) -> dict:
         "noise_filtering": {
             **filtered_noise,
             "active": any(filtered_noise.values()),
-            "message": (
-                "Line-ending-only and filemode-only changes are hidden by default in the workspace panel"
-                if any(filtered_noise.values())
-                else ""
-            ),
         },
     }
 

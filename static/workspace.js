@@ -870,12 +870,6 @@ function renderGitChanges(){
   summaryText.className='git-summary-text';
   summaryText.textContent=[status.branch||'HEAD',status.upstream,`${totals.changed||0} ${t('git_changed')}`,status.ahead?`\u2191${status.ahead}`:'',status.behind?`\u2193${status.behind}`:''].filter(Boolean).join(' \u00b7 ');
   summary.appendChild(summaryText);
-  if(status.noise_filtering&&status.noise_filtering.active){
-    const noise=document.createElement('span');
-    noise.className='git-noise-note';
-    noise.textContent=status.noise_filtering.message||'Metadata-only changes hidden';
-    summary.appendChild(noise);
-  }
   const selectedFiles=_gitSelectedFiles();
   const selectedCount=selectedFiles.length;
   const selectedStageable=selectedFiles.filter(f=>!f.conflict&&(f.unstaged||f.untracked));

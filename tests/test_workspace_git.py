@@ -153,7 +153,7 @@ def test_git_status_ignores_crlf_only_worktree_noise(tmp_path):
     assert status["totals"]["changed"] == 0
     assert status["files"] == []
     assert status["noise_filtering"]["active"] is True
-    assert "hidden by default" in status["noise_filtering"]["message"]
+    assert status["noise_filtering"]["crlf_only"] == 1
 
 
 def test_git_status_keeps_real_edit_with_crlf_endings(tmp_path):

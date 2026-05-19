@@ -1544,7 +1544,6 @@
   .git-changes-list{display:flex;flex:1;min-height:0;flex-direction:column;gap:10px;overflow:auto;}
   .git-summary{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:"SF Mono",ui-monospace,monospace;font-size:13px;color:var(--muted);padding:6px 2px;}
   .git-summary-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .git-noise-note{min-width:0;color:var(--warning);font-size:10px;line-height:1.35;}
   .git-summary-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;flex-wrap:wrap;}
   .git-change-group{display:flex;flex-direction:column;gap:3px;}
   .git-change-group-title{display:flex;align-items:center;gap:7px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:2px 2px 4px;}
