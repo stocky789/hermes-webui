@@ -1785,6 +1785,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           phase:'running',
           automatic:true,
           message:d.message||'Auto-compressing context...',
+          startedAt:Date.now()/1000,
         };
         setCompressionUi(state);
         const liveAnswerStarted=!!(assistantRow||String(((_parseStreamState&&_parseStreamState())||{}).displayText||'').trim());
@@ -1808,7 +1809,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!S.session||S.session.session_id!==activeSid) return;
       let d={};
       try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
-      if(d.session_id&&d.session_id!==activeSid) return;
+      const eventSid=d.old_session_id||d.session_id||activeSid;
+      if(eventSid!==activeSid && d.new_session_id!==activeSid && d.continuation_session_id!==activeSid) return;
+      const continuationSid=d.new_session_id||d.continuation_session_id||'';
       const message=String(d.message||'Context auto-compressed to continue the conversation').trim();
       if(d.usage&&typeof _syncCtxIndicator==='function'){
         S.lastUsage={...(S.lastUsage||{}),...d.usage};
@@ -1821,6 +1824,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           automatic:true,
           message,
           summary:{headline:message},
+          continuationSessionId:continuationSid,
         };
         setCompressionUi(state);
         const appended=typeof appendLiveCompressionCard==='function'&&appendLiveCompressionCard(state);

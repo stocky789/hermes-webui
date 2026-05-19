@@ -2158,14 +2158,27 @@ def _messaging_source_key(session: dict) -> str | None:
     return _messaging_session_identity(session, raw)
 
 
-def _keep_latest_messaging_session_per_source(sessions: list[dict]) -> list[dict]:
+def _keep_latest_messaging_session_per_source(
+    sessions: list[dict],
+    *,
+    show_previous_messaging_sessions: bool = False,
+) -> list[dict]:
     """Keep only the newest sidebar row per messaging session identity."""
+    if show_previous_messaging_sessions:
+        return sorted(sessions, key=_session_sort_timestamp, reverse=True)
+
     gateway_metadata = _load_gateway_session_identity_map()
     active_gateway_session_ids = {str(sid) for sid in gateway_metadata.keys() if sid}
+    session_ids = {
+        _safe_first(session.get("session_id"))
+        for session in sessions
+        if isinstance(session, dict)
+    }
+    visible_active_gateway_session_ids = active_gateway_session_ids & session_ids
     active_gateway_sources = {
         _normalize_messaging_source(_safe_first(meta.get("raw_source"), meta.get("platform")))
-        for meta in gateway_metadata.values()
-        if isinstance(meta, dict)
+        for sid, meta in gateway_metadata.items()
+        if sid in visible_active_gateway_session_ids and isinstance(meta, dict)
     }
     active_gateway_sources = {source for source in active_gateway_sources if _is_known_messaging_source(source)}
 
@@ -2177,7 +2190,7 @@ def _keep_latest_messaging_session_per_source(sessions: list[dict]) -> list[dict
         if not key:
             kept.append(session)
             continue
-        if _should_hide_stale_messaging_session(session, active_gateway_session_ids, active_gateway_sources):
+        if _should_hide_stale_messaging_session(session, visible_active_gateway_session_ids, active_gateway_sources):
             continue
         if key in kept_sources:
             kept_sources.add(key)
@@ -3943,7 +3956,12 @@ def handle_get(handler, parsed) -> bool:
                           if _profiles_match(s.get("profile"), active_profile)]
                 other_profile_count = len(merged) - len(scoped)
             diag.stage("messaging_dedupe")
-            scoped = _keep_latest_messaging_session_per_source(scoped)
+            scoped = _keep_latest_messaging_session_per_source(
+                scoped,
+                show_previous_messaging_sessions=bool(
+                    settings.get("show_previous_messaging_sessions")
+                ),
+            )
             if show_cli_sessions:
                 diag.stage("cli_cap")
                 scoped = _cap_recent_cli_sessions(scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
@@ -7839,6 +7857,18 @@ def _start_chat_stream_for_session(
     return response
 
 
+def _runtime_adapter_goal_action(goal_args: str) -> str:
+    """Return the bounded RuntimeAdapter goal action for WebUI /goal args."""
+    action = str(goal_args or "").strip().lower()
+    if not action or action == "status":
+        return "status"
+    if action in ("pause", "resume"):
+        return action
+    if action in ("clear", "stop", "done"):
+        return "clear"
+    return "set"
+
+
 def _handle_goal_command(handler, body):
     """Handle WebUI /goal command controls and optional kickoff stream."""
     try:
@@ -7911,12 +7941,30 @@ def _handle_goal_command(handler, body):
         )
         previous_goal_state = goal_state_snapshot(s.session_id, profile_home=profile_home)
 
-    payload = goal_command_payload(
-        s.session_id,
-        goal_args,
-        stream_running=stream_running,
-        profile_home=profile_home,
-    )
+    from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
+
+    def _legacy_goal_update(session_id: str, _action: str, text: str) -> dict:
+        return goal_command_payload(
+            session_id,
+            text,
+            stream_running=stream_running,
+            profile_home=profile_home,
+        )
+
+    goal_adapter_action = _runtime_adapter_goal_action(goal_args)
+    if runtime_adapter_enabled():
+        adapter = LegacyJournalRuntimeAdapter(goal_delegate=_legacy_goal_update)
+        control_result = adapter.update_goal(
+            s.session_id,
+            goal_adapter_action,
+            goal_args,
+        )
+        # Slice 3c keeps the adapter as a structural seam only.  Preserve the
+        # public /api/goal response by passing through the legacy payload rather
+        # than deriving HTTP behavior from ControlResult.accepted/status.
+        payload = dict(control_result.payload)
+    else:
+        payload = _legacy_goal_update(s.session_id, goal_adapter_action, goal_args)
     if not payload.get("ok", True):
         status = 409 if payload.get("error") == "agent_running" else 400
         return j(handler, payload, status=status)
@@ -8199,6 +8247,7 @@ def _handle_chat_sync(handler, body):
             )
             from api.streaming import (
                 _merge_display_messages_after_agent_result,
+                _restore_display_reasoning_metadata,
                 _restore_reasoning_metadata,
                 _sanitize_messages_for_api,
                 _context_messages_for_new_turn,
@@ -8251,7 +8300,7 @@ def _handle_chat_sync(handler, body):
         s.messages = _merge_display_messages_after_agent_result(
             _previous_messages,
             _previous_context_messages,
-            _restore_reasoning_metadata(_previous_messages, _result_messages),
+            _restore_display_reasoning_metadata(_previous_messages, _result_messages),
             msg,
         )
         # Only auto-generate title when still default; preserves user renames

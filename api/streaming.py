@@ -50,6 +50,56 @@ from api.turn_journal import append_turn_journal_event_for_stream
 # (api/profiles.py:715).
 _ENV_LOCK = threading.Lock()
 
+_KEYLESS_CUSTOM_API_KEY = "dummy-key"
+
+
+def _resolve_custom_provider_runtime_overrides(
+    resolved_provider: str | None,
+    resolved_api_key: str | None,
+    resolved_base_url: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Return provider/key/base_url overrides for ``custom:*`` endpoints.
+
+    Hermes Agent treats named custom providers as routing hints around an
+    OpenAI-compatible base URL.  Local OpenAI-compatible servers often run
+    without authentication, so a missing key should not fail before the first
+    request; pass a harmless placeholder to the SDK and let the endpoint accept
+    it or return its own auth error.
+    """
+    if not (isinstance(resolved_provider, str) and resolved_provider.startswith("custom:")):
+        return resolved_provider, resolved_api_key, resolved_base_url
+
+    _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+    if not resolved_api_key and _cp_key:
+        resolved_api_key = _cp_key
+    if not resolved_base_url and _cp_base:
+        resolved_base_url = _cp_base
+    if resolved_base_url:
+        # Route through the generic custom OpenAI-compatible client once the
+        # named provider has supplied the concrete endpoint. Keeping the
+        # provider as custom:<slug> would make Agent init synthesize invalid
+        # env-var hints like CUSTOM:SOMETHING-8000_API_KEY on keyless setups.
+        resolved_provider = "custom"
+        if not resolved_api_key:
+            resolved_api_key = _KEYLESS_CUSTOM_API_KEY
+    return resolved_provider, resolved_api_key, resolved_base_url
+
+
+def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
+    """Return True if an agent lifecycle status should surface as a fallback warning."""
+    k = str(kind or '').strip().lower()
+    m = str(message or '').strip().lower()
+    return (
+        k == 'lifecycle'
+        and (
+            'rate limited' in m
+            or 'switching to fallback' in m
+            or 'falling back' in m
+            or 'fallback activated' in m
+            or 'trying fallback' in m
+        )
+    )
+
 
 def _prewarm_skill_tool_modules():
     """Import tools.skills_tool and tools.skill_manager_tool outside any lock.
@@ -1898,6 +1948,45 @@ def _strip_native_image_parts_from_content(content):
     return clean_parts
 
 
+def _content_has_reasoning_only_parts(content) -> bool:
+    if not isinstance(content, list) or not content:
+        return False
+    saw_reasoning = False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get('type')
+        if part_type in {'thinking', 'reasoning'}:
+            text = part.get('thinking') or part.get('reasoning') or part.get('text') or ''
+            if str(text).strip():
+                saw_reasoning = True
+            continue
+        if part_type == 'text' and str(part.get('text') or part.get('content') or '').strip():
+            return False
+        if part_type not in {'text', 'thinking', 'reasoning'}:
+            return False
+    return saw_reasoning
+
+
+def _is_reasoning_only_assistant_message(msg) -> bool:
+    """Return True for display-only assistant Thinking entries.
+
+    These entries keep partial Thinking cards visible after reload/cancel, but
+    they are not API-safe history: providers only see a blank assistant turn.
+    Visible assistant replies that also carry reasoning metadata are kept.
+    """
+    if not isinstance(msg, dict) or msg.get('role') != 'assistant':
+        return False
+    if msg.get('tool_calls'):
+        return False
+    content = msg.get('content', '')
+    if _message_text(content).strip():
+        return False
+    if str(msg.get('reasoning') or msg.get('reasoning_content') or '').strip():
+        return True
+    return _content_has_reasoning_only_parts(content)
+
+
 def _sanitize_messages_for_api(messages, *, cfg: dict = None):
     """Return a deep copy of messages with only API-safe fields.
 
@@ -1936,6 +2025,10 @@ def _sanitize_messages_for_api(messages, *, cfg: dict = None):
     for msg in messages:
         if not isinstance(msg, dict):
             continue
+        # Skip display-only Thinking entries. They are visible transcript
+        # metadata, not provider-facing assistant turns.
+        if _is_reasoning_only_assistant_message(msg):
+            continue
         # Skip persisted error markers — never send them to the LLM as prior context.
         if msg.get('_error'):
             continue
@@ -1970,6 +2063,8 @@ def _api_safe_message_positions(messages):
     for idx, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
+        if _is_reasoning_only_assistant_message(msg):
+            continue
         role = msg.get('role')
         if role == 'tool':
             tid = msg.get('tool_call_id') or ''
@@ -2003,13 +2098,6 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
             return None
         return {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS and msg.get('role')}
 
-    def _reasoning_only_assistant(msg):
-        if not isinstance(msg, dict) or msg.get('role') != 'assistant' or not msg.get('reasoning'):
-            return False
-        if msg.get('tool_calls'):
-            return False
-        return not _message_text(msg.get('content'))
-
     safe_pos = 0
     while safe_pos < len(prev_safe):
         prev_idx, _ = prev_safe[safe_pos]
@@ -2026,12 +2114,28 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
             safe_pos += 1
             continue
 
-        if _reasoning_only_assistant(prev_msg):
-            updated_messages.insert(safe_pos, copy.deepcopy(prev_msg))
-            safe_pos += 1
-            continue
-
         safe_pos += 1
+
+    return updated_messages
+
+
+def _restore_display_reasoning_metadata(previous_messages, updated_messages):
+    """Restore display-only thinking rows for visible transcript persistence."""
+    updated_messages = _restore_reasoning_metadata(previous_messages, updated_messages)
+    if not previous_messages or not updated_messages:
+        return updated_messages
+    prev_safe = _api_safe_message_positions(previous_messages)
+    safe_indices = {idx for idx, _ in prev_safe}
+    inserted_reasoning_only = 0
+    for prev_idx, prev_msg in enumerate(previous_messages):
+        if prev_idx in safe_indices or not _is_reasoning_only_assistant_message(prev_msg):
+            continue
+        safe_pos = sum(1 for idx, _ in prev_safe if idx < prev_idx) + inserted_reasoning_only
+        existing = updated_messages[safe_pos] if safe_pos < len(updated_messages) else None
+        if isinstance(existing, dict) and _is_reasoning_only_assistant_message(existing):
+            continue
+        updated_messages.insert(safe_pos, copy.deepcopy(prev_msg))
+        inserted_reasoning_only += 1
     return updated_messages
 
 
@@ -2978,7 +3082,12 @@ def _run_agent_streaming(
             logger.debug("Failed to put event to queue")
 
     def _agent_status_callback(kind, message):
-        """Bridge Agent lifecycle compression status into WebUI SSE."""
+        """Bridge Agent lifecycle status into WebUI SSE.
+
+        Passes compression events as 'compressing' events and rate-limit/fallback
+        events as 'warning' events so the frontend can surface them to the user.
+        All other lifecycle messages are dropped silently.
+        """
         _message = str(message or '').strip()
         _kind = str(kind or '').strip().lower()
         if not _message:
@@ -2993,12 +3102,17 @@ def _run_agent_streaming(
                 or 'context too large' in _lower
             )
         )
-        if not _is_compression_start:
+        if _is_compression_start:
+            put('compressing', {
+                'session_id': session_id,
+                'message': 'Auto-compressing context to continue...',
+            })
             return
-        put('compressing', {
-            'session_id': session_id,
-            'message': 'Auto-compressing context to continue...',
-        })
+        # Pass through rate-limit and fallback messages so the frontend can
+        # show them as warnings via the existing messages.js 'warning' listener.
+        _is_fallback_notice = _is_fallback_lifecycle_message(_kind, _message)
+        if _is_fallback_notice:
+            put('warning', {'type': 'fallback', 'message': _message})
 
     # Initialised here (before any code that may raise) so the outer `finally`
     # block can safely check `if _checkpoint_stop is not None` even when an
@@ -3467,12 +3581,9 @@ def _run_agent_streaming(
             # Named custom providers (custom:slug) may not be resolvable by
             # hermes_cli.runtime_provider directly. Fall back to config.yaml
             # custom_providers[] so WebUI can pass explicit creds/base_url.
-            if isinstance(resolved_provider, str) and resolved_provider.startswith("custom:"):
-                _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
-                if not resolved_api_key and _cp_key:
-                    resolved_api_key = _cp_key
-                if not resolved_base_url and _cp_base:
-                    resolved_base_url = _cp_base
+            resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
+                resolved_provider, resolved_api_key, resolved_base_url
+            )
 
             # Read per-profile config at call time (not module-level snapshot)
             from api.config import get_config as _get_config
@@ -4004,7 +4115,7 @@ def _run_agent_streaming(
                 s.messages = _merge_display_messages_after_agent_result(
                     _previous_messages,
                     _previous_context_messages,
-                    _restore_reasoning_metadata(_previous_messages, _result_messages),
+                    _restore_display_reasoning_metadata(_previous_messages, _result_messages),
                     msg_text,
                 )
                 # Strip XML tool-call blocks from assistant message content.
@@ -4090,12 +4201,9 @@ def _run_agent_streaming(
                                 resolved_provider = _heal_rt.get('provider')
                             if not resolved_base_url:
                                 resolved_base_url = _heal_rt.get('base_url')
-                            if isinstance(resolved_provider, str) and resolved_provider.startswith('custom:'):
-                                _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
-                                if not resolved_api_key and _cp_key:
-                                    resolved_api_key = _cp_key
-                                if not resolved_base_url and _cp_base:
-                                    resolved_base_url = _cp_base
+                            resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
+                                resolved_provider, resolved_api_key, resolved_base_url
+                            )
                             # Rebuild agent kwargs and create a fresh agent
                             _agent_kwargs['api_key'] = resolved_api_key
                             _agent_kwargs['base_url'] = resolved_base_url
@@ -4237,11 +4345,15 @@ def _run_agent_streaming(
                 # reference stays alive even after the dict entry is removed.
                 # Concurrent readers that already looked up the old ID will still
                 # see the same Lock object until they release it.
+                _compression_origin_session_id = session_id
+                _compression_continuation_session_id = None
                 _agent_sid = getattr(agent, 'session_id', None)
                 _compressed = False
                 if _agent_sid and _agent_sid != session_id:
                     old_sid = session_id
                     new_sid = _agent_sid
+                    _compression_origin_session_id = old_sid
+                    _compression_continuation_session_id = new_sid
                     s.session_id = new_sid
                     # Carry profile identity across the compression boundary.
                     # Without this, s.profile stays None on the continuation
@@ -4318,8 +4430,13 @@ def _run_agent_streaming(
                         _compression_summary_from_messages(s.messages)
                         or _compression_summary_from_messages(s.context_messages)
                     )
+                    if _compression_continuation_session_id is None:
+                        _compression_continuation_session_id = s.session_id
                     put('compressed', {
-                        'session_id': s.session_id,
+                        'session_id': _compression_origin_session_id,
+                        'old_session_id': _compression_origin_session_id,
+                        'new_session_id': _compression_continuation_session_id,
+                        'continuation_session_id': _compression_continuation_session_id,
                         'message': 'Context auto-compressed to continue the conversation',
                         'usage': _live_usage_snapshot(),
                     })
@@ -4894,12 +5011,9 @@ def _run_agent_streaming(
                         resolved_provider = _heal_rt.get('provider')
                     if not resolved_base_url:
                         resolved_base_url = _heal_rt.get('base_url')
-                    if isinstance(resolved_provider, str) and resolved_provider.startswith('custom:'):
-                        _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
-                        if not resolved_api_key and _cp_key:
-                            resolved_api_key = _cp_key
-                        if not resolved_base_url and _cp_base:
-                            resolved_base_url = _cp_base
+                    resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
+                        resolved_provider, resolved_api_key, resolved_base_url
+                    )
                     # Build a fresh agent with the new credentials
                     _heal_kwargs = dict(_agent_kwargs) if '_agent_kwargs' in dir() else {}
                     _heal_kwargs['api_key'] = resolved_api_key
