@@ -1362,10 +1362,33 @@ shows a status message if load fails.
 Frontend only -- uses existing GET /api/file endpoint for text content.
 openFile() checks MD_EXTS set. If markdown, fetches text then calls:
 
-    $('previewMd').innerHTML = renderMd(data.content);
+    renderWorkspaceMarkdown(data.content);
 
 Preview renders in .preview-md container with full typography CSS separate from the
 chat bubble .msg-body CSS (allows different sizing/spacing for the narrower side panel).
+`renderWorkspaceMarkdown()` uses `renderMd()` and then runs the richer Markdown
+post-processing path when available: syntax highlighting, copy buttons, inline
+media loaders, Mermaid, KaTeX, and JSON/YAML tree views. Markdown file rows also
+show an eye button that opens this rendered preview explicitly, and the preview
+toolbar can pop the rendered HTML into a separate browser window without
+switching to raw Markdown source.
+
+**Workspace Git Changes**
+
+Backend Git behavior lives in `api/workspace_git.py`. All subprocess calls use
+argument arrays with `shell=False`, bounded timeouts, and workspace-relative
+path resolution before pathspecs are passed to Git. Mutating operations share a
+per-repository lock so stage, unstage, discard, commit, pull, push, and future
+write operations cannot race within one repo.
+
+Selected-file commits use a temporary index initialized from `HEAD`. The
+selected paths are staged into that temporary index and committed from there, so
+the user's real index is not used as the commit source and unrelated staged
+files are not accidentally included. After a successful selected commit, the
+real index is reset for the selected paths only so unrelated staged entries stay
+staged. Git API errors return sanitized messages plus stable codes such as
+`path_outside_workspace`, `conflict`, `timeout`, `missing_git`, `auth_failed`,
+`no_upstream`, and `non_fast_forward`.
 
 **Table Support in renderMd()**
 

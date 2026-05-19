@@ -1,4 +1,4 @@
-const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',showHiddenWorkspaceFiles:false};
+const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',showHiddenWorkspaceFiles:false,git:{status:null,selectedTab:'files',selectedDiff:null,loading:false}};
 const INFLIGHT={};  // keyed by session_id while request in-flight
 const SESSION_QUEUES={};  // keyed by session_id for queued follow-up turns
 const MAX_UPLOAD_BYTES=(window.__HERMES_CONFIG__&&window.__HERMES_CONFIG__.maxUploadBytes)||20*1024*1024;
@@ -7615,6 +7615,10 @@ function renderFileTree(){
   _renderTreeItems(box, visibleEntries, 0);
 }
 
+function _isWorkspaceMarkdownPath(path){
+  return /\.(md|markdown|mdown)$/i.test(String(path||''));
+}
+
 function _renderTreeItems(container, entries, depth){
   for(const item of entries){
     const el=document.createElement('div');el.className='file-item';
@@ -7714,6 +7718,26 @@ function _renderTreeItems(container, entries, depth){
     };
     el.appendChild(nameEl);
 
+    const gitState=(typeof _gitStatusForPath==='function')?_gitStatusForPath(item.path):null;
+    if(gitState){
+      const gitMark=document.createElement('span');
+      gitMark.className='file-git-status'+(gitState.conflict?' conflict':gitState.untracked?' untracked':'');
+      gitMark.textContent=gitState.status||'M';
+      gitMark.title='Git status';
+      el.appendChild(gitMark);
+    }
+
+    if(item.type==='file'&&_isWorkspaceMarkdownPath(item.path)){
+      const previewBtn=document.createElement('button');
+      previewBtn.className='file-preview-btn';
+      previewBtn.type='button';
+      previewBtn.title=`Preview rendered Markdown: ${item.name}`;
+      previewBtn.setAttribute('aria-label',`Preview rendered Markdown: ${item.name}`);
+      previewBtn.innerHTML=(typeof li==='function')?li('eye',13):'Preview';
+      previewBtn.onclick=(e)=>{e.stopPropagation();openFile(item.path);};
+      el.appendChild(previewBtn);
+    }
+
     // Size -- only for files
     if(item.type==='file'&&item.size){
       const sizeEl=document.createElement('span');
@@ -7789,6 +7813,7 @@ async function deleteWorkspaceDir(relPath, name){
     if(S._expandedDirs){S._expandedDirs.delete(relPath);if(typeof _saveExpandedDirs==='function')_saveExpandedDirs();}
     delete S._dirCache[relPath];
     await loadDir(S.currentDir);
+    if(typeof refreshGitStatus==='function')refreshGitStatus();
   }catch(e){setStatus(t('delete_failed')+e.message);}
 }
 
@@ -7919,6 +7944,7 @@ async function deleteWorkspaceFile(relPath, name){
     // Close preview if we just deleted the viewed file
     if($('previewPathText').textContent===relPath)$('btnClearPreview').onclick();
     await loadDir(S.currentDir);
+    if(typeof refreshGitStatus==='function')refreshGitStatus();
   }catch(e){setStatus(t('delete_failed')+e.message);}
 }
 
@@ -7941,6 +7967,7 @@ async function promptNewFile(){
     await api('/api/file/create',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath,content:''})});
     showToast(t('created')+name.trim());
     await loadDir(S.currentDir);
+    if(typeof refreshGitStatus==='function')refreshGitStatus();
     openFile(relPath);
   }catch(e){setStatus(t('create_failed')+e.message);}
 }
@@ -7963,6 +7990,7 @@ async function promptNewFolder(){
     await api('/api/file/create-dir',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath})});
     showToast(t('folder_created')+name.trim());
     await loadDir(S.currentDir);
+    if(typeof refreshGitStatus==='function')refreshGitStatus();
     // Offer to add the new folder as a space (#782)
     const absPath=S.session.workspace?((S.currentDir==='.'?S.session.workspace:S.session.workspace+'/'+S.currentDir)+'/'+name.trim()):null;
     if(absPath){

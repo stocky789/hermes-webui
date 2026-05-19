@@ -385,6 +385,22 @@ EXPECT:
   - Data rows alternate subtle background
 FAIL: Table displayed as raw pipe-separated text.
 
+### T5.7b: Markdown Eye Preview and Popout
+SETUP: Workspace has a Markdown file with headings, a table, fenced code, KaTeX, Mermaid, images, and links.
+STEPS:
+  1. Open the workspace file tree
+  2. Click the eye button next to the Markdown file
+  3. Click the rendered preview popout button in the preview toolbar
+  4. Click the preview back button
+  5. Reopen the Markdown preview and click Edit
+EXPECT:
+  - Eye click opens the rendered Markdown preview without triggering rename or another row action
+  - Rendered preview runs the same post-processing path as chat Markdown where available: code highlighting, copy buttons, Mermaid, KaTeX, and JSON/YAML tree views
+  - Popout opens rendered Markdown, not raw source
+  - Back returns to the file tree
+  - Edit mode still shows raw Markdown and save returns to rendered preview
+FAIL: Eye click opens raw source, also triggers another file-row action, popout shows raw Markdown, or post-processed blocks are missing.
+
 ### T5.8: Refresh Files Button
 SETUP: Active session, workspace has files.
 STEPS:
@@ -395,6 +411,45 @@ EXPECT:
 FAIL: Error, spinner never stops, tree clears without reloading.
 
 ---
+
+## Section 5G: Workspace Git Changes
+
+### T5G.1: Selected-File Commit
+SETUP: Workspace is a Git repository with one modified tracked file, one untracked file, and one unrelated file already staged from the terminal.
+STEPS:
+  1. Open the workspace panel and click the Changes tab
+  2. Select only the modified tracked file checkbox
+  3. Click the modified file row to open its diff, then click the preview back button
+  4. Enter a commit message and click Commit
+EXPECT:
+  - Tracked and Untracked groups have master checkboxes with selected counts
+  - The commit button label includes the selected file count
+  - Diff preview has a visible back button that returns to the Changes list without losing selection
+  - The new commit contains only the selected file
+  - The unrelated staged file remains staged after the commit
+FAIL: Commit includes unrelated staged files, selected counts are wrong, or checkbox clicks open the diff.
+
+### T5G.2: Selected Commit Message Generation
+SETUP: Same as T5G.1, with at least two changed files.
+STEPS:
+  1. Select one changed file
+  2. Click Generate message
+EXPECT:
+  - Privacy note is visible below the commit message box
+  - Generated message is based on the selected diff only
+  - Generate button is disabled while generation is in progress
+FAIL: Message uses unselected files, no privacy note appears, or repeated clicks start duplicate generation.
+
+### T5G.3: Git Mutations and Remote Output
+SETUP: Workspace is a Git repository with a configured remote if available.
+STEPS:
+  1. Run stage, unstage, discard/delete, fetch, pull, and push actions as applicable
+  2. Trigger a Git error such as missing upstream or path outside workspace
+EXPECT:
+  - Mutation controls disable while another mutation is running
+  - Fetch/pull/push toast includes useful Git output when Git returns output
+  - Errors return a readable message and stable code from the API
+FAIL: Controls race, remote output is hidden, or errors expose raw paths/secrets.
 
 ## Section 6: Workspace Path
 
