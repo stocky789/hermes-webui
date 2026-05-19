@@ -774,6 +774,9 @@ def test_workspace_git_static_contracts():
     assert "git-diff-mode-btn" in workspace_js
     assert ".git-diff-split-row.change .old-code" in style
     assert ".git-diff-split-row.change .new-code" in style
+    assert ".git-badge{grid-column:1 / -1;grid-row:2;justify-self:start;font-size:11px" in style
+    assert ".git-branch-button{height:30px" in style
+    assert ".git-summary{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:\"SF Mono\",ui-monospace,monospace;font-size:13px" in style
     assert "selectedPaths:new Set()" in workspace_js
     assert "selectionKey:scopeKey" in workspace_js
     assert "_gitGroupHeader" in workspace_js
