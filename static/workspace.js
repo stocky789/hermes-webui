@@ -350,7 +350,7 @@ function _gitChangeRow(file, kind){
     const open=document.createElement('button');
     open.className='mini-btn';
     open.textContent=t('open');
-    open.onclick=e=>{e.stopPropagation();openFile(file.path);};
+    open.onclick=e=>{e.stopPropagation();openFile(file.path,{returnTo:'changes'});};
     actions.appendChild(open);
   }else{
     const stage=document.createElement('button');
@@ -495,6 +495,18 @@ function fileExt(p){ const i=p.lastIndexOf('.'); return i>=0?p.slice(i).toLowerC
 let _previewCurrentPath = '';  // relative path of currently previewed file
 let _previewCurrentMode = '';  // 'code' | 'md' | 'image' | 'html' | 'pdf' | 'audio' | 'video'
 let _previewDirty = false;     // true when edits are unsaved
+let _previewReturnTarget = 'files'; // 'files' | 'changes'
+
+function _setPreviewReturnTarget(target){
+  _previewReturnTarget=target==='changes'?'changes':'files';
+  const btn=$('btnPreviewBack');
+  const label=$('previewBackLabel');
+  if(label)label.textContent=_previewReturnTarget==='changes'?t('git_changes'):t('git_files');
+  if(btn){
+    btn.style.display='inline-flex';
+    btn.title=_previewReturnTarget==='changes'?t('git_changes'):t('git_files');
+  }
+}
 
 function showPreview(mode){
   // mode: 'code' | 'image' | 'md' | 'html' | 'pdf' | 'audio' | 'video' | 'gitdiff'
@@ -519,6 +531,36 @@ function showPreview(mode){
   if(mdPopoutBtn) mdPopoutBtn.style.display = mode==='md'?'inline-flex':'none';
   const downloadBtn=$('btnDownloadFile');
   if(downloadBtn) downloadBtn.style.display = mode==='gitdiff'?'none':'inline-flex';
+}
+
+function _closePreviewSurface(){
+  const pa=$('previewArea');if(pa)pa.classList.remove('visible');
+  const pi=$('previewImg');if(pi){pi.onerror=null;pi.src='';}
+  const pdf=$('previewPdfFrame');if(pdf)pdf.src='';
+  const html=$('previewHtmlIframe');if(html)html.src='';
+  const pm=$('previewMd');if(pm)pm.innerHTML='';
+  const pc=$('previewCode');if(pc)pc.textContent='';
+  const pp=$('previewPathText');if(pp)pp.textContent='';
+  const back=$('btnPreviewBack');if(back)back.style.display='none';
+  _previewCurrentPath='';_previewCurrentMode='';_previewDirty=false;
+}
+
+async function returnFromPreview(){
+  if(typeof _previewDirty!=='undefined'&&_previewDirty){
+    const ok=await showConfirmDialog({title:t('unsaved_confirm'),message:'',confirmLabel:'Discard',danger:true,focusCancel:true});
+    if(!ok)return;
+  }
+  if(_previewReturnTarget==='changes'){
+    if(S.git){
+      S.git.selectedTab='changes';
+      S.git.selectedDiff=null;
+    }
+    _closePreviewSurface();
+    renderGitChanges();
+    renderWorkspacePanelTabState();
+    return;
+  }
+  if(typeof clearPreview==='function')clearPreview({keepPanelOpen:true});
 }
 
 function updateEditBtn(){
@@ -602,7 +644,7 @@ function cancelEditMode(){
   updateEditBtn();
 }
 
-async function openFile(path){
+async function openFile(path,opts={}){
   if(!S.session)return;
   const ext=fileExt(path);
 
@@ -615,6 +657,8 @@ async function openFile(path){
   $('previewPathText').textContent=path;
   $('previewArea').classList.add('visible');
   $('fileTree').style.display='none';
+  const returnTarget=opts.returnTo||(S.git&&S.git.selectedTab==='changes'?'changes':'files');
+  _setPreviewReturnTarget(returnTarget);
 
   _previewCurrentPath = path;
   renderFileBreadcrumb(path);
@@ -770,6 +814,7 @@ async function openGitDiff(path,kind='unstaged'){
   $('previewPathText').textContent=`Changes / ${path}`;
   $('previewArea').classList.add('visible');
   $('fileTree').style.display='none';
+  _setPreviewReturnTarget('changes');
   const changesView=$('gitChangesView'); if(changesView) changesView.style.display='none';
   const diffView=$('gitDiffView');
   if(diffView){
@@ -848,7 +893,7 @@ function renderGitDiff(diff){
   const open=document.createElement('button');
   open.className='mini-btn';
   open.textContent=t('open_file');
-  open.onclick=()=>openFile(diff.path);
+  open.onclick=()=>openFile(diff.path,{returnTo:'changes'});
   actions.appendChild(open);
   view.appendChild(actions);
   for(const lineText of text.split('\n')){

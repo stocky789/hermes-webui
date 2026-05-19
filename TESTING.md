@@ -391,11 +391,13 @@ STEPS:
   1. Open the workspace file tree
   2. Click the eye button next to the Markdown file
   3. Click the rendered preview popout button in the preview toolbar
-  4. Return to the preview and click Edit
+  4. Click the preview back button
+  5. Reopen the Markdown preview and click Edit
 EXPECT:
   - Eye click opens the rendered Markdown preview without triggering rename or another row action
   - Rendered preview runs the same post-processing path as chat Markdown where available: code highlighting, copy buttons, Mermaid, KaTeX, and JSON/YAML tree views
   - Popout opens rendered Markdown, not raw source
+  - Back returns to the file tree
   - Edit mode still shows raw Markdown and save returns to rendered preview
 FAIL: Eye click opens raw source, also triggers another file-row action, popout shows raw Markdown, or post-processed blocks are missing.
 
@@ -417,10 +419,12 @@ SETUP: Workspace is a Git repository with one modified tracked file, one untrack
 STEPS:
   1. Open the workspace panel and click the Changes tab
   2. Select only the modified tracked file checkbox
-  3. Enter a commit message and click Commit
+  3. Click the modified file row to open its diff, then click the preview back button
+  4. Enter a commit message and click Commit
 EXPECT:
   - Tracked and Untracked groups have master checkboxes with selected counts
   - The commit button label includes the selected file count
+  - Diff preview has a visible back button that returns to the Changes list without losing selection
   - The new commit contains only the selected file
   - The unrelated staged file remains staged after the commit
 FAIL: Commit includes unrelated staged files, selected counts are wrong, or checkbox clicks open the diff.

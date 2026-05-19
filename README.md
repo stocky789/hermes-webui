@@ -432,7 +432,7 @@ Production data and real cron jobs are never touched. Current snapshot:
 ### Workspace file browser
 - Directory tree with expand/collapse (single-click toggles, double-click navigates)
 - Breadcrumb navigation with clickable path segments
-- Preview text, code, Markdown (rendered), and images inline; Markdown rows also expose an eye button for explicit rendered preview and a rendered popout
+- Preview text, code, Markdown (rendered), and images inline; Markdown rows also expose an eye button for explicit rendered preview, a rendered popout, and contextual back navigation
 - Edit, create, delete, and rename files; create folders
 - Binary file download (auto-detected from server)
 - File preview auto-closes on directory navigation (with unsaved-edit guard)

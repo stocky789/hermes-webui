@@ -539,6 +539,8 @@ def test_workspace_git_static_contracts():
         "gitCommitBox",
         "gitCommitMessage",
         "gitSelectionSummary",
+        "btnPreviewBack",
+        "previewBackLabel",
         "btnGitGenerateCommitMessage",
         "btnGitCommit",
         "btnMarkdownPopout",
@@ -560,6 +562,9 @@ def test_workspace_git_static_contracts():
         "runGitRemoteAction",
         "switchWorkspacePanelTab",
         "openMarkdownPopout",
+        "returnFromPreview",
+        "_setPreviewReturnTarget",
+        "_closePreviewSurface",
         "renderWorkspaceMarkdown",
         "postProcessWorkspaceMarkdown",
     ]:
@@ -580,6 +585,9 @@ def test_workspace_git_static_contracts():
     assert "_gitGroupHeader" in workspace_js
     assert "checkbox.indeterminate" in workspace_js
     assert "stagedOnly" in workspace_js
+    assert "openFile(diff.path,{returnTo:'changes'})" in workspace_js
+    assert "openFile(file.path,{returnTo:'changes'})" in workspace_js
+    assert "S.git.selectedTab='changes'" in workspace_js
     assert "URL.createObjectURL(new Blob" in workspace_js
     assert "catch(e){\n    renderGitBadge(git.status);" in workspace_js
     assert "'/api/git/commit-selected'" in workspace_js
@@ -600,6 +608,7 @@ def test_workspace_git_static_contracts():
         ".git-select-checkbox",
         ".git-selection-summary",
         ".file-preview-btn",
+        ".preview-back-btn",
     ]:
         assert cls in style
     assert ".git-stat-add" in style and ".git-stat-del" in style

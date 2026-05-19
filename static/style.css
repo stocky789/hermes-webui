@@ -1519,6 +1519,8 @@
   .file-preview-btn{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--muted);border-radius:5px;cursor:pointer;flex-shrink:0;}
   .file-preview-btn:hover,.file-preview-btn:focus-visible{background:var(--hover-bg);color:var(--text);outline:none;}
   .preview-path{gap:6px;}
+  .preview-back-btn{width:auto;min-width:0;padding:2px 7px;gap:3px;font-size:11px;color:var(--text);background:var(--hover-bg);flex-shrink:0;}
+  .preview-back-btn:hover,.preview-back-btn:focus-visible{background:var(--accent-bg);color:var(--accent-text);}
   .preview-toolbar-btn{flex-shrink:0;}
   #btnOpenInBrowser:not([style*="display: none"])+#btnDownloadFile,#btnMarkdownPopout:not([style*="display: none"])~#btnDownloadFile{margin-left:0 !important;}
   /* File type badge in preview path bar */
