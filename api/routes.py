@@ -2229,6 +2229,7 @@ from api.workspace import (
     get_last_workspace,
     set_last_workspace,
     list_dir,
+    dir_signature,
     list_workspace_suggestions,
     read_file_content,
     safe_resolve_ws,
@@ -6128,11 +6129,14 @@ def _handle_list_dir(handler, parsed):
         except Exception:
             return bad(handler, "Session not found", 404)
     try:
+        rel_path = qs.get("path", ["."])[0]
+        entries = list_dir(Path(workspace), rel_path)
         return j(
             handler,
             {
-                "entries": list_dir(Path(workspace), qs.get("path", ["."])[0]),
-                "path": qs.get("path", ["."])[0],
+                "entries": entries,
+                "signature": dir_signature(Path(workspace), rel_path, entries),
+                "path": rel_path,
             },
         )
     except (FileNotFoundError, ValueError) as e:

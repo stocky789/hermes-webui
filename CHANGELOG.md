@@ -4,6 +4,8 @@
 
 ### Added
 
+- Add workspace freshness polling for the right-hand file tree. `/api/list` now returns a cheap metadata signature for each listed directory, and the frontend polls the current/expanded directories while the workspace panel is visible so external file creates, deletes, and renames appear without manual navigation.
+- Add bounded background Git auto-fetch for workspace remotes. The WebUI quietly posts fetch-only syncs on a separate cadence from local status polling, updates behind/ahead indicators, backs off after failures, and shows a subtle last-fetch/error status near the Git badge without success toasts.
 - Add selected-file Git commits in the workspace Changes tab. Tracked and untracked changes now have checkbox selection with group master checkboxes, selected-count commit labels, selected-diff commit message generation with provider privacy copy, and a backend `POST /api/git/commit-selected` path that commits through a temporary index so unrelated staged files are not included.
 - Add explicit rendered Markdown preview affordances in the workspace file tree. Markdown rows now show an eye button, Markdown previews run the richer post-processing path where available, and the preview toolbar can open a rendered Markdown popout.
 
