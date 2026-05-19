@@ -7482,6 +7482,10 @@ function renderFileTree(){
   _renderTreeItems(box, visibleEntries, 0);
 }
 
+function _isWorkspaceMarkdownPath(path){
+  return /\.(md|markdown|mdown)$/i.test(String(path||''));
+}
+
 function _renderTreeItems(container, entries, depth){
   for(const item of entries){
     const el=document.createElement('div');el.className='file-item';
@@ -7581,6 +7585,17 @@ function _renderTreeItems(container, entries, depth){
       gitMark.textContent=gitState.status||'M';
       gitMark.title='Git status';
       el.appendChild(gitMark);
+    }
+
+    if(item.type==='file'&&_isWorkspaceMarkdownPath(item.path)){
+      const previewBtn=document.createElement('button');
+      previewBtn.className='file-preview-btn';
+      previewBtn.type='button';
+      previewBtn.title=`Preview rendered Markdown: ${item.name}`;
+      previewBtn.setAttribute('aria-label',`Preview rendered Markdown: ${item.name}`);
+      previewBtn.innerHTML=(typeof li==='function')?li('eye',13):'Preview';
+      previewBtn.onclick=(e)=>{e.stopPropagation();openFile(item.path);};
+      el.appendChild(previewBtn);
     }
 
     // Size -- only for files

@@ -4015,6 +4015,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/git/status":
         return _handle_git_status(handler, parsed)
 
+    if parsed.path == "/api/git/branches":
+        return _handle_git_branches(handler, parsed)
+
     if parsed.path == "/api/git/diff":
         return _handle_git_diff(handler, parsed)
 
@@ -4049,9 +4052,22 @@ def handle_get(handler, parsed) -> bool:
             s = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
-        from api.workspace import git_info_for_workspace
+        from api.workspace_git import GitWorkspaceError, git_status
 
-        info = git_info_for_workspace(Path(s.workspace))
+        try:
+            status = git_status(Path(s.workspace))
+        except GitWorkspaceError as e:
+            return _git_bad(handler, e)
+        totals = status.get("totals") or {}
+        info = None if not status.get("is_git") else {
+            "branch": status.get("branch"),
+            "dirty": totals.get("changed", 0),
+            "modified": (totals.get("staged", 0) or 0) + (totals.get("unstaged", 0) or 0),
+            "untracked": totals.get("untracked", 0),
+            "ahead": status.get("ahead", 0),
+            "behind": status.get("behind", 0),
+            "is_git": True,
+        }
         return j(handler, {"git": info})
 
     if parsed.path == "/api/commands":
@@ -5193,8 +5209,32 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/git/discard":
         return _handle_git_discard(handler, body)
 
+    if parsed.path == "/api/git/commit-message":
+        return _handle_git_commit_message(handler, body)
+
+    if parsed.path == "/api/git/commit-message-selected":
+        return _handle_git_commit_message_selected(handler, body)
+
     if parsed.path == "/api/git/commit":
         return _handle_git_commit(handler, body)
+
+    if parsed.path == "/api/git/commit-selected":
+        return _handle_git_commit_selected(handler, body)
+
+    if parsed.path == "/api/git/fetch":
+        return _handle_git_remote_action(handler, body, "fetch")
+
+    if parsed.path == "/api/git/pull":
+        return _handle_git_remote_action(handler, body, "pull")
+
+    if parsed.path == "/api/git/push":
+        return _handle_git_remote_action(handler, body, "push")
+
+    if parsed.path == "/api/git/checkout":
+        return _handle_git_checkout(handler, body)
+
+    if parsed.path == "/api/git/stash-checkout":
+        return _handle_git_stash_checkout(handler, body)
 
     # ── File ops (POST) ──
     if parsed.path == "/api/file/delete":
@@ -8393,7 +8433,20 @@ def _handle_git_status(handler, parsed):
 
         return j(handler, {"git": git_status(workspace)})
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
+
+
+def _handle_git_branches(handler, parsed):
+    qs = parse_qs(parsed.query)
+    workspace = _git_session_workspace(handler, qs.get("session_id", [""])[0])
+    if workspace is None:
+        return True
+    try:
+        from api.workspace_git import GitWorkspaceError, git_branches
+
+        return j(handler, {"branches": git_branches(workspace)})
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
 
 
 def _handle_git_diff(handler, parsed):
@@ -8410,7 +8463,18 @@ def _handle_git_diff(handler, parsed):
 
         return j(handler, {"diff": git_diff(workspace, path, kind)})
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
+
+
+def _git_bad(handler, err, status: int = 400):
+    return j(
+        handler,
+        {
+            "error": _sanitize_error(err),
+            "code": getattr(err, "code", "git_failed") or "git_failed",
+        },
+        status=status,
+    )
 
 
 def _git_paths_from_body(body) -> list[str]:
@@ -8437,7 +8501,7 @@ def _handle_git_stage(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
 
 
 def _handle_git_unstage(handler, body):
@@ -8453,7 +8517,7 @@ def _handle_git_unstage(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
 
 
 def _handle_git_discard(handler, body):
@@ -8479,7 +8543,162 @@ def _handle_git_discard(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
+
+
+def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) -> str:
+    from api import profiles as profiles_api
+
+    active_profile = profiles_api.get_active_profile_name() or "default"
+    with profiles_api.profile_env_for_background_worker(
+        active_profile,
+        "git commit message",
+        logger_override=logger,
+    ):
+        from api.config import (
+            get_effective_default_model,
+            model_with_provider_context,
+            resolve_custom_provider_connection,
+            resolve_model_provider,
+        )
+
+        session_model = str(getattr(session, "model", "") or "").strip()
+        session_provider = str(getattr(session, "model_provider", "") or "").strip() or None
+        model_for_resolution = (
+            model_with_provider_context(session_model, session_provider)
+            if session_model
+            else get_effective_default_model()
+        )
+        _main_model, _main_provider, _main_base_url = resolve_model_provider(model_for_resolution)
+        _main_api_key = None
+        try:
+            from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                resolve_runtime_provider,
+                requested=_main_provider,
+            )
+            _main_api_key = _rt.get("api_key")
+            if not _main_provider:
+                _main_provider = _rt.get("provider")
+            if not _main_base_url:
+                _main_base_url = _rt.get("base_url")
+        except Exception as _e:
+            logger.debug("git commit message runtime provider resolution failed: %s", _e)
+        if isinstance(_main_provider, str) and _main_provider.startswith("custom:"):
+            _cp_key, _cp_base = resolve_custom_provider_connection(_main_provider)
+            if not _main_api_key and _cp_key:
+                _main_api_key = _cp_key
+            if not _main_base_url and _cp_base:
+                _main_base_url = _cp_base
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        main_runtime = {
+            "provider": _main_provider,
+            "model": _main_model,
+            "base_url": _main_base_url,
+            "api_key": _main_api_key,
+        }
+        try:
+            from agent.auxiliary_client import get_text_auxiliary_client
+
+            aux_client, aux_model = get_text_auxiliary_client(
+                "compression",
+                main_runtime=main_runtime,
+            )
+            if aux_client is not None and aux_model:
+                response = aux_client.chat.completions.create(
+                    model=aux_model,
+                    messages=messages,
+                )
+                return str(response.choices[0].message.content or "").strip()
+        except Exception as _e:
+            logger.debug("git commit message auxiliary model failed; falling back to main model: %s", _e)
+
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model=_main_model,
+            provider=_main_provider,
+            base_url=_main_base_url,
+            api_key=_main_api_key,
+            platform="webui",
+            quiet_mode=True,
+            enabled_toolsets=[],
+            session_id=f"git-commit-message-{uuid.uuid4().hex[:8]}",
+        )
+        result = agent.run_conversation(
+            user_message=user_prompt,
+            system_message=system_prompt,
+            conversation_history=[],
+            task_id=f"git-commit-message-{uuid.uuid4().hex[:8]}",
+        )
+        return str(result.get("final_response") or "").strip()
+
+
+def _handle_git_commit_message(handler, body):
+    from api.workspace_git import (
+        GitWorkspaceError,
+        clean_generated_commit_message,
+        staged_commit_message_prompt,
+    )
+
+    try:
+        require(body, "session_id")
+        session = get_session(body["session_id"])
+        workspace = Path(session.workspace)
+
+        prompt = staged_commit_message_prompt(workspace)
+        message = clean_generated_commit_message(
+            _llm_git_commit_message(prompt["system_prompt"], prompt["user_prompt"], session=session)
+        )
+        if not message:
+            raise GitWorkspaceError("No commit message was generated")
+        return j(handler, {"ok": True, "message": message, "truncated": bool(prompt.get("truncated"))})
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+    except Exception as e:
+        logger.exception("git commit message generation failed")
+        return bad(handler, _sanitize_error(e), 500)
+
+
+def _handle_git_commit_message_selected(handler, body):
+    from api.workspace_git import (
+        GitWorkspaceError,
+        clean_generated_commit_message,
+        selected_commit_message_prompt,
+    )
+
+    try:
+        require(body, "session_id")
+        paths = _git_paths_from_body(body)
+        session = get_session(body["session_id"])
+        workspace = Path(session.workspace)
+
+        prompt = selected_commit_message_prompt(workspace, paths)
+        message = clean_generated_commit_message(
+            _llm_git_commit_message(prompt["system_prompt"], prompt["user_prompt"], session=session)
+        )
+        if not message:
+            raise GitWorkspaceError("No commit message was generated")
+        return j(handler, {"ok": True, "message": message, "truncated": bool(prompt.get("truncated"))})
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+    except Exception as e:
+        logger.exception("selected git commit message generation failed")
+        return bad(handler, _sanitize_error(e), 500)
 
 
 def _handle_git_commit(handler, body):
@@ -8494,7 +8713,108 @@ def _handle_git_commit(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
+
+
+def _handle_git_commit_selected(handler, body):
+    try:
+        require(body, "session_id", "message")
+        paths = _git_paths_from_body(body)
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_commit_selected
+
+        return j(handler, git_commit_selected(workspace, body.get("message", ""), paths))
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+
+
+def _handle_git_remote_action(handler, body, action: str):
+    try:
+        require(body, "session_id")
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_fetch, git_pull, git_push
+
+        actions = {
+            "fetch": git_fetch,
+            "pull": git_pull,
+            "push": git_push,
+        }
+        return j(handler, actions[action](workspace))
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+
+
+def _handle_git_checkout(handler, body):
+    try:
+        require(body, "session_id", "ref", "mode")
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_checkout
+
+        result = git_checkout(
+            workspace,
+            str(body.get("ref", "")),
+            str(body.get("mode", "local")),
+            new_branch=body.get("new_branch"),
+            track=bool(body.get("track")),
+            dirty_mode=str(body.get("dirty_mode", "block")),
+        )
+        return j(
+            handler,
+            {
+                "ok": True,
+                "git": result.get("status"),
+                "branches": result.get("branches"),
+                "current_branch": result.get("current_branch"),
+                "message": result.get("message", ""),
+            },
+        )
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+
+
+def _handle_git_stash_checkout(handler, body):
+    try:
+        require(body, "session_id", "ref", "mode")
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_stash_and_checkout
+
+        result = git_stash_and_checkout(
+            workspace,
+            str(body.get("ref", "")),
+            str(body.get("mode", "local")),
+            new_branch=body.get("new_branch"),
+            track=bool(body.get("track")),
+        )
+        return j(
+            handler,
+            {
+                "ok": True,
+                "git": result.get("status"),
+                "branches": result.get("branches"),
+                "current_branch": result.get("current_branch"),
+                "message": result.get("message", ""),
+                "stash_name": result.get("stash_name", ""),
+                "stashed": bool(result.get("stashed")),
+            },
+        )
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
 
 
 def _handle_file_delete(handler, body):

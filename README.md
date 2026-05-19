@@ -432,11 +432,13 @@ Production data and real cron jobs are never touched. Current snapshot:
 ### Workspace file browser
 - Directory tree with expand/collapse (single-click toggles, double-click navigates)
 - Breadcrumb navigation with clickable path segments
-- Preview text, code, Markdown (rendered), and images inline
+- Preview text, code, Markdown (rendered), and images inline; Markdown rows also expose an eye button for explicit rendered preview, a rendered popout, and contextual back navigation
 - Edit, create, delete, and rename files; create folders
 - Binary file download (auto-detected from server)
 - File preview auto-closes on directory navigation (with unsaved-edit guard)
 - Git detection -- branch name and dirty file count badge in workspace header
+- Git Changes tab with tracked/untracked checkboxes, selected-file commits that avoid unrelated staged files, selected-diff commit message generation, diffs, stage/unstage, discard/delete, fetch, pull, and push
+- Line-ending-only and filemode-only Git noise is hidden by default with an inline explanation when detected
 - Right panel is drag-resizable
 - Syntax highlighted code preview (Prism.js)
 
@@ -531,7 +533,7 @@ static/
   index.html            HTML template (~1323 lines)
   style.css             All CSS incl. mobile responsive, themes (~3767 lines)
   ui.js                 DOM helpers, renderMd, tool cards, context indicator (~7216 lines)
-  workspace.js          File preview, file ops, git badge (~369 lines)
+  workspace.js          File preview, file ops, Git changes UI (~850 lines)
   sessions.js           Session CRUD, collapsible groups, search, reload recovery (~3517 lines)
   messages.js           send(), SSE handlers, live streaming, session recovery (~2301 lines)
   panels.js             Cron, skills, memory, profiles, settings (~6480 lines)
