@@ -110,6 +110,33 @@ def test_git_status_handles_staged_unstaged_untracked_deleted_and_renamed(tmp_pa
     assert status["totals"]["changed"] >= 5
 
 
+def test_git_status_reports_ignored_files_without_counting_them_as_changes(tmp_path):
+    from api.workspace_git import git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("*.log\nbuild/\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+
+    (repo / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")
+    (repo / "debug.log").write_text("ignored log\n", encoding="utf-8")
+    build = repo / "build"
+    build.mkdir()
+    (build / "artifact.txt").write_text("ignored artifact\n", encoding="utf-8")
+
+    status = git_status(repo)
+    by_path = {item["path"]: item for item in status["files"]}
+
+    assert by_path["tracked.txt"]["unstaged"] is True
+    assert by_path["debug.log"]["ignored"] is True
+    assert by_path["debug.log"]["status"] == "Ignored"
+    assert by_path["build/"]["ignored"] is True
+    assert by_path["build/"]["staged"] is False
+    assert by_path["build/"]["untracked"] is False
+    assert status["totals"]["changed"] == 1
+    assert status["totals"]["untracked"] == 0
+
+
 def test_git_status_ignores_crlf_only_worktree_noise(tmp_path):
     from api.workspace_git import git_status
 
@@ -217,6 +244,34 @@ def test_git_status_reports_untracked_files_inside_directories(tmp_path):
 
     git_discard(repo, ["newdir/a.txt"], delete_untracked=True)
     assert not (nested / "a.txt").exists()
+
+
+def test_git_status_reports_ignored_files_without_counting_them_as_changed(tmp_path):
+    from api.workspace_git import git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("*.log\nbuild/\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+
+    (repo / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")
+    (repo / "debug.log").write_text("ignored log\n", encoding="utf-8")
+    build = repo / "build"
+    build.mkdir()
+    (build / "artifact.txt").write_text("ignored artifact\n", encoding="utf-8")
+
+    status = git_status(repo)
+    by_path = {item["path"]: item for item in status["files"]}
+
+    assert by_path["tracked.txt"]["unstaged"] is True
+    assert by_path["debug.log"]["ignored"] is True
+    assert by_path["debug.log"]["status"] == "Ignored"
+    assert by_path["debug.log"]["staged"] is False
+    assert by_path["debug.log"]["unstaged"] is False
+    assert by_path["debug.log"]["untracked"] is False
+    assert any(item["ignored"] and item["path"].startswith("build") for item in status["files"])
+    assert status["totals"]["changed"] == 1
+    assert status["totals"]["untracked"] == 0
 
 
 def test_git_diff_large_untracked_file_is_bounded(tmp_path):
@@ -761,6 +816,12 @@ def test_workspace_git_static_contracts():
     assert "showToast(_gitRemoteToastMessage(action,data),4200)" in workspace_js
     assert "confirm(" not in discard_body.replace("showConfirmDialog(", "")
     assert "file-git-status" in ui_js
+    assert "git-ignored" in ui_js
+    assert "gitState.ignored?' ignored'" in ui_js
+    assert "Ignored by Git" in workspace_js
+    assert "f.ignored)return false" in workspace_js
+    assert ".file-item.git-ignored" in style
+    assert ".file-git-status.ignored" in style
     assert "file-preview-btn" in ui_js
     assert "function toastMessageHtml" in ui_js
     assert "toast-title" in ui_js and "toast-detail" in ui_js
@@ -855,6 +916,10 @@ def test_workspace_git_static_contracts():
     assert "Math.floor(_editorIndentColumns(line,tabSize)/tabSize)" in workspace_js
     assert "previewCodeGuides" in workspace_js and "previewEditGuides" in workspace_js
     assert "code==='??')return 'New'" in workspace_js
+    assert "file&&file.ignored" in workspace_js and "return 'Ignored'" in workspace_js
+    assert "!f.ignored&&!f.conflict" in workspace_js
+    assert "git-ignored" in ui_js
+    assert ".file-git-status.ignored" in style
     assert "status.textContent=_gitStatusLabel(file)" in workspace_js
     assert "typeof _gitStatusLabel==='function'" in ui_js
     update_edit_btn_body = workspace_js[

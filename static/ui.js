@@ -7727,11 +7727,14 @@ function _renderTreeItems(container, entries, depth){
     el.appendChild(nameEl);
 
     const gitState=(typeof _gitStatusForPath==='function')?_gitStatusForPath(item.path):null;
+    if(gitState&&gitState.ignored){
+      el.classList.add('git-ignored');
+    }
     if(gitState){
       const gitMark=document.createElement('span');
-      gitMark.className='file-git-status'+(gitState.conflict?' conflict':gitState.untracked?' untracked':'');
+      gitMark.className='file-git-status'+(gitState.ignored?' ignored':gitState.conflict?' conflict':gitState.untracked?' untracked':'');
       gitMark.textContent=(typeof _gitStatusLabel==='function')?_gitStatusLabel(gitState):(gitState.status||'M');
-      gitMark.title=`Git status: ${gitState.status||'M'}`;
+      gitMark.title=(typeof _gitStatusTitle==='function')?_gitStatusTitle(gitState):`Git status: ${gitState.status||'M'}`;
       el.appendChild(gitMark);
     }
 

@@ -642,12 +642,14 @@ function _gitFiles(){
 }
 
 function _gitStatusForPath(path){
-  return _gitFiles().find(f=>f.path===path)||null;
+  const normalized=String(path||'');
+  return _gitFiles().find(f=>f.path===normalized||(f.ignored&&f.path===`${normalized}/`))||null;
 }
 
 function _gitGroupFiles(kind){
   return _gitFiles().filter(f=>{
     if(kind==='conflicts')return f.conflict;
+    if(f.ignored)return false;
     if(kind==='tracked')return !f.untracked&&!f.conflict&&(f.staged||f.unstaged);
     if(kind==='staged')return f.staged&&!f.conflict;
     if(kind==='untracked')return f.untracked&&!f.conflict;
@@ -656,11 +658,11 @@ function _gitGroupFiles(kind){
 }
 
 function _gitStageableFiles(){
-  return _gitFiles().filter(f=>!f.conflict&&(f.unstaged||f.untracked));
+  return _gitFiles().filter(f=>!f.ignored&&!f.conflict&&(f.unstaged||f.untracked));
 }
 
 function _gitCommittableFiles(){
-  return _gitFiles().filter(f=>!f.conflict&&(f.staged||f.unstaged||f.untracked));
+  return _gitFiles().filter(f=>!f.ignored&&!f.conflict&&(f.staged||f.unstaged||f.untracked));
 }
 
 function _reconcileGitSelection(){
@@ -763,6 +765,7 @@ function _gitSyncLabel(action,status){
 function _gitStatusLabel(file){
   const code=String(file&&file.status||'').trim();
   if(file&&file.conflict)return 'Conflict';
+  if(file&&file.ignored||code==='Ignored'||code==='!!')return 'Ignored';
   if(file&&file.untracked||code==='??')return 'New';
   if(code==='R')return 'R';
   if(code==='D')return 'D';
@@ -777,6 +780,7 @@ function _gitStatusLabel(file){
 function _gitStatusTitle(file){
   const code=String(file&&file.status||'').trim();
   if(file&&file.conflict)return 'Conflict';
+  if(file&&file.ignored||code==='Ignored'||code==='!!')return 'Ignored by Git';
   if(file&&file.untracked||code==='??')return 'New file';
   if(code==='R')return 'Renamed';
   if(code==='D')return 'Deleted';

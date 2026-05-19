@@ -271,6 +271,7 @@ def git_status(workspace: str | Path) -> dict:
             "--porcelain=v2",
             "-z",
             "--branch",
+            "--ignored=matching",
             "--untracked-files=all",
             "--",
             _workspace_pathspec(ctx),
@@ -316,6 +317,12 @@ def git_status(workspace: str | Path) -> dict:
             xy = "??"
             repo_path = rec[2:]
             untracked = True
+            ignored = False
+        elif rec.startswith("! "):
+            xy = "!!"
+            repo_path = rec[2:]
+            untracked = False
+            ignored = True
         elif rec.startswith("1 "):
             parts = rec.split(" ", 8)
             if len(parts) < 9:
@@ -323,6 +330,7 @@ def git_status(workspace: str | Path) -> dict:
             xy = parts[1]
             repo_path = parts[8]
             untracked = False
+            ignored = False
         elif rec.startswith("2 "):
             parts = rec.split(" ", 9)
             if len(parts) < 10:
@@ -334,6 +342,7 @@ def git_status(workspace: str | Path) -> dict:
                 i += 1
             renamed = True
             untracked = False
+            ignored = False
         elif rec.startswith("u "):
             parts = rec.split(" ", 10)
             if len(parts) < 11:
@@ -341,6 +350,7 @@ def git_status(workspace: str | Path) -> dict:
             xy = parts[1]
             repo_path = parts[10]
             untracked = False
+            ignored = False
         else:
             continue
 
@@ -377,6 +387,26 @@ def git_status(workspace: str | Path) -> dict:
             )
             if raw_unstaged and not unstaged:
                 filtered_noise["filemode_only"] += 1
+        if ignored:
+            files[workspace_path] = {
+                "path": workspace_path,
+                "old_path": None,
+                "workspace_path": workspace_path,
+                "status": "Ignored",
+                "staged": False,
+                "unstaged": False,
+                "untracked": False,
+                "ignored": True,
+                "conflict": False,
+                "additions": 0,
+                "deletions": 0,
+                "binary": False,
+            }
+            if len(files) >= STATUS_FILE_LIMIT:
+                truncated = True
+                break
+            continue
+
         if not (staged or unstaged or untracked or conflict or renamed):
             continue
         if not (untracked or conflict or renamed or binary) and additions == 0 and deletions == 0:
@@ -391,6 +421,7 @@ def git_status(workspace: str | Path) -> dict:
             "staged": staged,
             "unstaged": unstaged,
             "untracked": untracked,
+            "ignored": False,
             "conflict": conflict,
             "additions": additions,
             "deletions": deletions,
@@ -403,6 +434,8 @@ def git_status(workspace: str | Path) -> dict:
     file_list = sorted(files.values(), key=lambda f: (f["path"].lower()))
     totals = _empty_status()
     for item in file_list:
+        if item.get("ignored"):
+            continue
         if item["staged"]:
             totals["staged"] += 1
         if item["unstaged"]:
@@ -411,7 +444,7 @@ def git_status(workspace: str | Path) -> dict:
             totals["untracked"] += 1
         if item["conflict"]:
             totals["conflicts"] += 1
-    totals["changed"] = len(file_list)
+    totals["changed"] = sum(1 for item in file_list if not item.get("ignored"))
 
     if not branch:
         branch = (_run_git(ctx, ["rev-parse", "--short", "HEAD"], check=False).stdout or "").strip()
