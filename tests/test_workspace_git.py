@@ -754,6 +754,7 @@ def test_workspace_git_static_contracts():
     assert "_gitStageableFiles" in workspace_js
     assert "branchMenuOpen" in workspace_js
     assert "branchFilter" in workspace_js
+    assert "_isSelectableRemoteBranch" in workspace_js
     assert "_branchMeta" in workspace_js and "_allBranchRows" in workspace_js
     assert "_installWorkspaceInteractionGuards" in workspace_js
     assert "'/api/git/checkout'" in workspace_js

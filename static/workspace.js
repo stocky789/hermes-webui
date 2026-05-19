@@ -127,6 +127,13 @@ function _branchLocalName(remoteName){
   return parts.slice(1).join('/');
 }
 
+function _isSelectableRemoteBranch(item){
+  const name=String((item&&item.name)||'').trim();
+  if(!name || !name.includes('/'))return false;
+  if(name.endsWith('/HEAD'))return false;
+  return true;
+}
+
 function _branchMeta(item){
   const bits=[];
   if(item.author)bits.push(item.author);
@@ -152,7 +159,7 @@ function _allBranchRows(branches,current,filterText){
   return {
     current: [_currentBranchItem(branches,current)].filter(matches),
     local: (branches.local||[]).filter(item=>item.name!==current&&matches(item)),
-    remote: (branches.remote||[]).filter(matches),
+    remote: (branches.remote||[]).filter(item=>_isSelectableRemoteBranch(item)&&matches(item)),
   };
 }
 
