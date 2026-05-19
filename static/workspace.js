@@ -100,7 +100,18 @@ async function _refreshGitBadge(){
 }
 
 function _ensureGitState(){
-  if(!S.git)S.git={status:null,selectedTab:'files',selectedDiff:null,loading:false,syncing:null,generatingCommitMessage:false};
+  const scopeKey=`${(S.session&&S.session.session_id)||''}\n${(S.session&&S.session.workspace)||''}`;
+  if(!S.git)S.git={status:null,selectedTab:'files',selectedDiff:null,loading:false,syncing:null,generatingCommitMessage:false,mutating:false,selectedPaths:new Set(),selectionTouched:false,selectionKey:scopeKey};
+  if(typeof S.git.mutating==='undefined')S.git.mutating=false;
+  if(typeof S.git.selectionTouched==='undefined')S.git.selectionTouched=false;
+  if(!(S.git.selectedPaths instanceof Set)){
+    S.git.selectedPaths=new Set(Array.isArray(S.git.selectedPaths)?S.git.selectedPaths:Object.keys(S.git.selectedPaths||{}).filter(k=>S.git.selectedPaths[k]));
+  }
+  if(S.git.selectionKey!==scopeKey){
+    S.git.selectedPaths=new Set();
+    S.git.selectionTouched=false;
+    S.git.selectionKey=scopeKey;
+  }
   return S.git;
 }
 
@@ -143,16 +154,15 @@ async function refreshGitStatus(){
     const data=await api(`/api/git/status?session_id=${encodeURIComponent(S.session.session_id)}`);
     git.status=data.git||null;
     if(!git.status||!git.status.is_git)git.selectedTab='files';
+    _reconcileGitSelection();
     renderGitBadge(git.status);
     renderGitChanges();
     if(typeof renderFileTree==='function')renderFileTree();
     return git.status;
   }catch(e){
-    git.status=null;
-    git.selectedTab='files';
-    renderGitBadge(null);
+    renderGitBadge(git.status);
     renderGitChanges();
-    return null;
+    return git.status;
   }finally{
     git.loading=false;
     renderWorkspacePanelTabState();
@@ -199,6 +209,7 @@ function _gitStatusForPath(path){
 function _gitGroupFiles(kind){
   return _gitFiles().filter(f=>{
     if(kind==='conflicts')return f.conflict;
+    if(kind==='tracked')return !f.untracked&&!f.conflict&&(f.staged||f.unstaged);
     if(kind==='staged')return f.staged&&!f.conflict;
     if(kind==='untracked')return f.untracked&&!f.conflict;
     return (f.unstaged&&!f.untracked&&!f.conflict);
@@ -209,9 +220,50 @@ function _gitStageableFiles(){
   return _gitFiles().filter(f=>!f.conflict&&(f.unstaged||f.untracked));
 }
 
+function _gitCommittableFiles(){
+  return _gitFiles().filter(f=>!f.conflict&&(f.staged||f.unstaged||f.untracked));
+}
+
+function _reconcileGitSelection(){
+  const git=_ensureGitState();
+  const selectable=_gitCommittableFiles();
+  const allowed=new Set(selectable.map(f=>f.path));
+  if(!git.selectionTouched){
+    git.selectedPaths=new Set(selectable.filter(f=>f.staged&&!f.conflict).map(f=>f.path));
+    return;
+  }
+  for(const path of [...git.selectedPaths]){
+    if(!allowed.has(path))git.selectedPaths.delete(path);
+  }
+}
+
+function _gitSelectedFiles(){
+  const git=_ensureGitState();
+  return _gitCommittableFiles().filter(f=>git.selectedPaths.has(f.path));
+}
+
+function _setGitPathSelected(path, selected){
+  const git=_ensureGitState();
+  git.selectionTouched=true;
+  if(selected)git.selectedPaths.add(path);
+  else git.selectedPaths.delete(path);
+  renderGitChanges();
+}
+
+function _setGitGroupSelected(files, selected){
+  const git=_ensureGitState();
+  git.selectionTouched=true;
+  for(const file of files){
+    if(selected)git.selectedPaths.add(file.path);
+    else git.selectedPaths.delete(file.path);
+  }
+  renderGitChanges();
+}
+
 function _setGitStatus(status){
   const git=_ensureGitState();
   git.status=status||null;
+  _reconcileGitSelection();
   renderGitBadge(git.status);
   renderGitChanges();
   if(typeof renderFileTree==='function')renderFileTree();
@@ -234,12 +286,46 @@ function _gitStatsEl(file){
   return stats;
 }
 
+function _gitGroupHeader(kind, label, files){
+  const header=document.createElement('div');
+  header.className='git-change-group-title';
+  if(kind==='tracked'||kind==='untracked'){
+    const selected=files.filter(f=>_ensureGitState().selectedPaths.has(f.path)).length;
+    const checkbox=document.createElement('input');
+    checkbox.type='checkbox';
+    checkbox.className='git-select-checkbox git-select-group';
+    checkbox.checked=selected>0&&selected===files.length;
+    checkbox.indeterminate=selected>0&&selected<files.length;
+    checkbox.disabled=!!_ensureGitState().mutating;
+    checkbox.setAttribute('aria-label',`${label}: select ${files.length} file${files.length===1?'':'s'}`);
+    checkbox.onclick=e=>{e.stopPropagation();_setGitGroupSelected(files,checkbox.checked);};
+    header.appendChild(checkbox);
+    const text=document.createElement('span');
+    text.textContent=`${label} ${selected}/${files.length}`;
+    header.appendChild(text);
+  }else{
+    header.textContent=label;
+  }
+  return header;
+}
+
 function _gitChangeRow(file, kind){
   const row=document.createElement('div');
-  row.className='git-change-row';
+  const selectable=kind==='tracked'||kind==='untracked';
+  row.className='git-change-row'+(selectable?' selectable':'');
   row.tabIndex=0;
-  row.onclick=()=>openGitDiff(file.path,kind==='staged'?'staged':'unstaged');
+  row.onclick=()=>openGitDiff(file.path,(kind==='staged'||(kind==='tracked'&&file.staged&&!file.unstaged))?'staged':'unstaged');
   row.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();row.click();}};
+  if(selectable){
+    const checkbox=document.createElement('input');
+    checkbox.type='checkbox';
+    checkbox.className='git-select-checkbox';
+    checkbox.checked=_ensureGitState().selectedPaths.has(file.path);
+    checkbox.disabled=!!_ensureGitState().mutating;
+    checkbox.setAttribute('aria-label',`Select ${file.path} for commit`);
+    checkbox.onclick=e=>{e.stopPropagation();_setGitPathSelected(file.path,checkbox.checked);};
+    row.appendChild(checkbox);
+  }
   const status=document.createElement('span');
   status.className='git-change-status';
   status.textContent=file.status||'M';
@@ -251,10 +337,13 @@ function _gitChangeRow(file, kind){
   row.appendChild(_gitStatsEl(file));
   const actions=document.createElement('span');
   actions.className='git-change-actions';
-  if(kind==='staged'){
+  const mutating=!!_ensureGitState().mutating;
+  const stagedOnly=(kind==='tracked'&&file.staged&&!file.unstaged&&!file.untracked);
+  if(kind==='staged'||stagedOnly){
     const unstage=document.createElement('button');
     unstage.className='mini-btn';
     unstage.textContent=t('git_unstage');
+    unstage.disabled=mutating;
     unstage.onclick=e=>{e.stopPropagation();unstageGitPath(file.path);};
     actions.appendChild(unstage);
   }else if(kind==='conflicts'){
@@ -267,11 +356,13 @@ function _gitChangeRow(file, kind){
     const stage=document.createElement('button');
     stage.className='mini-btn';
     stage.textContent=t('git_stage');
+    stage.disabled=mutating;
     stage.onclick=e=>{e.stopPropagation();stageGitPath(file.path);};
     actions.appendChild(stage);
     const discard=document.createElement('button');
     discard.className='mini-btn danger';
     discard.textContent=file.untracked?t('delete_title'):t('git_discard');
+    discard.disabled=mutating;
     discard.onclick=e=>{e.stopPropagation();discardGitPath(file.path,{untracked:!!file.untracked});};
     actions.appendChild(discard);
   }
@@ -284,6 +375,7 @@ function renderGitChanges(){
   const commitBox=$('gitCommitBox');
   const commitBtn=$('btnGitCommit');
   const generateBtn=$('btnGitGenerateCommitMessage');
+  const selectionSummary=$('gitSelectionSummary');
   if(!list)return;
   list.innerHTML='';
   const status=_ensureGitState().status;
@@ -303,6 +395,12 @@ function renderGitChanges(){
   summaryText.className='git-summary-text';
   summaryText.textContent=[status.branch||'HEAD',status.upstream,`${totals.changed||0} ${t('git_changed')}`,status.ahead?`\u2191${status.ahead}`:'',status.behind?`\u2193${status.behind}`:''].filter(Boolean).join(' \u00b7 ');
   summary.appendChild(summaryText);
+  if(status.noise_filtering&&status.noise_filtering.active){
+    const noise=document.createElement('span');
+    noise.className='git-noise-note';
+    noise.textContent=status.noise_filtering.message||'Metadata-only changes hidden';
+    summary.appendChild(noise);
+  }
   const summaryActions=document.createElement('span');
   summaryActions.className='git-summary-actions';
   for(const [action,label] of [['fetch',t('git_fetch')],['pull',t('git_pull')],['push',t('git_push')]]){
@@ -310,7 +408,7 @@ function renderGitChanges(){
     btn.className='mini-btn git-sync-btn';
     btn.type='button';
     btn.textContent=label;
-    btn.disabled=_ensureGitState().syncing===action;
+    btn.disabled=!!_ensureGitState().mutating||_ensureGitState().syncing===action;
     btn.onclick=()=>runGitRemoteAction(action);
     summaryActions.appendChild(btn);
   }
@@ -320,6 +418,7 @@ function renderGitChanges(){
     stageAll.className='mini-btn git-stage-all-btn';
     stageAll.type='button';
     stageAll.textContent=t('git_stage_all')||'Stage all';
+    stageAll.disabled=!!_ensureGitState().mutating;
     stageAll.onclick=()=>stageGitAllChanges();
     summaryActions.appendChild(stageAll);
   }
@@ -327,8 +426,7 @@ function renderGitChanges(){
   list.appendChild(summary);
   const groups=[
     ['conflicts',t('git_conflicts')],
-    ['staged',t('git_staged')],
-    ['unstaged',t('git_unstaged')],
+    ['tracked',t('git_tracked')||'Tracked'],
     ['untracked',t('git_untracked')],
   ];
   let rendered=0;
@@ -337,10 +435,7 @@ function renderGitChanges(){
     if(!files.length)continue;
     const group=document.createElement('section');
     group.className='git-change-group';
-    const header=document.createElement('div');
-    header.className='git-change-group-title';
-    header.textContent=label;
-    group.appendChild(header);
+    group.appendChild(_gitGroupHeader(kind,label,files));
     files.forEach(file=>group.appendChild(_gitChangeRow(file,kind)));
     list.appendChild(group);
     rendered+=files.length;
@@ -351,12 +446,22 @@ function renderGitChanges(){
     empty.textContent=t('git_no_changes');
     list.appendChild(empty);
   }
-  if(commitBox)commitBox.style.display=(totals.staged||0)>0?'flex':'none';
-  const hasStaged=(totals.staged||0)>0;
+  const selectedCount=_gitSelectedFiles().length;
+  const committableCount=_gitCommittableFiles().length;
+  if(commitBox)commitBox.style.display=committableCount?'flex':'none';
+  if(selectionSummary){
+    selectionSummary.textContent=selectedCount
+      ? `${selectedCount} of ${committableCount} committable file${committableCount===1?'':'s'} selected`
+      : `${committableCount} committable file${committableCount===1?'':'s'} available`;
+  }
+  const hasSelection=selectedCount>0;
   const generating=!!_ensureGitState().generatingCommitMessage;
-  if(commitBtn)commitBtn.disabled=!hasStaged||generating;
+  if(commitBtn){
+    commitBtn.disabled=!hasSelection||generating||!!_ensureGitState().mutating;
+    commitBtn.textContent=hasSelection?`${t('git_commit')} ${selectedCount} ${selectedCount===1?'file':'files'}`:t('git_commit');
+  }
   if(generateBtn){
-    generateBtn.disabled=!hasStaged||generating;
+    generateBtn.disabled=!hasSelection||generating||!!_ensureGitState().mutating;
     generateBtn.textContent=generating?'Generating...':'Generate message';
   }
   renderWorkspacePanelTabState();
@@ -410,6 +515,8 @@ function showPreview(mode){
   // Show "Open in browser" button for iframe-backed document previews
   const openBtn=$('btnOpenInBrowser');
   if(openBtn) openBtn.style.display = (mode==='html'||mode==='pdf')?'inline-flex':'none';
+  const mdPopoutBtn=$('btnMarkdownPopout');
+  if(mdPopoutBtn) mdPopoutBtn.style.display = mode==='md'?'inline-flex':'none';
   const downloadBtn=$('btnDownloadFile');
   if(downloadBtn) downloadBtn.style.display = mode==='gitdiff'?'none':'inline-flex';
 }
@@ -439,7 +546,7 @@ async function toggleEditMode(){
       _previewDirty=false;
       // Update read-only views
       if(_previewCurrentMode==='code') $('previewCode').textContent=content;
-      else { $('previewMd').innerHTML=renderMd(content); requestAnimationFrame(()=>{if(typeof renderKatexBlocks==='function')renderKatexBlocks();}); }
+      else { renderWorkspaceMarkdown(content); }
       $('previewEditArea').style.display='none';
       if(_previewCurrentMode==='code') $('previewCode').style.display='';
       else $('previewMd').style.display='';
@@ -464,6 +571,26 @@ async function toggleEditMode(){
 }
 
 let _previewRawContent = '';  // raw text for md files (to populate editor)
+
+function renderWorkspaceMarkdown(content){
+  const target=$('previewMd');
+  if(!target)return;
+  target.innerHTML=renderMd(content||'');
+  postProcessWorkspaceMarkdown(target);
+}
+
+function postProcessWorkspaceMarkdown(container){
+  requestAnimationFrame(()=>{
+    if(typeof postProcessRenderedMessages==='function')postProcessRenderedMessages(container);
+    else{
+      if(typeof highlightCode==='function')highlightCode(container);
+      if(typeof addCopyButtons==='function')addCopyButtons(container);
+      if(typeof renderMermaidBlocks==='function')renderMermaidBlocks(container);
+      if(typeof renderKatexBlocks==='function')renderKatexBlocks(container);
+      if(typeof initTreeViews==='function')initTreeViews(container);
+    }
+  });
+}
 
 function cancelEditMode(){
   // Discard changes and return to read-only view
@@ -524,8 +651,7 @@ async function openFile(path){
       const data=await api(`/api/file?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`);
       showPreview('md');
       _previewRawContent = data.content;
-      $('previewMd').innerHTML=renderMd(data.content);
-      requestAnimationFrame(()=>{if(typeof renderKatexBlocks==='function')renderKatexBlocks();});
+      renderWorkspaceMarkdown(data.content);
     }catch(e){setStatus(t('file_open_failed'));}
   } else if(HTML_EXTS.has(ext)){
     // HTML: render in sandboxed iframe via raw endpoint.
@@ -616,6 +742,24 @@ function openInBrowser(){
   if(!_previewCurrentPath||!S.session) return;
   const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(_previewCurrentPath)}`;
   window.open(url,'_blank');
+}
+
+function openMarkdownPopout(){
+  if(_previewCurrentMode!=='md'||!_previewCurrentPath)return;
+  const bodyHtml=$('previewMd')?$('previewMd').innerHTML:'';
+  const title=(_previewCurrentPath.split('/').pop()||_previewCurrentPath).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+  const html=`<!doctype html><html><head><meta charset="utf-8"><title>${title}</title><style>
+    :root{color-scheme:dark light;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:#11100e;color:#eae0d5}
+    body{margin:0;padding:28px;line-height:1.7}
+    main{max-width:920px;margin:0 auto}
+    pre{overflow:auto;padding:12px;border:1px solid rgba(255,255,255,.14);border-radius:8px;background:rgba(0,0,0,.24)}
+    code{font-family:"SF Mono",ui-monospace,monospace}
+    table{border-collapse:collapse;width:100%;margin:12px 0}th,td{border:1px solid rgba(255,255,255,.16);padding:6px 10px;text-align:left}
+    a{color:#8ab4f8} img{max-width:100%;height:auto}
+  </style></head><body><main class="preview-md">${bodyHtml}</main></body></html>`;
+  const url=URL.createObjectURL(new Blob([html],{type:'text/html'}));
+  window.open(url,'_blank','noopener,noreferrer');
+  setTimeout(()=>URL.revokeObjectURL(url),60000);
 }
 
 async function openGitDiff(path,kind='unstaged'){
@@ -721,31 +865,40 @@ function renderGitDiff(diff){
 
 async function stageGitPath(path){
   if(!S.session)return;
+  const git=_ensureGitState();
+  git.mutating=true;renderGitChanges();
   try{
     const data=await api('/api/git/stage',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:[path]})});
     _setGitStatus(data.git);
     if(S.git.selectedDiff&&S.git.selectedDiff.path===path)openGitDiff(path,'staged');
   }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
+  finally{git.mutating=false;renderGitChanges();}
 }
 
 async function stageGitAllChanges(){
   if(!S.session)return;
   const paths=_gitStageableFiles().map(f=>f.path);
   if(!paths.length)return;
+  const git=_ensureGitState();
+  git.mutating=true;renderGitChanges();
   try{
     const data=await api('/api/git/stage',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths})});
     _setGitStatus(data.git);
     if(S.git.selectedDiff&&paths.includes(S.git.selectedDiff.path))openGitDiff(S.git.selectedDiff.path,'staged');
   }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
+  finally{git.mutating=false;renderGitChanges();}
 }
 
 async function unstageGitPath(path){
   if(!S.session)return;
+  const git=_ensureGitState();
+  git.mutating=true;renderGitChanges();
   try{
     const data=await api('/api/git/unstage',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:[path]})});
     _setGitStatus(data.git);
     if(S.git.selectedDiff&&S.git.selectedDiff.path===path)openGitDiff(path,'unstaged');
   }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
+  finally{git.mutating=false;renderGitChanges();}
 }
 
 async function discardGitPath(path,opts={}){
@@ -759,6 +912,8 @@ async function discardGitPath(path,opts={}){
     focusCancel:true
   });
   if(!ok)return;
+  const git=_ensureGitState();
+  git.mutating=true;renderGitChanges();
   try{
     const data=await api('/api/git/discard',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:[path],delete_untracked:untracked})});
     _setGitStatus(data.git);
@@ -769,6 +924,7 @@ async function discardGitPath(path,opts={}){
     }
     await loadDir(S.currentDir);
   }catch(e){showToast(e.message||t('git_commit_failed'),3000,'error');}
+  finally{git.mutating=false;renderGitChanges();}
 }
 
 async function commitGitChanges(){
@@ -776,30 +932,37 @@ async function commitGitChanges(){
   const input=$('gitCommitMessage');
   const message=(input&&input.value||'').trim();
   if(!message){showToast(t('git_commit_message'),2200);return;}
+  const selected=_gitSelectedFiles().map(f=>f.path);
+  if(!selected.length){showToast(t('git_select_files')||'Select files to commit',2200);return;}
+  const git=_ensureGitState();
+  git.mutating=true;renderGitChanges();
   try{
-    const data=await api('/api/git/commit',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,message})});
+    const data=await api('/api/git/commit-selected',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,message,paths:selected})});
     if(input)input.value='';
     _setGitStatus(data.status);
     showToast(`${t('git_committed')} ${data.commit}`,2600);
     await loadDir(S.currentDir);
   }catch(e){showToast(`${t('git_commit_failed')}: ${e.message}`,4000,'error');}
+  finally{git.mutating=false;renderGitChanges();}
 }
 
 async function generateGitCommitMessage(){
   if(!S.session)return;
   const git=_ensureGitState();
   if(git.generatingCommitMessage)return;
+  const selected=_gitSelectedFiles().map(f=>f.path);
+  if(!selected.length){showToast(t('git_select_files')||'Select files to commit',2200);return;}
   git.generatingCommitMessage=true;
   renderGitChanges();
   try{
-    const data=await api('/api/git/commit-message',{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
+    const data=await api('/api/git/commit-message-selected',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,paths:selected})});
     const input=$('gitCommitMessage');
     if(input){
       input.value=data.message||'';
       input.focus();
       input.selectionStart=input.selectionEnd=input.value.length;
     }
-    if(data.truncated)showToast('Generated from a truncated staged diff',3200);
+    if(data.truncated)showToast('Generated from a truncated selected diff',3200);
   }catch(e){
     showToast(`Commit message generation failed: ${e.message}`,4000,'error');
   }finally{
@@ -812,17 +975,19 @@ async function runGitRemoteAction(action){
   if(!S.session||!['fetch','pull','push'].includes(action))return;
   const git=_ensureGitState();
   git.syncing=action;
+  git.mutating=true;
   renderGitChanges();
   try{
     const data=await api(`/api/git/${action}`,{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
     _setGitStatus(data.status);
     const label=action==='fetch'?t('git_fetched'):action==='pull'?t('git_pulled'):t('git_pushed');
-    showToast(label,2600);
+    showToast(data.message?`${label}: ${data.message}`:label,3600);
     await loadDir(S.currentDir);
   }catch(e){
     showToast(`${t('git_sync_failed')}: ${e.message}`,4000,'error');
   }finally{
     git.syncing=null;
+    git.mutating=false;
     renderGitChanges();
   }
 }

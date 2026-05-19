@@ -125,6 +125,8 @@ def test_git_status_ignores_crlf_only_worktree_noise(tmp_path):
     status = git_status(repo)
     assert status["totals"]["changed"] == 0
     assert status["files"] == []
+    assert status["noise_filtering"]["active"] is True
+    assert "hidden by default" in status["noise_filtering"]["message"]
 
 
 def test_git_status_keeps_real_edit_with_crlf_endings(tmp_path):
@@ -155,11 +157,12 @@ def test_git_status_ignores_filemode_only_noise(tmp_path):
     _git(repo, "update-index", "--chmod=+x", "script.sh")
 
     raw = _git(repo, "status", "--porcelain", "--", "script.sh")
-    assert raw.startswith("M ")
+    assert "script.sh" in raw
 
     status = git_status(repo)
     assert status["totals"]["changed"] == 0
     assert status["files"] == []
+    assert status["noise_filtering"]["active"] is True
 
 
 def test_git_status_scopes_nested_workspace_to_that_directory(tmp_path):
@@ -259,6 +262,136 @@ def test_git_stage_unstage_discard_and_commit(tmp_path):
     assert committed["ok"] is True
     assert committed["commit"]
     assert committed["status"]["totals"]["changed"] == 0
+
+
+def test_git_commit_selected_ignores_unrelated_real_index(tmp_path):
+    from api.workspace_git import git_commit_selected, git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "selected.txt").write_text("one\n", encoding="utf-8")
+    (repo / "staged.txt").write_text("alpha\n", encoding="utf-8")
+    _commit_all(repo)
+
+    (repo / "selected.txt").write_text("one\ntwo\n", encoding="utf-8")
+    (repo / "staged.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    _git(repo, "add", "staged.txt")
+
+    committed = git_commit_selected(repo, "Commit selected only", ["selected.txt"])
+    assert committed["ok"] is True
+    assert committed["paths"] == ["selected.txt"]
+    assert _git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["selected.txt"]
+
+    by_path = {item["path"]: item for item in git_status(repo)["files"]}
+    assert "selected.txt" not in by_path
+    assert by_path["staged.txt"]["staged"] is True
+
+
+def test_git_commit_selected_supports_initial_commit(tmp_path):
+    from api.workspace_git import git_commit_selected, git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "first.txt").write_text("first\n", encoding="utf-8")
+
+    committed = git_commit_selected(repo, "Initial selected commit", ["first.txt"])
+    assert committed["ok"] is True
+    assert _git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["first.txt"]
+    assert git_status(repo)["totals"]["changed"] == 0
+
+
+def test_git_commit_selected_preserves_rename_semantics(tmp_path):
+    from api.workspace_git import git_commit_selected, git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "old.txt").write_text("old\n", encoding="utf-8")
+    _commit_all(repo)
+
+    _git(repo, "mv", "old.txt", "new.txt")
+
+    committed = git_commit_selected(repo, "Rename selected file", ["new.txt"])
+    assert committed["ok"] is True
+    assert _git(repo, "ls-tree", "--name-only", "HEAD").splitlines() == ["new.txt"]
+    assert "old.txt" not in _git(repo, "status", "--porcelain=v2")
+    assert git_status(repo)["totals"]["changed"] == 0
+
+
+def test_git_commit_selected_handles_untracked_and_mixed_paths(tmp_path):
+    from api.workspace_git import git_commit_selected
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+
+    (repo / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")
+    (repo / "new.txt").write_text("new\n", encoding="utf-8")
+
+    committed = git_commit_selected(repo, "Commit mixed selected files", ["tracked.txt", "new.txt"])
+    assert committed["ok"] is True
+    assert set(_git(repo, "show", "--name-only", "--format=", "HEAD").splitlines()) == {
+        "tracked.txt",
+        "new.txt",
+    }
+
+
+def test_git_commit_selected_respects_nested_workspace_scope(tmp_path):
+    from api.workspace_git import GitWorkspaceError, git_commit_selected
+
+    repo = _init_repo(tmp_path / "repo")
+    nested = repo / "app"
+    nested.mkdir()
+    (nested / "inside.txt").write_text("inside\n", encoding="utf-8")
+    (repo / "outside.txt").write_text("outside\n", encoding="utf-8")
+    _commit_all(repo)
+
+    (nested / "inside.txt").write_text("inside\nchanged\n", encoding="utf-8")
+    (repo / "outside.txt").write_text("outside\nchanged\n", encoding="utf-8")
+
+    committed = git_commit_selected(nested, "Nested selected commit", ["inside.txt"])
+    assert committed["paths"] == ["inside.txt"]
+    assert _git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["app/inside.txt"]
+
+    with pytest.raises(GitWorkspaceError) as outside:
+        git_commit_selected(nested, "Outside", ["../outside.txt"])
+    assert outside.value.code == "path_outside_workspace"
+
+
+def test_git_commit_selected_rejects_conflicts_and_path_traversal(tmp_path):
+    from api.workspace_git import GitWorkspaceError, git_commit_selected
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "conflict.txt").write_text("base\n", encoding="utf-8")
+    _commit_all(repo)
+    _git(repo, "checkout", "-b", "side")
+    (repo / "conflict.txt").write_text("side\n", encoding="utf-8")
+    _commit_all(repo, "side")
+    _git(repo, "checkout", "master")
+    (repo / "conflict.txt").write_text("main\n", encoding="utf-8")
+    _commit_all(repo, "main")
+    subprocess.run(["git", "merge", "side"], cwd=repo, shell=False, text=True, capture_output=True, timeout=20)
+
+    with pytest.raises(GitWorkspaceError) as conflict:
+        git_commit_selected(repo, "Nope", ["conflict.txt"])
+    assert conflict.value.code == "conflict"
+
+    with pytest.raises(GitWorkspaceError) as traversal:
+        git_commit_selected(repo, "Nope", ["../outside.txt"])
+    assert traversal.value.code == "path_outside_workspace"
+
+
+def test_selected_commit_message_prompt_uses_selected_diff(tmp_path):
+    from api.workspace_git import selected_commit_message_prompt
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "selected.txt").write_text("one\n", encoding="utf-8")
+    (repo / "other.txt").write_text("alpha\n", encoding="utf-8")
+    _commit_all(repo)
+    (repo / "selected.txt").write_text("one\ntwo\n", encoding="utf-8")
+    (repo / "other.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+
+    prompt = selected_commit_message_prompt(repo, ["selected.txt"])
+    assert "selected.txt" in prompt["user_prompt"]
+    assert "+two" in prompt["user_prompt"]
+    assert "other.txt" not in prompt["user_prompt"]
+    assert "beta" not in prompt["user_prompt"]
 
 
 def test_staged_commit_message_prompt_uses_only_staged_diff(tmp_path):
@@ -364,6 +497,33 @@ def test_git_routes_status_diff_stage_unstage_discard_commit(cleanup_test_sessio
     assert committed["status"]["totals"]["changed"] == 0
 
 
+def test_git_routes_selected_commit_and_structured_error(cleanup_test_sessions):
+    sid, base_ws = _make_session(cleanup_test_sessions)
+    repo = base_ws / f"git-selected-route-{uuid.uuid4().hex[:8]}"
+    _init_repo(repo)
+    (repo / "selected.txt").write_text("one\n", encoding="utf-8")
+    (repo / "other.txt").write_text("alpha\n", encoding="utf-8")
+    _commit_all(repo)
+
+    _post("/api/session/update", {"session_id": sid, "workspace": str(repo), "model": "openai/gpt-5.4-mini"})
+    (repo / "selected.txt").write_text("one\ntwo\n", encoding="utf-8")
+    (repo / "other.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    _git(repo, "add", "other.txt")
+
+    bad, code = _post("/api/git/commit-selected", {"session_id": sid, "message": "Bad", "paths": ["../x"]})
+    assert code == 400
+    assert bad["code"] == "path_outside_workspace"
+
+    committed, code = _post(
+        "/api/git/commit-selected",
+        {"session_id": sid, "message": "Selected route commit", "paths": ["selected.txt"]},
+    )
+    assert code == 200
+    assert committed["ok"] is True
+    assert committed["paths"] == ["selected.txt"]
+    assert _git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["selected.txt"]
+
+
 def test_workspace_git_static_contracts():
     index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     workspace_js = (ROOT / "static" / "workspace.js").read_text(encoding="utf-8")
@@ -378,8 +538,10 @@ def test_workspace_git_static_contracts():
         "gitChangesList",
         "gitCommitBox",
         "gitCommitMessage",
+        "gitSelectionSummary",
         "btnGitGenerateCommitMessage",
         "btnGitCommit",
+        "btnMarkdownPopout",
         "gitDiffView",
     ]:
         assert f'id="{dom_id}"' in index
@@ -397,6 +559,9 @@ def test_workspace_git_static_contracts():
         "generateGitCommitMessage",
         "runGitRemoteAction",
         "switchWorkspacePanelTab",
+        "openMarkdownPopout",
+        "renderWorkspaceMarkdown",
+        "postProcessWorkspaceMarkdown",
     ]:
         assert f"function {fn}" in workspace_js
 
@@ -406,7 +571,20 @@ def test_workspace_git_static_contracts():
     assert "showConfirmDialog" in discard_body
     assert "confirm(" not in discard_body.replace("showConfirmDialog(", "")
     assert "file-git-status" in ui_js
+    assert "file-preview-btn" in ui_js
+    assert "_isWorkspaceMarkdownPath" in ui_js
+    assert "e.stopPropagation()" in ui_js
     assert "_gitStageableFiles" in workspace_js
+    assert "selectedPaths:new Set()" in workspace_js
+    assert "selectionKey:scopeKey" in workspace_js
+    assert "_gitGroupHeader" in workspace_js
+    assert "checkbox.indeterminate" in workspace_js
+    assert "stagedOnly" in workspace_js
+    assert "URL.createObjectURL(new Blob" in workspace_js
+    assert "catch(e){\n    renderGitBadge(git.status);" in workspace_js
+    assert "'/api/git/commit-selected'" in workspace_js
+    assert "'/api/git/commit-message-selected'" in workspace_js
+    assert "postProcessRenderedMessages" in workspace_js
     assert "git-stat-add" in workspace_js and "git-stat-del" in workspace_js
     for cls in [
         ".workspace-tabs",
@@ -419,6 +597,9 @@ def test_workspace_git_static_contracts():
         ".git-sync-btn",
         ".git-commit-actions",
         ".git-commit-primary",
+        ".git-select-checkbox",
+        ".git-selection-summary",
+        ".file-preview-btn",
     ]:
         assert cls in style
     assert ".git-stat-add" in style and ".git-stat-del" in style
@@ -426,8 +607,12 @@ def test_workspace_git_static_contracts():
     for route in ["/api/git/fetch", "/api/git/pull", "/api/git/push"]:
         assert route in routes
     assert "/api/git/commit-message" in routes
+    assert "/api/git/commit-selected" in routes
+    assert "/api/git/commit-message-selected" in routes
+    assert "_git_bad" in routes and '"code": getattr(err, "code"' in routes
+    assert 'if parsed.path == "/api/git-info"' in routes and "git_status(Path(s.workspace))" in routes
     assert "`/api/git/${action}`" in workspace_js
-    assert "'/api/git/commit-message'" in workspace_js
+    assert "'/api/git/commit-message-selected'" in workspace_js
 
     for token in [
         'data-i18n="git_files"',
@@ -449,4 +634,6 @@ def test_workspace_git_static_contracts():
         "git_push",
         "git_sync_failed",
     ]:
+        assert i18n.count(f"{key}:") >= 11
+    for key in ["git_tracked", "git_select_files", "git_commit_message_privacy"]:
         assert i18n.count(f"{key}:") >= 11

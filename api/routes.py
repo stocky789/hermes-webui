@@ -4049,9 +4049,22 @@ def handle_get(handler, parsed) -> bool:
             s = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
-        from api.workspace import git_info_for_workspace
+        from api.workspace_git import GitWorkspaceError, git_status
 
-        info = git_info_for_workspace(Path(s.workspace))
+        try:
+            status = git_status(Path(s.workspace))
+        except GitWorkspaceError as e:
+            return _git_bad(handler, e)
+        totals = status.get("totals") or {}
+        info = None if not status.get("is_git") else {
+            "branch": status.get("branch"),
+            "dirty": totals.get("changed", 0),
+            "modified": (totals.get("staged", 0) or 0) + (totals.get("unstaged", 0) or 0),
+            "untracked": totals.get("untracked", 0),
+            "ahead": status.get("ahead", 0),
+            "behind": status.get("behind", 0),
+            "is_git": True,
+        }
         return j(handler, {"git": info})
 
     if parsed.path == "/api/commands":
@@ -5196,8 +5209,14 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/git/commit-message":
         return _handle_git_commit_message(handler, body)
 
+    if parsed.path == "/api/git/commit-message-selected":
+        return _handle_git_commit_message_selected(handler, body)
+
     if parsed.path == "/api/git/commit":
         return _handle_git_commit(handler, body)
+
+    if parsed.path == "/api/git/commit-selected":
+        return _handle_git_commit_selected(handler, body)
 
     if parsed.path == "/api/git/fetch":
         return _handle_git_remote_action(handler, body, "fetch")
@@ -8405,7 +8424,7 @@ def _handle_git_status(handler, parsed):
 
         return j(handler, {"git": git_status(workspace)})
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
 
 
 def _handle_git_diff(handler, parsed):
@@ -8422,7 +8441,18 @@ def _handle_git_diff(handler, parsed):
 
         return j(handler, {"diff": git_diff(workspace, path, kind)})
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
+
+
+def _git_bad(handler, err, status: int = 400):
+    return j(
+        handler,
+        {
+            "error": _sanitize_error(err),
+            "code": getattr(err, "code", "git_failed") or "git_failed",
+        },
+        status=status,
+    )
 
 
 def _git_paths_from_body(body) -> list[str]:
@@ -8449,7 +8479,7 @@ def _handle_git_stage(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
 
 
 def _handle_git_unstage(handler, body):
@@ -8465,7 +8495,7 @@ def _handle_git_unstage(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
 
 
 def _handle_git_discard(handler, body):
@@ -8491,7 +8521,7 @@ def _handle_git_discard(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
 
 
 def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) -> str:
@@ -8612,9 +8642,40 @@ def _handle_git_commit_message(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
     except Exception as e:
         logger.exception("git commit message generation failed")
+        return bad(handler, _sanitize_error(e), 500)
+
+
+def _handle_git_commit_message_selected(handler, body):
+    from api.workspace_git import (
+        GitWorkspaceError,
+        clean_generated_commit_message,
+        selected_commit_message_prompt,
+    )
+
+    try:
+        require(body, "session_id")
+        paths = _git_paths_from_body(body)
+        session = get_session(body["session_id"])
+        workspace = Path(session.workspace)
+
+        prompt = selected_commit_message_prompt(workspace, paths)
+        message = clean_generated_commit_message(
+            _llm_git_commit_message(prompt["system_prompt"], prompt["user_prompt"], session=session)
+        )
+        if not message:
+            raise GitWorkspaceError("No commit message was generated")
+        return j(handler, {"ok": True, "message": message, "truncated": bool(prompt.get("truncated"))})
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+    except Exception as e:
+        logger.exception("selected git commit message generation failed")
         return bad(handler, _sanitize_error(e), 500)
 
 
@@ -8630,7 +8691,23 @@ def _handle_git_commit(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
+
+
+def _handle_git_commit_selected(handler, body):
+    try:
+        require(body, "session_id", "message")
+        paths = _git_paths_from_body(body)
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_commit_selected
+
+        return j(handler, git_commit_selected(workspace, body.get("message", ""), paths))
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
 
 
 def _handle_git_remote_action(handler, body, action: str):
@@ -8650,7 +8727,7 @@ def _handle_git_remote_action(handler, body, action: str):
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
-        return bad(handler, _sanitize_error(e), 400)
+        return _git_bad(handler, e)
 
 
 def _handle_file_delete(handler, body):

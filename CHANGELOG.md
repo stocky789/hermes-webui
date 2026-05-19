@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add selected-file Git commits in the workspace Changes tab. Tracked and untracked changes now have checkbox selection with group master checkboxes, selected-count commit labels, selected-diff commit message generation with provider privacy copy, and a backend `POST /api/git/commit-selected` path that commits through a temporary index so unrelated staged files are not included.
+- Add explicit rendered Markdown preview affordances in the workspace file tree. Markdown rows now show an eye button, Markdown previews run the richer post-processing path where available, and the preview toolbar can open a rendered Markdown popout.
+
+### Changed
+
+- Route legacy `/api/git-info` through the workspace Git status implementation so nested workspaces inside larger repositories use the same scoping as the Changes tab.
+
+### Fixed
+
+- Git mutation endpoints now share a per-repository operation lock and return structured sanitized error codes for common failures such as path traversal, conflicts, missing Git, timeouts, auth failures, missing upstream, and non-fast-forward pushes. The Changes tab now also explains when line-ending-only or filemode-only noise is hidden.
+
 ## [v0.51.89] — 2026-05-18 — Release BM (stage-382 — 6-PR full sweep batch — runtime adapter approval/clarify seam + SOUL.md memory panel + #1855 resolve_model_provider fast-path + PWA sidebar spinner fix + /model active-provider preference + contributor contract docs index)
 
 ### Changed

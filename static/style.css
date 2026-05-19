@@ -1474,10 +1474,14 @@
   .git-changes-list{display:flex;flex:1;min-height:0;flex-direction:column;gap:10px;overflow:auto;}
   .git-summary{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:"SF Mono",ui-monospace,monospace;font-size:11px;color:var(--muted);padding:4px 2px;}
   .git-summary-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .git-noise-note{min-width:0;color:var(--warning);font-size:10px;line-height:1.35;}
   .git-summary-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;flex-wrap:wrap;}
   .git-change-group{display:flex;flex-direction:column;gap:3px;}
-  .git-change-group-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:2px 2px 4px;}
+  .git-change-group-title{display:flex;align-items:center;gap:7px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:2px 2px 4px;}
+  .git-select-checkbox{width:15px;height:15px;margin:0;accent-color:var(--accent-text);cursor:pointer;}
+  .git-select-checkbox:disabled{cursor:not-allowed;opacity:.55;}
   .git-change-row{display:grid;grid-template-columns:30px minmax(0,1fr) auto auto;align-items:center;gap:7px;min-height:34px;padding:5px 6px;border-radius:6px;color:var(--text);cursor:pointer;}
+  .git-change-row.selectable{grid-template-columns:18px 30px minmax(0,1fr) auto auto;}
   .git-change-row:hover,.git-change-row:focus-visible{background:var(--hover-bg);outline:none;}
   .git-change-status,.file-git-status{font-family:"SF Mono",ui-monospace,monospace;font-size:10px;font-weight:700;color:var(--accent-text);}
   .git-change-status{justify-self:center;}
@@ -1496,6 +1500,7 @@
   .git-empty{padding:18px 10px;color:var(--muted);font-size:12px;text-align:center;line-height:1.45;}
   .git-empty.error{color:var(--error);}
   .git-commit-box{display:none;flex-direction:column;gap:7px;border-top:1px solid var(--border);padding-top:10px;flex-shrink:0;}
+  .git-selection-summary,.git-privacy-note{font-size:11px;line-height:1.35;color:var(--muted);}
   .git-commit-box textarea{width:100%;box-sizing:border-box;resize:vertical;min-height:62px;max-height:120px;background:var(--input-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:8px;font:12px/1.45 var(--font-ui);}
   .git-commit-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;}
   .git-commit-primary{min-height:30px;padding:0 13px;border-color:var(--accent-bg-strong,var(--border2));background:var(--accent-bg);color:var(--accent-text);font-weight:700;}
@@ -1511,6 +1516,11 @@
   .file-git-status{margin-left:auto;padding:0 4px;line-height:18px;border-radius:4px;background:var(--hover-bg);flex-shrink:0;}
   .file-git-status.untracked{color:var(--muted);}
   .file-git-status.conflict{color:var(--error);}
+  .file-preview-btn{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--muted);border-radius:5px;cursor:pointer;flex-shrink:0;}
+  .file-preview-btn:hover,.file-preview-btn:focus-visible{background:var(--hover-bg);color:var(--text);outline:none;}
+  .preview-path{gap:6px;}
+  .preview-toolbar-btn{flex-shrink:0;}
+  #btnOpenInBrowser:not([style*="display: none"])+#btnDownloadFile,#btnMarkdownPopout:not([style*="display: none"])~#btnDownloadFile{margin-left:0 !important;}
   /* File type badge in preview path bar */
   .preview-badge{display:inline-block;font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;margin-left:8px;text-transform:uppercase;letter-spacing:.06em;}
   .preview-badge.img,.preview-badge.image,.preview-badge.audio,.preview-badge.video{background:var(--accent-bg);color:var(--accent-text);}
