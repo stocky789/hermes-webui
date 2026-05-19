@@ -13,6 +13,14 @@ the **composer footer** — always visible while composing. A circular context r
 shows token usage at a glance. All settings and session tools are in the
 **Hermes Control Center** (launcher at the sidebar bottom).
 
+The workspace panel keeps itself fresh while it is open: visible file-tree
+folders are checked with cheap directory signatures so files created, renamed,
+or deleted by external tools appear without manual navigation. Git remotes may
+also be fetched quietly in the background to update branch and behind/ahead
+indicators. This background sync is fetch-only — it never pulls, merges, stages,
+commits, rebases, or otherwise modifies the working tree — and manual
+Fetch/Pull/Push controls remain available in the Changes tab.
+
 <img width="2448" height="1748" alt="Hermes Web UI — three-panel layout" src="https://github.com/user-attachments/assets/6bf8af4c-209d-441e-8b92-6515d7a0c369" />
 
 <table>
@@ -432,11 +440,13 @@ Production data and real cron jobs are never touched. Current snapshot:
 ### Workspace file browser
 - Directory tree with expand/collapse (single-click toggles, double-click navigates)
 - Breadcrumb navigation with clickable path segments
-- Preview text, code, Markdown (rendered), and images inline
+- Preview text, code, Markdown (rendered), and images inline; Markdown rows also expose an eye button for explicit rendered preview, a rendered popout, and contextual back navigation
 - Edit, create, delete, and rename files; create folders
 - Binary file download (auto-detected from server)
 - File preview auto-closes on directory navigation (with unsaved-edit guard)
 - Git detection -- branch name and dirty file count badge in workspace header
+- Git Changes tab with tracked/untracked checkboxes, selected-file commits that avoid unrelated staged files, selected-diff commit message generation, diffs, stage/unstage, discard/delete, fetch, pull, and push
+- Line-ending-only and filemode-only Git noise is hidden by default with an inline explanation when detected
 - Right panel is drag-resizable
 - Syntax highlighted code preview (Prism.js)
 
@@ -531,7 +541,7 @@ static/
   index.html            HTML template (~1323 lines)
   style.css             All CSS incl. mobile responsive, themes (~3767 lines)
   ui.js                 DOM helpers, renderMd, tool cards, context indicator (~7216 lines)
-  workspace.js          File preview, file ops, git badge (~369 lines)
+  workspace.js          File preview, file ops, Git changes UI (~850 lines)
   sessions.js           Session CRUD, collapsible groups, search, reload recovery (~3517 lines)
   messages.js           send(), SSE handlers, live streaming, session recovery (~2301 lines)
   panels.js             Cron, skills, memory, profiles, settings (~6480 lines)
