@@ -7729,8 +7729,8 @@ function _renderTreeItems(container, entries, depth){
     if(gitState){
       const gitMark=document.createElement('span');
       gitMark.className='file-git-status'+(gitState.conflict?' conflict':gitState.untracked?' untracked':'');
-      gitMark.textContent=gitState.status||'M';
-      gitMark.title='Git status';
+      gitMark.textContent=(typeof _gitStatusLabel==='function')?_gitStatusLabel(gitState):(gitState.status||'M');
+      gitMark.title=`Git status: ${gitState.status||'M'}`;
       el.appendChild(gitMark);
     }
 

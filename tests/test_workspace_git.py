@@ -695,9 +695,11 @@ def test_workspace_git_static_contracts():
         "gitBranchMenu",
         "workspaceEditorShell",
         "previewCodeGutter",
+        "previewCodeGuides",
         "previewReadShell",
         "previewEditShell",
         "previewEditGutter",
+        "previewEditGuides",
         "previewWrapToggle",
         "previewEditorStatus",
         "previewEditorActions",
@@ -728,6 +730,7 @@ def test_workspace_git_static_contracts():
         "renderWorkspaceMarkdown",
         "postProcessWorkspaceMarkdown",
         "refreshGitBranches",
+        "_gitStatusLabel",
         "_autoRefreshWorkspaceGitStatus",
         "_installWorkspaceGitAutoRefresh",
         "renderGitBranchControl",
@@ -737,6 +740,7 @@ def test_workspace_git_static_contracts():
         "setEditorSoftWrap",
         "requestCancelEditMode",
         "renderEditorGutter",
+        "renderEditorIndentGuides",
         "handleEditorKeydown",
         "handleEditorInput",
         "parseUnifiedDiff",
@@ -808,6 +812,8 @@ def test_workspace_git_static_contracts():
         ".workspace-tabs",
         ".workspace-editor-shell",
         ".workspace-editor-gutter",
+        ".workspace-editor-guides",
+        ".workspace-editor-guide-line",
         ".workspace-editor-textarea",
         ".workspace-editor-status",
         ".workspace-editor-actions",
@@ -844,6 +850,18 @@ def test_workspace_git_static_contracts():
     ]:
         assert cls in style
     assert ".git-stat-add" in style and ".git-stat-del" in style
+    assert "background:repeating-linear-gradient(to right" not in style
+    assert "_editorLineIndentDepths" in workspace_js
+    assert "Math.floor(_editorIndentColumns(line,tabSize)/tabSize)" in workspace_js
+    assert "previewCodeGuides" in workspace_js and "previewEditGuides" in workspace_js
+    assert "code==='??')return 'New'" in workspace_js
+    assert "status.textContent=_gitStatusLabel(file)" in workspace_js
+    assert "typeof _gitStatusLabel==='function'" in ui_js
+    update_edit_btn_body = workspace_js[
+        workspace_js.index("function updateEditBtn") : workspace_js.index("async function toggleEditMode")
+    ]
+    assert "editable&&!editing" in update_edit_btn_body
+    assert "Save*" not in update_edit_btn_body
     routes = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
     workspace_git = (ROOT / "api" / "workspace_git.py").read_text(encoding="utf-8")
     for route in ["/api/git/fetch", "/api/git/pull", "/api/git/push", "/api/git/branches", "/api/git/checkout", "/api/git/stash-checkout"]:

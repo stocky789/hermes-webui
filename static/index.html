@@ -1325,10 +1325,12 @@
         </div>
         <div class="workspace-editor-surface" id="previewReadShell">
           <div class="workspace-editor-gutter" id="previewCodeGutter" aria-hidden="true"></div>
-          <pre class="preview-code workspace-editor-code" id="previewCode"></pre>
+          <div class="workspace-editor-guides" id="previewCodeGuides" aria-hidden="true"></div>
+          <pre class="preview-code workspace-editor-code" id="previewCode" onscroll="syncEditorScroll('read')"></pre>
         </div>
         <div class="workspace-editor-surface workspace-editor-edit-surface" id="previewEditShell" style="display:none">
           <div class="workspace-editor-gutter" id="previewEditGutter" aria-hidden="true"></div>
+          <div class="workspace-editor-guides" id="previewEditGuides" aria-hidden="true"></div>
           <textarea id="previewEditArea" class="workspace-editor-textarea" oninput="handleEditorInput()" onscroll="syncEditorScroll('edit')"></textarea>
         </div>
       </div>
