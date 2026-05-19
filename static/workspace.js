@@ -670,6 +670,20 @@ function _gitSyncLabel(action,status){
   return t('git_fetch');
 }
 
+function _gitStatusLabel(file){
+  const code=String(file&&file.status||'').trim();
+  if(file&&file.conflict)return 'Conflict';
+  if(file&&file.untracked||code==='??')return 'New';
+  if(code==='R')return 'Renamed';
+  if(code==='D')return 'Deleted';
+  if(code==='A')return 'Added';
+  if(code==='C')return 'Copied';
+  if(code==='U'||code.includes('U'))return 'Conflict';
+  if(code==='T')return 'Type';
+  if(code==='M'||!code)return 'Modified';
+  return code;
+}
+
 function _gitChangeRow(file, kind){
   const row=document.createElement('div');
   const selectable=kind==='tracked'||kind==='untracked';
@@ -688,8 +702,9 @@ function _gitChangeRow(file, kind){
     row.appendChild(checkbox);
   }
   const status=document.createElement('span');
-  status.className='git-change-status';
-  status.textContent=file.status||'M';
+  status.className='git-change-status'+(file.untracked?' untracked':file.conflict?' conflict':'');
+  status.textContent=_gitStatusLabel(file);
+  status.title=`Git status: ${file.status||'M'}`;
   row.appendChild(status);
   const name=document.createElement('span');
   name.className='git-change-path';
@@ -928,6 +943,47 @@ function renderEditorGutter(targetId,text,activeLine){
   gutter.innerHTML=html;
 }
 
+function _editorIndentColumns(line,tabSize){
+  let cols=0;
+  for(const ch of String(line||'')){
+    if(ch===' ')cols+=1;
+    else if(ch==='\t')cols+=tabSize;
+    else break;
+  }
+  return cols;
+}
+
+function _editorLineIndentDepths(text,tabSize){
+  const lines=String(text||'').split('\n');
+  return lines.map((line,idx)=>{
+    if(line.trim())return Math.floor(_editorIndentColumns(line,tabSize)/tabSize);
+    for(let next=idx+1;next<lines.length;next++){
+      if(lines[next].trim())return Math.floor(_editorIndentColumns(lines[next],tabSize)/tabSize);
+    }
+    for(let prev=idx-1;prev>=0;prev--){
+      if(lines[prev].trim())return Math.floor(_editorIndentColumns(lines[prev],tabSize)/tabSize);
+    }
+    return 0;
+  });
+}
+
+function renderEditorIndentGuides(targetId,text,scrollTop){
+  const guides=$(targetId);
+  if(!guides)return;
+  const tabSize=2;
+  const depths=_editorLineIndentDepths(text,tabSize);
+  let html='';
+  for(const depth of depths){
+    html+='<div class="workspace-editor-guide-line">';
+    for(let level=1;level<=depth;level++){
+      html+=`<span style="left:${(level-1)*tabSize}ch"></span>`;
+    }
+    html+='</div>';
+  }
+  guides.innerHTML=html;
+  guides.style.transform=`translateY(-${scrollTop||0}px)`;
+}
+
 function _editorCursorPosition(text,pos){
   const before=String(text||'').slice(0,pos);
   const lines=before.split('\n');
@@ -941,6 +997,7 @@ function refreshEditorChrome(){
   const text=editing&&area?area.value:(code?code.textContent:'');
   const cursor=editing&&area?_editorCursorPosition(area.value,area.selectionStart||0):{line:1,col:1};
   renderEditorGutter(editing?'previewEditGutter':'previewCodeGutter',text,cursor.line);
+  renderEditorIndentGuides(editing?'previewEditGuides':'previewCodeGuides',text,editing&&area?area.scrollTop:(code?code.scrollTop:0));
   const status=$('previewEditorStatus');
   if(status)status.textContent=`Ln ${cursor.line}, Col ${cursor.col}`;
   const dirty=$('editorDirtyState');
@@ -957,13 +1014,14 @@ function refreshEditorChrome(){
 
 function syncEditorScroll(mode){
   if(mode==='edit'){
-    const area=$('previewEditArea'), gutter=$('previewEditGutter');
+    const area=$('previewEditArea'), gutter=$('previewEditGutter'), guides=$('previewEditGuides');
     if(area&&gutter)gutter.scrollTop=area.scrollTop;
-    refreshEditorChrome();
+    if(area&&guides)guides.style.transform=`translateY(-${area.scrollTop}px)`;
     return;
   }
-  const code=$('previewCode'), gutter=$('previewCodeGutter');
+  const code=$('previewCode'), gutter=$('previewCodeGutter'), guides=$('previewCodeGuides');
   if(code&&gutter)gutter.scrollTop=code.scrollTop;
+  if(code&&guides)guides.style.transform=`translateY(-${code.scrollTop}px)`;
 }
 
 function handleEditorInput(){
@@ -1077,12 +1135,11 @@ function updateEditBtn(){
   const btn=$('btnEditFile');
   if(!btn)return;
   const editable = _previewCurrentMode==='code'||_previewCurrentMode==='md';
-  btn.style.display = editable?'':'none';
   const editing = _isPreviewEditing();
-  btn.innerHTML = editing ? `&#128190; ${t('save')}` : `&#9998; ${t('edit')}`;
-  btn.title = editing ? t('save_title') : t('edit_title');
-  btn.style.color = editing ? 'var(--blue)' : '';
-  if(_previewDirty) btn.innerHTML = '&#128190; Save*';
+  btn.style.display = editable&&!editing?'':'none';
+  btn.innerHTML = `&#9998; ${t('edit')}`;
+  btn.title = t('edit_title');
+  btn.style.color = '';
 }
 
 async function toggleEditMode(){

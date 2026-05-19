@@ -1481,14 +1481,17 @@
   .workspace-editor-actions[hidden]{display:none!important;}
   .workspace-editor-save{background:var(--accent-bg);border-color:var(--accent-bg-strong,var(--border2));color:var(--accent-text);}
   .workspace-editor-save:hover{background:var(--accent-bg-strong,var(--hover-bg));color:var(--accent-text);}
-  .workspace-editor-surface{display:grid;grid-template-columns:minmax(42px,auto) minmax(0,1fr);flex:1;min-height:0;overflow:hidden;}
+  .workspace-editor-surface{display:grid;grid-template-columns:minmax(42px,auto) minmax(0,1fr);grid-template-rows:minmax(0,1fr);flex:1;min-height:0;overflow:hidden;}
   .workspace-editor-gutter{overflow:hidden;padding:10px 8px 10px 6px;border-right:1px solid var(--border);background:rgba(0,0,0,.12);color:var(--muted);font:11px/1.6 "SF Mono",ui-monospace,monospace;text-align:right;user-select:none;}
   .workspace-editor-line-number{height:1.6em;}
   .workspace-editor-line-number.active{color:var(--accent-text);}
   .preview-code,.workspace-editor-textarea{font-family:"SF Mono","Fira Code",ui-monospace,monospace;font-size:12px;line-height:1.6;tab-size:2;color:var(--pre-text);}
-  .preview-code{min-height:100%;margin:0;padding:10px 12px;overflow:auto;white-space:pre;word-break:normal;background:repeating-linear-gradient(to right,transparent 0,transparent calc(2ch - 1px),rgba(255,255,255,.035) calc(2ch - 1px),rgba(255,255,255,.035) 2ch);}
+  .workspace-editor-guides{grid-column:2;grid-row:1;padding:10px 12px;overflow:hidden;pointer-events:none;z-index:0;font:12px/1.6 "SF Mono","Fira Code",ui-monospace,monospace;tab-size:2;will-change:transform;}
+  .workspace-editor-guide-line{position:relative;height:1.6em;}
+  .workspace-editor-guide-line span{position:absolute;top:0;bottom:0;width:1px;background:rgba(148,163,184,.18);}
+  .preview-code{grid-column:2;grid-row:1;position:relative;z-index:1;min-height:100%;margin:0;padding:10px 12px;overflow:auto;white-space:pre;word-break:normal;background:transparent;}
   .workspace-editor-shell.soft-wrap .preview-code{white-space:pre-wrap;word-break:break-word;}
-  .workspace-editor-textarea{width:100%;height:100%;box-sizing:border-box;resize:none;border:0;outline:none;background:repeating-linear-gradient(to right,transparent 0,transparent calc(2ch - 1px),rgba(255,255,255,.035) calc(2ch - 1px),rgba(255,255,255,.035) 2ch);padding:10px 12px;overflow:auto;white-space:pre;}
+  .workspace-editor-textarea{grid-column:2;grid-row:1;position:relative;z-index:1;width:100%;height:100%;box-sizing:border-box;resize:none;border:0;outline:none;background:transparent;padding:10px 12px;overflow:auto;white-space:pre;}
   .workspace-editor-shell.soft-wrap .workspace-editor-textarea{white-space:pre-wrap;overflow-wrap:anywhere;}
   .workspace-editor-edit-surface.is-dirty{box-shadow:inset 2px 0 0 var(--warning);}
   /* Image preview */
@@ -1542,11 +1545,13 @@
   .git-change-group-title{display:flex;align-items:center;gap:7px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:2px 2px 4px;}
   .git-select-checkbox{width:15px;height:15px;margin:0;accent-color:var(--accent-text);cursor:pointer;}
   .git-select-checkbox:disabled{cursor:not-allowed;opacity:.55;}
-  .git-change-row{display:grid;grid-template-columns:30px minmax(0,1fr) auto auto;align-items:center;gap:7px;min-height:34px;padding:5px 6px;border-radius:6px;color:var(--text);cursor:pointer;}
-  .git-change-row.selectable{grid-template-columns:18px 30px minmax(0,1fr) auto auto;}
+  .git-change-row{display:grid;grid-template-columns:58px minmax(0,1fr) auto auto;align-items:center;gap:7px;min-height:34px;padding:5px 6px;border-radius:6px;color:var(--text);cursor:pointer;}
+  .git-change-row.selectable{grid-template-columns:18px 58px minmax(0,1fr) auto auto;}
   .git-change-row:hover,.git-change-row:focus-visible{background:var(--hover-bg);outline:none;}
   .git-change-status,.file-git-status{font-family:"SF Mono",ui-monospace,monospace;font-size:10px;font-weight:700;color:var(--accent-text);}
-  .git-change-status{justify-self:center;}
+  .git-change-status{justify-self:start;min-width:0;max-width:58px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);}
+  .git-change-status.untracked{color:var(--accent-text);}
+  .git-change-status.conflict{color:var(--error);}
   .git-change-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;}
   .git-change-stats{font-family:"SF Mono",ui-monospace,monospace;font-size:10px;color:var(--muted);white-space:nowrap;}
   .git-stat-add{color:var(--success,#86C08B);}
@@ -1599,7 +1604,7 @@
     .workspace-editor-status{margin-left:0;}
     .workspace-editor-actions{margin-left:auto;}
   }
-  .file-git-status{margin-left:auto;padding:0 4px;line-height:18px;border-radius:4px;background:var(--hover-bg);flex-shrink:0;}
+  .file-git-status{margin-left:auto;padding:0 5px;line-height:18px;border-radius:4px;background:var(--hover-bg);flex-shrink:0;max-width:58px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .file-git-status.untracked{color:var(--muted);}
   .file-git-status.conflict{color:var(--error);}
   .file-preview-btn{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--muted);border-radius:5px;cursor:pointer;flex-shrink:0;}
