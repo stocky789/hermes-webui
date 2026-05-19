@@ -103,6 +103,12 @@ function _ensureGitState(){
   const scopeKey=`${(S.session&&S.session.session_id)||''}\n${(S.session&&S.session.workspace)||''}`;
   if(!S.git)S.git={status:null,selectedTab:'files',selectedDiff:null,loading:false,syncing:null,generatingCommitMessage:false,mutating:false,selectedPaths:new Set(),selectionTouched:false,selectionKey:scopeKey};
   if(typeof S.git.mutating==='undefined')S.git.mutating=false;
+  if(typeof S.git.branchLoading==='undefined')S.git.branchLoading=false;
+  if(typeof S.git.branchMenuOpen==='undefined')S.git.branchMenuOpen=false;
+  if(typeof S.git.branchFilter==='undefined')S.git.branchFilter='';
+  if(typeof S.git.diffMode==='undefined'){
+    try{S.git.diffMode=localStorage.getItem('hermes-webui-git-diff-mode')||'';}catch(e){S.git.diffMode='';}
+  }
   if(typeof S.git.selectionTouched==='undefined')S.git.selectionTouched=false;
   if(!(S.git.selectedPaths instanceof Set)){
     S.git.selectedPaths=new Set(Array.isArray(S.git.selectedPaths)?S.git.selectedPaths:Object.keys(S.git.selectedPaths||{}).filter(k=>S.git.selectedPaths[k]));
@@ -115,6 +121,308 @@ function _ensureGitState(){
   return S.git;
 }
 
+function _branchLocalName(remoteName){
+  const parts=String(remoteName||'').split('/');
+  if(parts.length<=1)return remoteName;
+  return parts.slice(1).join('/');
+}
+
+function _branchMeta(item){
+  const bits=[];
+  if(item.author)bits.push(item.author);
+  if(item.updated_relative)bits.push(item.updated_relative);
+  if(item.upstream)bits.push(item.upstream);
+  if(item.ahead)bits.push(`\u2191${item.ahead}`);
+  if(item.behind)bits.push(`\u2193${item.behind}`);
+  if(item.subject)bits.push(item.subject);
+  return bits.join(' \u00b7 ');
+}
+
+function _branchSearchText(item){
+  return [item.name,item.upstream,item.author,item.updated_relative,item.subject].filter(Boolean).join(' ').toLowerCase();
+}
+
+function _currentBranchItem(branches,current){
+  return (branches.local||[]).find(item=>item.name===current) || {name:current,upstream:branches.upstream||'',ahead:branches.ahead||0,behind:branches.behind||0};
+}
+
+function _allBranchRows(branches,current,filterText){
+  const query=String(filterText||'').trim().toLowerCase();
+  const matches=item=>!query||_branchSearchText(item).includes(query);
+  return {
+    current: [_currentBranchItem(branches,current)].filter(matches),
+    local: (branches.local||[]).filter(item=>item.name!==current&&matches(item)),
+    remote: (branches.remote||[]).filter(matches),
+  };
+}
+
+function _defaultGitDiffMode(){
+  if(window.matchMedia&&window.matchMedia('(max-width: 760px)').matches)return 'unified';
+  return 'split';
+}
+
+function _currentGitDiffMode(){
+  const mode=(_ensureGitState().diffMode||'').trim();
+  return mode==='split'||mode==='unified'?mode:_defaultGitDiffMode();
+}
+
+function setGitDiffMode(mode){
+  const git=_ensureGitState();
+  git.diffMode=mode==='split'?'split':'unified';
+  try{localStorage.setItem('hermes-webui-git-diff-mode',git.diffMode);}catch(e){}
+  if(git.selectedDiff)openGitDiff(git.selectedDiff.path,git.selectedDiff.kind);
+}
+
+async function refreshGitBranches(){
+  const git=_ensureGitState();
+  if(!S.session||!git.status||!git.status.is_git){
+    git.branches=null;
+    renderGitBranchControl();
+    return null;
+  }
+  git.branchLoading=true;
+  renderGitBranchControl();
+  try{
+    const data=await api(`/api/git/branches?session_id=${encodeURIComponent(S.session.session_id)}`);
+    git.branches=data.branches||null;
+    renderGitBranchControl();
+    return git.branches;
+  }catch(e){
+    git.branches=null;
+    renderGitBranchControl(e.message);
+    return null;
+  }finally{
+    git.branchLoading=false;
+    renderGitBranchControl();
+  }
+}
+
+function renderGitBranchControl(errorMessage){
+  const git=_ensureGitState();
+  const control=$('gitBranchControl'), label=$('gitBranchLabel'), menu=$('gitBranchMenu'), btn=$('btnGitBranchMenu');
+  if(!control||!label||!menu||!btn)return;
+  if(!git.status||!git.status.is_git){
+    control.style.display='none';
+    control.classList.remove('is-open');
+    menu.hidden=true;
+    btn.setAttribute('aria-expanded','false');
+    return;
+  }
+  control.style.display='';
+  const current=(git.branches&&git.branches.current)||git.status.branch||'HEAD';
+  label.textContent=current;
+  btn.title=`${t('git_current_branch')||'Current branch'}: ${current}`;
+  btn.setAttribute('aria-label',`${t('git_current_branch')||'Current branch'}: ${current}`);
+  btn.setAttribute('aria-expanded',git.branchMenuOpen?'true':'false');
+  control.classList.toggle('is-open',!!git.branchMenuOpen);
+  menu.hidden=!git.branchMenuOpen;
+  if(!git.branchMenuOpen)return;
+  menu.innerHTML='';
+  const branches=git.branches||{};
+  const filterText=String(git.branchFilter||'');
+  const searchWrap=document.createElement('div');
+  searchWrap.className='git-branch-search';
+  const search=document.createElement('input');
+  search.id='gitBranchSearchInput';
+  search.type='search';
+  search.placeholder='Switch branch...';
+  search.autocomplete='off';
+  search.spellcheck=false;
+  search.value=filterText;
+  search.addEventListener('input',()=>{
+    git.branchFilter=search.value;
+    renderGitBranchControl();
+    requestAnimationFrame(()=>{
+      const next=$('gitBranchSearchInput');
+      if(next){
+        next.focus();
+        next.selectionStart=next.selectionEnd=next.value.length;
+      }
+    });
+  });
+  search.addEventListener('keydown',e=>{
+    if(e.key==='Escape'){
+      e.preventDefault();
+      closeGitBranchMenu();
+      return;
+    }
+    if(e.key!=='Enter')return;
+    const rows=_allBranchRows(branches,current,search.value);
+    const first=[...rows.local.map(item=>({item,mode:'local'})),...rows.remote.map(item=>({item,mode:'remote'}))][0];
+    if(first){
+      e.preventDefault();
+      checkoutGitBranch(first.item.name,first.mode);
+      return;
+    }
+    const name=search.value.trim();
+    if(name){
+      e.preventDefault();
+      checkoutGitBranch(name,'new');
+    }
+  });
+  searchWrap.appendChild(search);
+  menu.appendChild(searchWrap);
+  if(git.branchLoading){
+    const loading=document.createElement('div');
+    loading.className='git-empty';
+    loading.textContent=t('loading')||'Loading...';
+    menu.appendChild(loading);
+    return;
+  }
+  if(errorMessage){
+    const err=document.createElement('div');
+    err.className='git-empty error';
+    err.textContent=errorMessage;
+    menu.appendChild(err);
+  }
+  const rows=_allBranchRows(branches,current,filterText);
+  const addSection=(title,items,mode)=>{
+    const section=document.createElement('section');
+    section.className='git-branch-section';
+    const h=document.createElement('div');
+    h.className='git-branch-title';
+    h.textContent=title;
+    section.appendChild(h);
+    if(!items||!items.length){
+      const empty=document.createElement('div');
+      empty.className='git-empty';
+      empty.textContent=t('git_no_branches')||'No branches';
+      section.appendChild(empty);
+    }else{
+      for(const item of items){
+        const row=document.createElement('button');
+        row.type='button';
+        row.className='git-branch-item'+(item.name===current?' current':'');
+        row.setAttribute('role','menuitem');
+        row.disabled=item.name===current;
+        row.onclick=()=>checkoutGitBranch(item.name,mode);
+        const mark=document.createElement('span');
+        mark.className='git-branch-check';
+        mark.textContent=item.name===current?'\u2713':'';
+        row.appendChild(mark);
+        const body=document.createElement('span');
+        body.className='git-branch-body';
+        const name=document.createElement('span');
+        name.className='git-branch-name';
+        name.textContent=item.name;
+        body.appendChild(name);
+        const meta=_branchMeta(item);
+        if(meta){
+          const m=document.createElement('span');
+          m.className='git-branch-meta';
+          m.textContent=meta;
+          body.appendChild(m);
+        }
+        row.appendChild(body);
+        if(item.name===current){
+          const currentMeta=document.createElement('span');
+          currentMeta.className='git-branch-current-mark';
+          currentMeta.textContent=t('git_current_branch')||'Current branch';
+          row.appendChild(currentMeta);
+        }
+        section.appendChild(row);
+      }
+    }
+    menu.appendChild(section);
+  };
+  addSection(t('git_current_branch')||'Current branch',rows.current,'local');
+  addSection(t('git_local_branches')||'Local branches',rows.local,'local');
+  addSection(t('git_remote_branches')||'Remote branches',rows.remote,'remote');
+  const exactExists=[...rows.current,...rows.local,...rows.remote].some(item=>item.name===filterText.trim()||_branchLocalName(item.name)===filterText.trim());
+  if(filterText.trim()&&!exactExists){
+    const create=document.createElement('section');
+    create.className='git-branch-section';
+    const createBtn=document.createElement('button');
+    createBtn.type='button';
+    createBtn.className='git-branch-create-row';
+    createBtn.onclick=()=>checkoutGitBranch(filterText,'new');
+    createBtn.textContent=`${t('git_create_branch')||'Create branch'} "${filterText.trim()}"`;
+    create.appendChild(createBtn);
+    menu.appendChild(create);
+  }
+  const fetchBtn=document.createElement('button');
+  fetchBtn.type='button';
+  fetchBtn.className='git-branch-fetch';
+  fetchBtn.textContent=t('git_fetch_refresh')||'Fetch refresh';
+  fetchBtn.onclick=async()=>{await runGitRemoteAction('fetch');await refreshGitBranches();};
+  menu.appendChild(fetchBtn);
+  requestAnimationFrame(()=>{
+    const active=document.activeElement;
+    if(active&&menu.contains(active))return;
+    const input=$('gitBranchSearchInput');
+    if(input)input.focus();
+  });
+}
+
+function closeGitBranchMenu(){
+  const git=_ensureGitState();
+  if(!git.branchMenuOpen)return;
+  git.branchMenuOpen=false;
+  git.branchFilter='';
+  renderGitBranchControl();
+}
+
+async function toggleGitBranchMenu(event){
+  if(event)event.stopPropagation();
+  const git=_ensureGitState();
+  git.branchMenuOpen=!git.branchMenuOpen;
+  renderGitBranchControl();
+  if(git.branchMenuOpen&&!git.branches)await refreshGitBranches();
+}
+
+async function checkoutGitBranch(ref,mode,opts={}){
+  if(!S.session)return;
+  ref=String(ref||'').trim();
+  if(!ref)return;
+  if(_previewDirty){
+    const ok=await showConfirmDialog({title:t('unsaved_confirm'),message:'',confirmLabel:t('discard'),danger:true,focusCancel:true});
+    if(!ok)return;
+    cancelEditMode();
+  }
+  const git=_ensureGitState();
+  git.mutating=true;
+  git.branchMenuOpen=false;
+  renderGitChanges();
+  renderGitBranchControl();
+  try{
+    const endpoint=opts.stash?'/api/git/stash-checkout':'/api/git/checkout';
+    const data=await api(endpoint,{method:'POST',body:JSON.stringify({
+      session_id:S.session.session_id,
+      ref,
+      mode:mode==='remote'?'remote':mode==='new'?'new':'local',
+      new_branch:mode==='new'?ref:null,
+      track:mode==='remote',
+      dirty_mode:'block'
+    })});
+    _setGitStatus(data.git);
+    git.branches=data.branches||null;
+    const stashNote=data.stash_name?` · ${t('git_stashed')||'Stashed'}: ${data.stash_name}`:'';
+    showToast(data.current_branch?`${t('git_checked_out')||'Checked out'} ${data.current_branch}${stashNote}`:`${t('git_checked_out')||'Checked out'}${stashNote}`,3600);
+    _closePreviewSurface();
+    await loadDir('.');
+    await refreshGitBranches();
+  }catch(e){
+    let code='';
+    try{code=JSON.parse(e.body||'{}').code||'';}catch(_e){}
+    if(!opts.stash&&code==='dirty_worktree'){
+      const ok=await showConfirmDialog({
+        title:t('git_checkout_dirty_title')||'Checkout blocked',
+        message:t('git_checkout_dirty_message')||'The worktree has uncommitted changes. Stash local changes and switch branch?',
+        confirmLabel:t('git_stash_and_switch')||'Stash and switch',
+        danger:false,
+        focusCancel:true
+      });
+      if(ok)return checkoutGitBranch(ref,mode,{stash:true});
+    }
+    const msg=e.message||t('git_checkout_failed')||'Checkout failed';
+    showToast(`${t('git_checkout_failed')||'Checkout failed'}: ${msg}`,5000,'error');
+  }finally{
+    git.mutating=false;
+    renderGitChanges();
+    renderGitBranchControl();
+  }
+}
+
 function renderGitBadge(status){
   const badge=$('gitBadge');
   const tabs=$('workspaceGitTabs');
@@ -123,6 +431,7 @@ function renderGitBadge(status){
     badge.style.display='none';
     badge.textContent='';
     if(tabs)tabs.hidden=true;
+    renderGitBranchControl();
     return;
   }
   if(tabs)tabs.hidden=false;
@@ -134,6 +443,7 @@ function renderGitBadge(status){
   badge.textContent=text;
   badge.className='git-badge'+((totals.changed||0)>0?' dirty':'');
   badge.style.display='';
+  renderGitBranchControl();
   const changesTab=$('btnWorkspaceChangesTab');
   if(changesTab){
     changesTab.textContent=(totals.changed||0)>0?`${t('git_changes')} ${totals.changed}`:t('git_changes');
@@ -157,6 +467,7 @@ async function refreshGitStatus(){
     _reconcileGitSelection();
     renderGitBadge(git.status);
     renderGitChanges();
+    refreshGitBranches();
     if(typeof renderFileTree==='function')renderFileTree();
     return git.status;
   }catch(e){
@@ -496,6 +807,7 @@ let _previewCurrentPath = '';  // relative path of currently previewed file
 let _previewCurrentMode = '';  // 'code' | 'md' | 'image' | 'html' | 'pdf' | 'audio' | 'video'
 let _previewDirty = false;     // true when edits are unsaved
 let _previewReturnTarget = 'files'; // 'files' | 'changes'
+let _editorSoftWrap = false;
 
 function _setPreviewReturnTarget(target){
   _previewReturnTarget=target==='changes'?'changes':'files';
@@ -510,19 +822,22 @@ function _setPreviewReturnTarget(target){
 
 function showPreview(mode){
   // mode: 'code' | 'image' | 'md' | 'html' | 'pdf' | 'audio' | 'video' | 'gitdiff'
-  $('previewCode').style.display     = mode==='code'  ? '' : 'none';
+  const editorShell=$('workspaceEditorShell'); if(editorShell) editorShell.style.display = mode==='code' ? 'flex' : 'none';
+  const readShell=$('previewReadShell'); if(readShell) readShell.style.display = mode==='code' ? 'grid' : 'none';
+  const editShell=$('previewEditShell'); if(editShell) editShell.style.display = 'none';
   $('previewImgWrap').style.display  = mode==='image' ? '' : 'none';
   const mediaWrap=$('previewMediaWrap'); if(mediaWrap) mediaWrap.style.display = (mode==='audio'||mode==='video') ? '' : 'none';
   const pdfWrap=$('previewPdfWrap'); if(pdfWrap) pdfWrap.style.display = mode==='pdf' ? '' : 'none';
   $('previewMd').style.display       = mode==='md'    ? '' : 'none';
   $('previewHtmlWrap').style.display = mode==='html'  ? '' : 'none';
   const diffView=$('gitDiffView'); if(diffView) diffView.style.display = mode==='gitdiff' ? 'flex' : 'none';
-  $('previewEditArea').style.display = 'none';  // start in read-only
+  const editArea=$('previewEditArea'); if(editArea) editArea.onkeydown=null;  // start in read-only
   const badge=$('previewBadge');
   badge.className='preview-badge '+mode;
   badge.textContent = mode==='image'?'image':mode==='audio'?'audio':mode==='video'?'video':mode==='pdf'?'pdf':mode==='md'?'md':mode==='html'?'html':mode==='gitdiff'?'diff':fileExt($('previewPathText').textContent)||'text';
   _previewCurrentMode = mode;
   _previewDirty = false;
+  refreshEditorChrome();
   updateEditBtn();
   // Show "Open in browser" button for iframe-backed document previews
   const openBtn=$('btnOpenInBrowser');
@@ -533,6 +848,145 @@ function showPreview(mode){
   if(downloadBtn) downloadBtn.style.display = mode==='gitdiff'?'none':'inline-flex';
 }
 
+function setEditorSoftWrap(on){
+  _editorSoftWrap=!!on;
+  const shell=$('workspaceEditorShell');
+  if(shell)shell.classList.toggle('soft-wrap',_editorSoftWrap);
+  try{localStorage.setItem('hermes-webui-editor-soft-wrap',_editorSoftWrap?'1':'0');}catch(e){}
+}
+
+function _initEditorPrefs(){
+  try{_editorSoftWrap=localStorage.getItem('hermes-webui-editor-soft-wrap')==='1';}catch(e){_editorSoftWrap=false;}
+  const toggle=$('previewWrapToggle');
+  if(toggle)toggle.checked=_editorSoftWrap;
+  setEditorSoftWrap(_editorSoftWrap);
+}
+
+function _lineCount(text){return Math.max(1,String(text||'').split('\n').length);}
+
+function renderEditorGutter(targetId,text,activeLine){
+  const gutter=$(targetId);
+  if(!gutter)return;
+  const count=_lineCount(text);
+  let html='';
+  for(let i=1;i<=count;i++)html+=`<div class="workspace-editor-line-number${i===activeLine?' active':''}">${i}</div>`;
+  gutter.innerHTML=html;
+}
+
+function _editorCursorPosition(text,pos){
+  const before=String(text||'').slice(0,pos);
+  const lines=before.split('\n');
+  return {line:lines.length,col:(lines[lines.length-1]||'').length+1};
+}
+
+function refreshEditorChrome(){
+  const editing=_isPreviewEditing();
+  const area=$('previewEditArea');
+  const code=$('previewCode');
+  const text=editing&&area?area.value:(code?code.textContent:'');
+  const cursor=editing&&area?_editorCursorPosition(area.value,area.selectionStart||0):{line:1,col:1};
+  renderEditorGutter(editing?'previewEditGutter':'previewCodeGutter',text,cursor.line);
+  const status=$('previewEditorStatus');
+  if(status)status.textContent=`Ln ${cursor.line}, Col ${cursor.col}`;
+  const dirty=$('editorDirtyState');
+  if(dirty)dirty.textContent=_previewDirty?`• ${t('unsaved')||'Unsaved'}`:'';
+  const editShell=$('previewEditShell');
+  if(editShell)editShell.classList.toggle('is-dirty',!!_previewDirty);
+  const actions=$('previewEditorActions');
+  if(actions)actions.hidden=!editing;
+  const cancelBtn=$('btnEditorCancel');
+  if(cancelBtn)cancelBtn.disabled=!editing;
+  const saveBtn=$('btnEditorSave');
+  if(saveBtn)saveBtn.disabled=!editing||!_previewDirty;
+}
+
+function syncEditorScroll(mode){
+  if(mode==='edit'){
+    const area=$('previewEditArea'), gutter=$('previewEditGutter');
+    if(area&&gutter)gutter.scrollTop=area.scrollTop;
+    refreshEditorChrome();
+    return;
+  }
+  const code=$('previewCode'), gutter=$('previewCodeGutter');
+  if(code&&gutter)gutter.scrollTop=code.scrollTop;
+}
+
+function handleEditorInput(){
+  _previewDirty=true;
+  updateEditBtn();
+  refreshEditorChrome();
+}
+
+function _isPreviewEditing(){
+  const editShell=$('previewEditShell');
+  return !!(editShell&&editShell.style.display!=='none');
+}
+
+async function requestCancelEditMode(){
+  if(_previewDirty){
+    const ok=await showConfirmDialog({title:t('unsaved_confirm'),message:'',confirmLabel:t('discard'),danger:true,focusCancel:true});
+    if(!ok)return false;
+  }
+  cancelEditMode();
+  return true;
+}
+
+function _indentSelection(text,start,end,indent){
+  const lineStart=text.lastIndexOf('\n',Math.max(0,start-1))+1;
+  const selected=text.slice(lineStart,end);
+  const lines=selected.split('\n');
+  const out=lines.map(line=>indent+line).join('\n');
+  return {text:text.slice(0,lineStart)+out+text.slice(end),start:start+indent.length,end:end+(indent.length*lines.length)};
+}
+
+function _unindentSelection(text,start,end,tabSize){
+  const lineStart=text.lastIndexOf('\n',Math.max(0,start-1))+1;
+  const selected=text.slice(lineStart,end);
+  let deltaStart=0,deltaEnd=0;
+  const out=selected.split('\n').map((line,idx)=>{
+    let remove=0;
+    if(line.startsWith('\t'))remove=1;
+    else{
+      const m=line.match(/^ +/);
+      remove=Math.min(tabSize,m?m[0].length:0);
+    }
+    if(idx===0)deltaStart=remove;
+    deltaEnd+=remove;
+    return line.slice(remove);
+  }).join('\n');
+  return {text:text.slice(0,lineStart)+out+text.slice(end),start:Math.max(lineStart,start-deltaStart),end:Math.max(lineStart,end-deltaEnd)};
+}
+
+function handleEditorKeydown(e){
+  const area=$('previewEditArea');
+  if(!area)return;
+  const tabSize=2;
+  const indent=' '.repeat(tabSize);
+  if(e.key==='Tab'){
+    e.preventDefault();
+    const start=area.selectionStart,end=area.selectionEnd;
+    const next=e.shiftKey?_unindentSelection(area.value,start,end,tabSize):_indentSelection(area.value,start,end,indent);
+    area.value=next.text;
+    area.selectionStart=next.start;area.selectionEnd=next.end;
+    handleEditorInput();
+  }else if(e.key==='Enter'){
+    e.preventDefault();
+    const start=area.selectionStart,end=area.selectionEnd;
+    const lineStart=area.value.lastIndexOf('\n',Math.max(0,start-1))+1;
+    const currentLine=area.value.slice(lineStart,start);
+    const match=currentLine.match(/^\s*/);
+    const insertion='\n'+(match?match[0]:'');
+    area.value=area.value.slice(0,start)+insertion+area.value.slice(end);
+    area.selectionStart=area.selectionEnd=start+insertion.length;
+    handleEditorInput();
+  }else if(e.key==='Escape'){
+    e.preventDefault();
+    requestCancelEditMode();
+  }else{
+    setTimeout(refreshEditorChrome,0);
+  }
+}
+
 function _closePreviewSurface(){
   const pa=$('previewArea');if(pa)pa.classList.remove('visible');
   const pi=$('previewImg');if(pi){pi.onerror=null;pi.src='';}
@@ -540,6 +994,7 @@ function _closePreviewSurface(){
   const html=$('previewHtmlIframe');if(html)html.src='';
   const pm=$('previewMd');if(pm)pm.innerHTML='';
   const pc=$('previewCode');if(pc)pc.textContent='';
+  const shell=$('workspaceEditorShell');if(shell)shell.style.display='none';
   const pp=$('previewPathText');if(pp)pp.textContent='';
   const back=$('btnPreviewBack');if(back)back.style.display='none';
   _previewCurrentPath='';_previewCurrentMode='';_previewDirty=false;
@@ -568,7 +1023,7 @@ function updateEditBtn(){
   if(!btn)return;
   const editable = _previewCurrentMode==='code'||_previewCurrentMode==='md';
   btn.style.display = editable?'':'none';
-  const editing = $('previewEditArea').style.display!=='none';
+  const editing = _isPreviewEditing();
   btn.innerHTML = editing ? `&#128190; ${t('save')}` : `&#9998; ${t('edit')}`;
   btn.title = editing ? t('save_title') : t('edit_title');
   btn.style.color = editing ? 'var(--blue)' : '';
@@ -576,7 +1031,7 @@ function updateEditBtn(){
 }
 
 async function toggleEditMode(){
-  const editing = $('previewEditArea').style.display!=='none';
+  const editing = _isPreviewEditing();
   if(editing){
     // Save
     if(!S.session||!_previewCurrentPath)return;
@@ -586,12 +1041,13 @@ async function toggleEditMode(){
         session_id:S.session.session_id, path:_previewCurrentPath, content
       })});
       _previewDirty=false;
+      _previewRawContent=content;
       // Update read-only views
       if(_previewCurrentMode==='code') $('previewCode').textContent=content;
       else { renderWorkspaceMarkdown(content); }
-      $('previewEditArea').style.display='none';
-      if(_previewCurrentMode==='code') $('previewCode').style.display='';
-      else $('previewMd').style.display='';
+      const editShell=$('previewEditShell'); if(editShell)editShell.style.display='none';
+      const readShell=$('previewReadShell'); if(readShell&&_previewCurrentMode==='code')readShell.style.display='grid';
+      else { const editorShell=$('workspaceEditorShell'); if(editorShell)editorShell.style.display='none'; $('previewMd').style.display=''; }
       showToast(t('saved'));
       refreshGitStatus();
     }catch(e){setStatus(t('save_failed')+e.message);}
@@ -600,15 +1056,18 @@ async function toggleEditMode(){
     const currentText = _previewCurrentMode==='code'
       ? $('previewCode').textContent
       : _previewRawContent||'';
+    _initEditorPrefs();
+    const editorShell=$('workspaceEditorShell'); if(editorShell)editorShell.style.display='flex';
     $('previewEditArea').value=currentText;
-    $('previewEditArea').style.display='';
-    if(_previewCurrentMode==='code') $('previewCode').style.display='none';
+    const editShell=$('previewEditShell'); if(editShell)editShell.style.display='grid';
+    const readShell=$('previewReadShell'); if(readShell&&_previewCurrentMode==='code')readShell.style.display='none';
     else $('previewMd').style.display='none';
-    // Escape cancels the edit without saving
-    $('previewEditArea').onkeydown=e=>{
-      if(e.key==='Escape'){e.preventDefault();cancelEditMode();}
-    };
+    $('previewEditArea').onkeydown=handleEditorKeydown;
+    $('previewEditArea').onkeyup=refreshEditorChrome;
+    $('previewEditArea').onclick=refreshEditorChrome;
+    $('previewEditArea').focus();
   }
+  refreshEditorChrome();
   updateEditBtn();
 }
 
@@ -636,11 +1095,12 @@ function postProcessWorkspaceMarkdown(container){
 
 function cancelEditMode(){
   // Discard changes and return to read-only view
-  $('previewEditArea').style.display='none';
+  const editShell=$('previewEditShell'); if(editShell)editShell.style.display='none';
   $('previewEditArea').onkeydown=null;
-  if(_previewCurrentMode==='code') $('previewCode').style.display='';
-  else $('previewMd').style.display='';
+  if(_previewCurrentMode==='code'){const readShell=$('previewReadShell');if(readShell)readShell.style.display='grid';}
+  else {const editorShell=$('workspaceEditorShell');if(editorShell)editorShell.style.display='none';$('previewMd').style.display='';}
   _previewDirty=false;
+  refreshEditorChrome();
   updateEditBtn();
 }
 
@@ -724,6 +1184,9 @@ async function openFile(path,opts={}){
       }
       showPreview('code');
       $('previewCode').textContent=data.content;
+      $('previewCode').onscroll=()=>syncEditorScroll('read');
+      refreshEditorChrome();
+      if(window.Prism&&typeof Prism.highlightElement==='function')Prism.highlightElement($('previewCode'));
     }catch(e){
       // If it's a 400/too-large error, offer download instead
       downloadFile(path);
@@ -845,6 +1308,7 @@ function renderGitDiff(diff){
   const view=$('gitDiffView');
   if(!view)return;
   view.innerHTML='';
+  view.className='git-diff-view '+_currentGitDiffMode();
   if(!diff)return;
   if(diff.binary){
     const msg=document.createElement('div');
@@ -867,6 +1331,8 @@ function renderGitDiff(diff){
     view.appendChild(msg);
     return;
   }
+  const toolbar=document.createElement('div');
+  toolbar.className='git-diff-toolbar';
   const actions=document.createElement('div');
   actions.className='git-diff-actions';
   const state=_gitStatusForPath(diff.path);
@@ -895,17 +1361,124 @@ function renderGitDiff(diff){
   open.textContent=t('open_file');
   open.onclick=()=>openFile(diff.path,{returnTo:'changes'});
   actions.appendChild(open);
-  view.appendChild(actions);
-  for(const lineText of text.split('\n')){
-    const line=document.createElement('div');
-    line.className='git-diff-line';
-    if(lineText.startsWith('@@'))line.classList.add('git-diff-hunk');
-    else if(lineText.startsWith('+')&&!lineText.startsWith('+++'))line.classList.add('git-diff-add');
-    else if(lineText.startsWith('-')&&!lineText.startsWith('---'))line.classList.add('git-diff-del');
-    else if(lineText.startsWith('diff --git')||lineText.startsWith('index ')||lineText.startsWith('---')||lineText.startsWith('+++'))line.classList.add('git-diff-meta');
-    line.textContent=lineText||' ';
-    view.appendChild(line);
+  const copy=document.createElement('button');
+  copy.className='mini-btn';
+  copy.textContent=t('copy_file_path')||'Copy path';
+  copy.onclick=async()=>{try{await navigator.clipboard.writeText(diff.path);showToast(t('path_copied')||'Copied');}catch(e){showToast(t('path_copy_failed')||'Copy failed',2600,'error');}};
+  actions.appendChild(copy);
+  const modes=document.createElement('div');
+  modes.className='git-diff-mode-controls';
+  for(const mode of ['unified','split']){
+    const btn=document.createElement('button');
+    btn.className='mini-btn git-diff-mode-btn'+(_currentGitDiffMode()===mode?' active':'');
+    btn.type='button';
+    btn.textContent=mode==='split'?(t('git_diff_split')||'Split'):(t('git_diff_unified')||'Unified');
+    btn.onclick=()=>setGitDiffMode(mode);
+    modes.appendChild(btn);
   }
+  toolbar.append(actions,modes);
+  view.appendChild(toolbar);
+  const parsed=parseUnifiedDiff(text,diff.path);
+  renderParsedGitDiff(view,parsed,_currentGitDiffMode());
+}
+
+function _parseHunkHeader(line){
+  const m=line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?/);
+  if(!m)return null;
+  return {oldStart:parseInt(m[1],10),oldCount:parseInt(m[2]||'1',10),newStart:parseInt(m[3],10),newCount:parseInt(m[4]||'1',10)};
+}
+
+function parseUnifiedDiff(text,path){
+  const file={oldPath:path,newPath:path,hunks:[],meta:[]};
+  let hunk=null,oldLine=0,newLine=0;
+  for(const raw of String(text||'').split('\n')){
+    if(raw.startsWith('--- ')){file.oldPath=raw.slice(4).replace(/^a\//,'');file.meta.push(raw);continue;}
+    if(raw.startsWith('+++ ')){file.newPath=raw.slice(4).replace(/^b\//,'');file.meta.push(raw);continue;}
+    if(raw.startsWith('diff --git')||raw.startsWith('index ')||raw.startsWith('new file mode')||raw.startsWith('deleted file mode')||raw.startsWith('rename ')){file.meta.push(raw);continue;}
+    if(raw.startsWith('@@')){
+      const parsed=_parseHunkHeader(raw);
+      oldLine=parsed?parsed.oldStart:0;
+      newLine=parsed?parsed.newStart:0;
+      hunk={header:raw,oldStart:oldLine,newStart:newLine,lines:[]};
+      file.hunks.push(hunk);
+      continue;
+    }
+    if(!hunk)continue;
+    const sign=raw[0]||' ';
+    const content=raw.length?raw.slice(1):'';
+    if(sign==='+'){
+      hunk.lines.push({type:'add',oldLine:null,newLine:newLine++,text:content});
+    }else if(sign==='-'){
+      hunk.lines.push({type:'del',oldLine:oldLine++,newLine:null,text:content});
+    }else if(sign==='\\'){
+      hunk.lines.push({type:'meta',oldLine:null,newLine:null,text:raw});
+    }else{
+      hunk.lines.push({type:'ctx',oldLine:oldLine++,newLine:newLine++,text:raw.startsWith(' ')?content:raw});
+    }
+  }
+  return file;
+}
+
+function _diffCell(text,cls=''){
+  const el=document.createElement('span');
+  el.className=cls;
+  el.textContent=text==null?'':String(text);
+  return el;
+}
+
+function renderParsedGitDiff(view,file,mode){
+  const wrap=document.createElement('div');
+  wrap.className='git-diff-file';
+  const header=document.createElement('div');
+  header.className='git-diff-file-header';
+  header.append(_diffCell('old','git-diff-ln'),_diffCell('new','git-diff-ln'),_diffCell(`${file.oldPath} → ${file.newPath}`,'git-diff-code'));
+  wrap.appendChild(header);
+  for(const hunk of file.hunks){
+    const h=document.createElement('div');
+    h.className='git-diff-hunk';
+    h.append(_diffCell('', 'git-diff-ln'),_diffCell('', 'git-diff-ln'),_diffCell(hunk.header,'git-diff-code'));
+    wrap.appendChild(h);
+    const rows=mode==='split'?_splitDiffRows(hunk.lines):hunk.lines;
+    for(const rowData of rows){
+      wrap.appendChild(mode==='split'?_renderSplitDiffRow(rowData):_renderUnifiedDiffRow(rowData));
+    }
+  }
+  view.appendChild(wrap);
+}
+
+function _renderUnifiedDiffRow(line){
+  const row=document.createElement('div');
+  row.className=`git-diff-row ${line.type}`;
+  const prefix=line.type==='add'?'+':line.type==='del'?'-':' ';
+  row.append(_diffCell(line.oldLine||'', 'git-diff-ln'),_diffCell(line.newLine||'', 'git-diff-ln'),_diffCell(prefix+line.text,'git-diff-code'));
+  return row;
+}
+
+function _splitDiffRows(lines){
+  const rows=[];
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    if(line.type==='del'&&lines[i+1]&&lines[i+1].type==='add'){
+      rows.push({type:'change',old:line,new:lines[i+1]});
+      i++;
+    }else if(line.type==='del')rows.push({type:'del',old:line,new:null});
+    else if(line.type==='add')rows.push({type:'add',old:null,new:line});
+    else rows.push({type:line.type,old:line,new:line});
+  }
+  return rows;
+}
+
+function _renderSplitDiffRow(pair){
+  const row=document.createElement('div');
+  row.className=`git-diff-split-row ${pair.type}`;
+  const oldLine=pair.old, newLine=pair.new;
+  row.append(
+    _diffCell(oldLine&&oldLine.oldLine||'', 'git-diff-ln'),
+    _diffCell(oldLine?((oldLine.type==='del'?'-':' ')+oldLine.text):'', 'git-diff-code old-code'),
+    _diffCell(newLine&&newLine.newLine||'', 'git-diff-ln'),
+    _diffCell(newLine?((newLine.type==='add'?'+':' ')+newLine.text):'', 'git-diff-code new-code')
+  );
+  return row;
 }
 
 async function stageGitPath(path){
@@ -1036,3 +1609,26 @@ async function runGitRemoteAction(action){
     renderGitChanges();
   }
 }
+
+function _installWorkspaceInteractionGuards(){
+  if(window.__hermesWorkspaceInteractionGuardsInstalled)return;
+  window.__hermesWorkspaceInteractionGuardsInstalled=true;
+  document.addEventListener('click',event=>{
+    const git=_ensureGitState();
+    if(!git.branchMenuOpen)return;
+    const control=$('gitBranchControl');
+    if(control&&control.contains(event.target))return;
+    closeGitBranchMenu();
+  });
+  document.addEventListener('keydown',event=>{
+    if(event.key!=='Escape')return;
+    const git=_ensureGitState();
+    if(!git.branchMenuOpen)return;
+    event.preventDefault();
+    closeGitBranchMenu();
+    const btn=$('btnGitBranchMenu');
+    if(btn)btn.focus();
+  });
+}
+
+_installWorkspaceInteractionGuards();

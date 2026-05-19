@@ -4015,6 +4015,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/git/status":
         return _handle_git_status(handler, parsed)
 
+    if parsed.path == "/api/git/branches":
+        return _handle_git_branches(handler, parsed)
+
     if parsed.path == "/api/git/diff":
         return _handle_git_diff(handler, parsed)
 
@@ -5226,6 +5229,12 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/git/push":
         return _handle_git_remote_action(handler, body, "push")
+
+    if parsed.path == "/api/git/checkout":
+        return _handle_git_checkout(handler, body)
+
+    if parsed.path == "/api/git/stash-checkout":
+        return _handle_git_stash_checkout(handler, body)
 
     # ── File ops (POST) ──
     if parsed.path == "/api/file/delete":
@@ -8427,6 +8436,19 @@ def _handle_git_status(handler, parsed):
         return _git_bad(handler, e)
 
 
+def _handle_git_branches(handler, parsed):
+    qs = parse_qs(parsed.query)
+    workspace = _git_session_workspace(handler, qs.get("session_id", [""])[0])
+    if workspace is None:
+        return True
+    try:
+        from api.workspace_git import GitWorkspaceError, git_branches
+
+        return j(handler, {"branches": git_branches(workspace)})
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+
+
 def _handle_git_diff(handler, parsed):
     qs = parse_qs(parsed.query)
     workspace = _git_session_workspace(handler, qs.get("session_id", [""])[0])
@@ -8724,6 +8746,71 @@ def _handle_git_remote_action(handler, body, action: str):
             "push": git_push,
         }
         return j(handler, actions[action](workspace))
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+
+
+def _handle_git_checkout(handler, body):
+    try:
+        require(body, "session_id", "ref", "mode")
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_checkout
+
+        result = git_checkout(
+            workspace,
+            str(body.get("ref", "")),
+            str(body.get("mode", "local")),
+            new_branch=body.get("new_branch"),
+            track=bool(body.get("track")),
+            dirty_mode=str(body.get("dirty_mode", "block")),
+        )
+        return j(
+            handler,
+            {
+                "ok": True,
+                "git": result.get("status"),
+                "branches": result.get("branches"),
+                "current_branch": result.get("current_branch"),
+                "message": result.get("message", ""),
+            },
+        )
+    except ValueError as e:
+        return bad(handler, str(e))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+
+
+def _handle_git_stash_checkout(handler, body):
+    try:
+        require(body, "session_id", "ref", "mode")
+        workspace = _git_session_workspace(handler, body["session_id"])
+        if workspace is None:
+            return True
+        from api.workspace_git import GitWorkspaceError, git_stash_and_checkout
+
+        result = git_stash_and_checkout(
+            workspace,
+            str(body.get("ref", "")),
+            str(body.get("mode", "local")),
+            new_branch=body.get("new_branch"),
+            track=bool(body.get("track")),
+        )
+        return j(
+            handler,
+            {
+                "ok": True,
+                "git": result.get("status"),
+                "branches": result.get("branches"),
+                "current_branch": result.get("current_branch"),
+                "message": result.get("message", ""),
+                "stash_name": result.get("stash_name", ""),
+                "stashed": bool(result.get("stashed")),
+            },
+        )
     except ValueError as e:
         return bad(handler, str(e))
     except GitWorkspaceError as e:
