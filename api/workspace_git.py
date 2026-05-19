@@ -453,16 +453,18 @@ def _branch_ahead_behind(ctx: GitContext, branch: str, upstream: str) -> tuple[i
 
 def _for_each_ref(ctx: GitContext, ref_prefix: str) -> list[dict]:
     fmt = (
-        "%(refname:short)%00%(upstream:short)%00%(objectname:short)%00"
+        "%(refname)%00%(refname:short)%00%(upstream:short)%00%(objectname:short)%00"
         "%(committerdate:unix)%00%(committerdate:relative)%00%(authorname)%00%(subject)"
     )
     result = _run_git(ctx, ["for-each-ref", f"--format={fmt}", ref_prefix], check=True)
     refs = []
     for line in result.stdout.splitlines():
-        name, upstream, sha, updated, updated_relative, author, subject = (
-            line.split("\0") + ["", "", "", "", "", "", ""]
-        )[:7]
-        if not name or name.endswith("/HEAD"):
+        full_name, name, upstream, sha, updated, updated_relative, author, subject = (
+            line.split("\0") + ["", "", "", "", "", "", "", ""]
+        )[:8]
+        if not name or full_name.endswith("/HEAD") or name.endswith("/HEAD"):
+            continue
+        if ref_prefix == "refs/remotes" and "/" not in name:
             continue
         item = {
             "name": name,

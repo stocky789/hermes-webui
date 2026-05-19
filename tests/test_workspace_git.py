@@ -482,6 +482,7 @@ def test_git_branches_lists_local_remote_and_upstream(tmp_path):
     main = next(item for item in branches["local"] if item["name"] == "main")
     assert "updated_relative" in main and "author" in main and "subject" in main
     assert any(item["name"] == "origin/main" for item in branches["remote"])
+    assert not any(item["name"] == "origin" for item in branches["remote"])
 
 
 def test_git_checkout_local_new_remote_dirty_and_invalid_refs(tmp_path):
