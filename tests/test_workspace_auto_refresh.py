@@ -89,6 +89,7 @@ def test_file_tree_refresh_polls_visible_dirs_and_rerenders_only_on_signature_ch
     assert "signatures[dir]&&signatures[dir]===nextSignature" in compact
     assert "_storeWorkspaceDirListing(dir,data)" in compact
     assert "renderFileTree()" in refresh_body
+    assert "renderWorkspacePanelTabState()" in refresh_body
 
 
 def test_file_tree_refresh_guard_preserves_unsaved_preview_and_avoids_git_mutation():

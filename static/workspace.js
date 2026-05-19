@@ -2050,6 +2050,7 @@ async function _refreshWorkspaceTreeIfChanged(){
       const scrollTop=scrollEl?scrollEl.scrollTop:0;
       renderBreadcrumb();
       renderFileTree();
+      renderWorkspacePanelTabState();
       if(scrollEl)scrollEl.scrollTop=scrollTop;
     }
   }finally{

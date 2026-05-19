@@ -7607,16 +7607,17 @@ function renderFileTree(){
   // Show empty-state when no workspace is set or the directory is empty (#703)
   const emptyEl=$('wsEmptyState');
   const hasWorkspace=!!(S.session&&S.session.workspace);
+  const showingChanges=typeof _ensureGitState==='function'&&_ensureGitState().selectedTab==='changes';
   if(!hasWorkspace){
-    if(emptyEl){emptyEl.textContent=t('workspace_empty_no_path');emptyEl.style.display='flex';}
+    if(emptyEl){emptyEl.textContent=t('workspace_empty_no_path');emptyEl.style.display=showingChanges?'none':'flex';}
     box.style.display='none';
     return;
   }
   if(emptyEl) emptyEl.style.display='none';
-  box.style.display='';
+  box.style.display=showingChanges?'none':'';
   const visibleEntries=_visibleWorkspaceEntries(S.entries);
   if(!visibleEntries.length){
-    if(emptyEl){emptyEl.textContent=t('workspace_empty_dir');emptyEl.style.display='flex';}
+    if(emptyEl){emptyEl.textContent=t('workspace_empty_dir');emptyEl.style.display=showingChanges?'none':'flex';}
     return;
   }
   _renderTreeItems(box, visibleEntries, 0);
