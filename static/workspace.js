@@ -99,6 +99,8 @@ async function _refreshGitBadge(){
   return refreshGitStatus();
 }
 
+const GIT_AUTO_REFRESH_MS = 5000;
+
 function _ensureGitState(){
   const scopeKey=`${(S.session&&S.session.session_id)||''}\n${(S.session&&S.session.workspace)||''}`;
   if(!S.git)S.git={status:null,selectedTab:'files',selectedDiff:null,loading:false,syncing:null,generatingCommitMessage:false,mutating:false,selectedPaths:new Set(),selectionTouched:false,selectionKey:scopeKey};
@@ -119,6 +121,30 @@ function _ensureGitState(){
     S.git.selectionKey=scopeKey;
   }
   return S.git;
+}
+
+function _gitStatusSignature(status){
+  if(!status||!status.is_git)return 'not-git';
+  const files=(status.files||[]).map(f=>[
+    f.path,f.old_path||'',f.status||'',!!f.staged,!!f.unstaged,!!f.untracked,
+    !!f.conflict,f.additions||0,f.deletions||0,!!f.binary
+  ]);
+  return JSON.stringify({
+    branch:status.branch||'',
+    upstream:status.upstream||'',
+    ahead:status.ahead||0,
+    behind:status.behind||0,
+    totals:status.totals||{},
+    truncated:!!status.truncated,
+    files
+  });
+}
+
+function _workspacePanelOpenForAutoRefresh(){
+  if(document.visibilityState&&document.visibilityState!=='visible')return false;
+  if(document.documentElement.dataset.workspacePanel==='open')return true;
+  const panel=document.querySelector('.rightpanel');
+  return !!(panel&&(panel.classList.contains('mobile-open')||!document.querySelector('.layout')?.classList.contains('workspace-panel-collapsed')));
 }
 
 function _branchLocalName(remoteName){
@@ -457,7 +483,7 @@ function renderGitBadge(status){
   }
 }
 
-async function refreshGitStatus(){
+async function refreshGitStatus(opts={}){
   const git=_ensureGitState();
   if(!S.session){
     git.status=null;
@@ -466,16 +492,21 @@ async function refreshGitStatus(){
     renderWorkspacePanelTabState();
     return null;
   }
+  if(git.loading&&opts.auto)return git.status;
   git.loading=true;
   try{
+    const priorSignature=_gitStatusSignature(git.status);
     const data=await api(`/api/git/status?session_id=${encodeURIComponent(S.session.session_id)}`);
     git.status=data.git||null;
     if(!git.status||!git.status.is_git)git.selectedTab='files';
     _reconcileGitSelection();
-    renderGitBadge(git.status);
-    renderGitChanges();
-    refreshGitBranches();
-    if(typeof renderFileTree==='function')renderFileTree();
+    const changed=priorSignature!==_gitStatusSignature(git.status);
+    if(changed||!opts.auto){
+      renderGitBadge(git.status);
+      renderGitChanges();
+      if(opts.refreshBranches!==false)refreshGitBranches();
+      if(typeof renderFileTree==='function')renderFileTree();
+    }
     return git.status;
   }catch(e){
     renderGitBadge(git.status);
@@ -627,6 +658,18 @@ function _gitGroupHeader(kind, label, files){
   return header;
 }
 
+function _gitSyncLabel(action,status){
+  if(action==='push'){
+    const ahead=Number(status&&status.ahead||0);
+    return ahead>0?`${t('git_push')} \u2191${ahead}`:t('git_push');
+  }
+  if(action==='pull'){
+    const behind=Number(status&&status.behind||0);
+    return behind>0?`${t('git_pull')} \u2193${behind}`:t('git_pull');
+  }
+  return t('git_fetch');
+}
+
 function _gitChangeRow(file, kind){
   const row=document.createElement('div');
   const selectable=kind==='tracked'||kind==='untracked';
@@ -721,11 +764,16 @@ function renderGitChanges(){
   }
   const summaryActions=document.createElement('span');
   summaryActions.className='git-summary-actions';
-  for(const [action,label] of [['fetch',t('git_fetch')],['pull',t('git_pull')],['push',t('git_push')]]){
+  for(const action of ['fetch','pull','push']){
     const btn=document.createElement('button');
     btn.className='mini-btn git-sync-btn';
     btn.type='button';
-    btn.textContent=label;
+    btn.textContent=_gitSyncLabel(action,status);
+    btn.title=action==='push'
+      ? 'Push local commits'
+      : action==='pull'
+        ? 'Pull remote commits'
+        : t('git_fetch');
     btn.disabled=!!_ensureGitState().mutating||_ensureGitState().syncing===action;
     btn.onclick=()=>runGitRemoteAction(action);
     summaryActions.appendChild(btn);
@@ -1639,3 +1687,23 @@ function _installWorkspaceInteractionGuards(){
 }
 
 _installWorkspaceInteractionGuards();
+
+async function _autoRefreshWorkspaceGitStatus(){
+  if(!S.session)return;
+  if(!_workspacePanelOpenForAutoRefresh())return;
+  const git=_ensureGitState();
+  if(git.mutating||git.syncing||git.generatingCommitMessage||git.branchMenuOpen)return;
+  if(typeof _previewDirty!=='undefined'&&_previewDirty)return;
+  await refreshGitStatus({auto:true,refreshBranches:false});
+}
+
+function _installWorkspaceGitAutoRefresh(){
+  if(window.__hermesWorkspaceGitAutoRefreshInstalled)return;
+  window.__hermesWorkspaceGitAutoRefreshInstalled=true;
+  window.setInterval(()=>{_autoRefreshWorkspaceGitStatus();},GIT_AUTO_REFRESH_MS);
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='visible')_autoRefreshWorkspaceGitStatus();
+  });
+}
+
+_installWorkspaceGitAutoRefresh();
