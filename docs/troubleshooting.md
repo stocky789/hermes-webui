@@ -85,6 +85,18 @@ If after running steps 1-4 the import still fails *and* `pip install -e .` succe
 
 ---
 
+## Workspace file tree or Git remote indicators look stale
+
+**Symptom.** A file created/deleted by another terminal or agent is not visible in the right-hand workspace tree, or Git behind/remote-branch indicators do not reflect new commits from the remote immediately.
+
+**Expected behavior.** While the workspace panel is visible, WebUI periodically checks the current directory and expanded directories using `/api/list` metadata signatures. It also periodically performs a background Git **fetch only** so remote refs and behind/ahead indicators can update. Auto-fetch never pulls, merges, rebases, stages, commits, or modifies the working tree; manual Fetch/Pull/Push controls remain in the Changes tab.
+
+**Why it may pause.** Freshness checks are intentionally skipped while the browser tab/panel is hidden, Git operations are already running, the branch menu is open, commit-message generation is running, or the file preview has unsaved edits.
+
+**What to try.** Save or discard preview edits, reopen the workspace panel, or use the manual Fetch button in the Changes tab. If auto-fetch fails repeatedly, check the subtle status text near the Git badge for the last error; authentication or remote-access failures should be fixed in the repository's normal Git credentials.
+
+---
+
 ## Other troubleshooting
 
 This document grows over time. If a recurring failure mode isn't covered here yet, add it via PR. The format for each entry: **Symptom → Why → Diagnostic commands → Fix → When to file a bug**.

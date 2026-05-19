@@ -13,6 +13,14 @@ the **composer footer** — always visible while composing. A circular context r
 shows token usage at a glance. All settings and session tools are in the
 **Hermes Control Center** (launcher at the sidebar bottom).
 
+The workspace panel keeps itself fresh while it is open: visible file-tree
+folders are checked with cheap directory signatures so files created, renamed,
+or deleted by external tools appear without manual navigation. Git remotes may
+also be fetched quietly in the background to update branch and behind/ahead
+indicators. This background sync is fetch-only — it never pulls, merges, stages,
+commits, rebases, or otherwise modifies the working tree — and manual
+Fetch/Pull/Push controls remain available in the Changes tab.
+
 <img width="2448" height="1748" alt="Hermes Web UI — three-panel layout" src="https://github.com/user-attachments/assets/6bf8af4c-209d-441e-8b92-6515d7a0c369" />
 
 <table>
