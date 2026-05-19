@@ -1657,6 +1657,43 @@ async function generateGitCommitMessage(){
   }
 }
 
+function _gitRemoteActionLabel(action){
+  return action==='fetch'?t('git_fetched'):action==='pull'?t('git_pulled'):t('git_pushed');
+}
+
+function _gitRemoteToastMessage(action,data){
+  const label=_gitRemoteActionLabel(action);
+  const raw=String(data&&data.message?data.message:'').trim();
+  if(!raw)return label;
+  const lines=raw.split(/\r?\n/).map(line=>line.trim()).filter(Boolean);
+  const refs=[];
+  let remote='';
+  const fallback=[];
+  lines.forEach(line=>{
+    if(line.startsWith('From ')){
+      remote=line.slice(5).trim().replace(/^https?:\/\//,'').replace(/\.git$/,'');
+      return;
+    }
+    const compact=line.replace(/\s+/g,' ');
+    const refLine=compact.replace(/^[*+=!-]\s+/,'').replace(/^\[[^\]]+\]\s+/,'');
+    const match=refLine.match(/^(?:(\S+\.\.\S+)\s+)?(\S+)\s+->\s+(\S+)(?:\s+\(.+\))?$/);
+    if(match){
+      const range=match[1];
+      const src=match[2];
+      const dst=match[3];
+      refs.push(`${src} -> ${dst}${range?` (${range})`:''}`);
+    }else{
+      fallback.push(compact);
+    }
+  });
+  if(refs.length){
+    const shown=refs.slice(0,3);
+    if(refs.length>shown.length)shown.push(`+${refs.length-shown.length} more refs`);
+    return [label, remote?`Remote ${remote}`:null, ...shown].filter(Boolean).join('\n');
+  }
+  return [label, ...fallback.slice(0,3)].filter(Boolean).join('\n');
+}
+
 async function runGitRemoteAction(action){
   if(!S.session||!['fetch','pull','push'].includes(action))return;
   const git=_ensureGitState();
@@ -1666,8 +1703,7 @@ async function runGitRemoteAction(action){
   try{
     const data=await api(`/api/git/${action}`,{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
     _setGitStatus(data.status);
-    const label=action==='fetch'?t('git_fetched'):action==='pull'?t('git_pulled'):t('git_pushed');
-    showToast(data.message?`${label}: ${data.message}`:label,3600);
+    showToast(_gitRemoteToastMessage(action,data),4200);
     await loadDir(S.currentDir);
   }catch(e){
     showToast(`${t('git_sync_failed')}: ${e.message}`,4000,'error');

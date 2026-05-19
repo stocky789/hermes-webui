@@ -719,6 +719,7 @@ def test_workspace_git_static_contracts():
         "commitGitChanges",
         "generateGitCommitMessage",
         "runGitRemoteAction",
+        "_gitRemoteToastMessage",
         "switchWorkspacePanelTab",
         "openMarkdownPopout",
         "returnFromPreview",
@@ -748,9 +749,17 @@ def test_workspace_git_static_contracts():
         workspace_js.index("async function discardGitPath") : workspace_js.index("async function commitGitChanges")
     ]
     assert "showConfirmDialog" in discard_body
+    remote_action_body = workspace_js[
+        workspace_js.index("function _gitRemoteToastMessage") : workspace_js.index("async function runGitRemoteAction")
+    ]
+    assert "Remote ${remote}" in remote_action_body
+    assert "more refs" in remote_action_body
+    assert "showToast(_gitRemoteToastMessage(action,data),4200)" in workspace_js
     assert "confirm(" not in discard_body.replace("showConfirmDialog(", "")
     assert "file-git-status" in ui_js
     assert "file-preview-btn" in ui_js
+    assert "function toastMessageHtml" in ui_js
+    assert "toast-title" in ui_js and "toast-detail" in ui_js
     assert "_isWorkspaceMarkdownPath" in ui_js
     assert "e.stopPropagation()" in ui_js
     assert "_gitStageableFiles" in workspace_js
@@ -777,6 +786,8 @@ def test_workspace_git_static_contracts():
     assert ".git-badge{grid-column:1 / -1;grid-row:2;justify-self:start;font-size:11px" in style
     assert ".git-branch-button{height:30px" in style
     assert ".git-summary{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:\"SF Mono\",ui-monospace,monospace;font-size:13px" in style
+    assert ".toast{pointer-events:auto;position:fixed;top:24px;right:24px;left:auto;bottom:auto;transform:translateY(-6px);display:flex;align-items:flex-start" in style
+    assert ".toast-title" in style and ".toast-detail" in style
     assert "selectedPaths:new Set()" in workspace_js
     assert "selectionKey:scopeKey" in workspace_js
     assert "_gitGroupHeader" in workspace_js

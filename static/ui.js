@@ -3562,6 +3562,12 @@ function copyToastText(btn){
   const done=()=>{const old=btn.textContent;btn.textContent='Copied';setTimeout(()=>{btn.textContent=old;},1200);};
   _copyText(text).then(done).catch(()=>{});
 }
+function toastMessageHtml(s){
+  const lines=String(s==null?'':s).split(/\r?\n/).map(line=>line.trim()).filter(Boolean);
+  if(lines.length<=1)return `<span class="toast-message">${esc(s)}</span>`;
+  const title=lines.shift();
+  return `<span class="toast-message"><span class="toast-title">${esc(title)}</span><span class="toast-detail">${esc(lines.join('\n'))}</span></span>`;
+}
 function showToast(msg,ms,type){
   const el=$('toast');if(!el)return;
   const s=String(msg==null?'':msg);let t=type;
@@ -3569,8 +3575,9 @@ function showToast(msg,ms,type){
   const duration=(ms==null)?(t==='error'?TOAST_ERROR_DEFAULT_MS:TOAST_DEFAULT_MS):ms;
   el.className='toast show '+t;
   el.dataset.toastMessage=s;
-  if(t==='error') el.innerHTML=`<span class="toast-message">${esc(s)}</span><button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button>`;
-  else el.textContent=s;
+  const body=toastMessageHtml(s);
+  if(t==='error') el.innerHTML=`${body}<button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button>`;
+  else el.innerHTML=body;
   el.onmouseenter=()=>clearToastDismissTimer(el);
   el.onmouseleave=()=>setToastDismissTimer(el,duration);
   el.onfocusin=()=>clearToastDismissTimer(el);
