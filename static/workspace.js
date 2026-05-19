@@ -1210,7 +1210,20 @@ async function openFile(path,opts={}){
       const data=await api(`/api/file?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`);
       showPreview('md');
       _previewRawContent = data.content;
-      renderWorkspaceMarkdown(data.content);
+      const previewMd=$('previewMd');
+      if(previewMd){
+        previewMd.innerHTML=renderMd(data.content);
+        requestAnimationFrame(()=>{
+          if(typeof postProcessRenderedMessages==='function')postProcessRenderedMessages(previewMd);
+          else{
+            if(typeof highlightCode==='function')highlightCode(previewMd);
+            if(typeof addCopyButtons==='function')addCopyButtons(previewMd);
+            if(typeof renderMermaidBlocks==='function')renderMermaidBlocks(previewMd);
+            if(typeof renderKatexBlocks==='function')renderKatexBlocks(previewMd);
+            if(typeof initTreeViews==='function')initTreeViews(previewMd);
+          }
+        });
+      }
     }catch(e){setStatus(t('file_open_failed'));}
   } else if(HTML_EXTS.has(ext)){
     // HTML: render in sandboxed iframe via raw endpoint.
