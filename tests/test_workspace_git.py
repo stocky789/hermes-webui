@@ -897,9 +897,13 @@ def test_workspace_git_static_contracts():
     assert "_isSelectableRemoteBranch" in workspace_js
     assert "_branchMeta" in workspace_js and "_allBranchRows" in workspace_js
     assert "_installWorkspaceInteractionGuards" in workspace_js
-    assert "'/api/git/checkout'" in workspace_js
     assert "'/api/git/stash-checkout'" in workspace_js
-    assert "git_stash_and_switch" in workspace_js
+    checkout_body = workspace_js[
+        workspace_js.index("async function checkoutGitBranch") : workspace_js.index("function renderGitBadge")
+    ]
+    assert "'/api/git/checkout'" not in checkout_body
+    assert "git_checkout_dirty_message" not in checkout_body
+    assert "data.restored_stash" in checkout_body
     assert "`/api/git/branches?session_id=${encodeURIComponent(S.session.session_id)}`" in workspace_js
     assert "dirty_mode:'block'" in workspace_js
     assert "handleEditorKeydown" in workspace_js
