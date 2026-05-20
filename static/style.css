@@ -1717,13 +1717,13 @@
   .git-change-group-title{display:flex;align-items:center;gap:7px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:2px 2px 4px;}
   .git-select-checkbox{width:15px;height:15px;margin:0;accent-color:var(--accent-text);cursor:pointer;}
   .git-select-checkbox:disabled{cursor:not-allowed;opacity:.55;}
-  .git-change-row{display:grid;grid-template-columns:24px minmax(0,1fr) auto;align-items:center;gap:8px;min-height:34px;padding:5px 6px;border-radius:6px;color:var(--text);cursor:pointer;}
-  .git-change-row.selectable{grid-template-columns:18px 24px minmax(0,1fr) auto;}
-  .git-change-row.has-actions{grid-template-columns:24px minmax(0,1fr) auto auto;}
-  .git-change-row.selectable.has-actions{grid-template-columns:18px 24px minmax(0,1fr) auto auto;}
+  .git-change-row{display:grid;grid-template-columns:max-content minmax(0,1fr) auto;align-items:center;gap:8px;min-height:34px;padding:5px 6px;border-radius:6px;color:var(--text);cursor:pointer;}
+  .git-change-row.selectable{grid-template-columns:18px max-content minmax(0,1fr) auto;}
+  .git-change-row.has-actions{grid-template-columns:max-content minmax(0,1fr) auto auto;}
+  .git-change-row.selectable.has-actions{grid-template-columns:18px max-content minmax(0,1fr) auto auto;}
   .git-change-row:hover,.git-change-row:focus-visible{background:var(--hover-bg);outline:none;}
   .git-change-status,.file-git-status{font-family:"SF Mono",ui-monospace,monospace;font-size:10px;font-weight:700;color:var(--accent-text);}
-  .git-change-status{justify-self:start;min-width:0;max-width:58px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);}
+  .git-change-status{justify-self:start;min-width:24px;max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);}
   .git-change-status.untracked{color:var(--accent-text);}
   .git-change-status.conflict{color:var(--error);}
   .git-change-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;}
