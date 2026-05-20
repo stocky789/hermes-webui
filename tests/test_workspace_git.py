@@ -1,10 +1,12 @@
 import json
 import pathlib
 import subprocess
+import types
 import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from io import BytesIO
 
 import pytest
 
@@ -71,6 +73,26 @@ def _make_session(created_list, ws=None):
     sid = data["session"]["session_id"]
     created_list.append(sid)
     return sid, pathlib.Path(data["session"]["workspace"])
+
+
+class _CaptureHandler:
+    def __init__(self):
+        self.status = None
+        self.headers = {}
+        self.response_headers = []
+        self.wfile = BytesIO()
+
+    def send_response(self, status):
+        self.status = status
+
+    def send_header(self, key, value):
+        self.response_headers.append((key, value))
+
+    def end_headers(self):
+        pass
+
+    def payload(self):
+        return json.loads(self.wfile.getvalue().decode("utf-8"))
 
 
 def test_git_status_non_git_workspace(tmp_path):
@@ -1053,12 +1075,22 @@ def test_git_env_scrub_removes_redirecting_vars_and_preserves_temp_index(monkeyp
     monkeypatch.setenv("GIT_DIR", "/tmp/evil-git-dir")
     monkeypatch.setenv("GIT_WORK_TREE", "/tmp/evil-work-tree")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/tmp/evil-config")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/tmp/evil-system-config")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "ssh -i /tmp/evil-key")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.sshCommand=ssh -i /tmp/evil-key'")
 
     env = _clean_git_env({"GIT_INDEX_FILE": "/tmp/hermes-index"})
 
     assert "GIT_DIR" not in env
     assert "GIT_WORK_TREE" not in env
     assert "GIT_CONFIG_GLOBAL" not in env
+    assert "GIT_CONFIG_SYSTEM" not in env
+    assert "GIT_CONFIG_COUNT" not in env
+    assert "GIT_CONFIG_KEY_0" not in env
+    assert "GIT_CONFIG_VALUE_0" not in env
+    assert "GIT_CONFIG_PARAMETERS" not in env
     assert env["GIT_INDEX_FILE"] == "/tmp/hermes-index"
 
 
@@ -1102,8 +1134,6 @@ def test_destructive_workspace_git_flag_defaults_off_and_accepts_truthy(monkeypa
 
 
 def test_git_active_stream_lock_detection(monkeypatch):
-    import types
-
     from api import routes
     from api.config import STREAMS, STREAMS_LOCK
 
@@ -1117,3 +1147,36 @@ def test_git_active_stream_lock_detection(monkeypatch):
             STREAMS.pop(session.active_stream_id, None)
 
     assert routes._git_locked_by_active_stream(session) is False
+
+
+def test_git_commit_route_rejects_active_stream(monkeypatch, tmp_path):
+    from api import routes
+    from api.config import STREAMS, STREAMS_LOCK
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    _git(repo, "add", "tracked.txt")
+    session = types.SimpleNamespace(
+        session_id="sid-active-git",
+        workspace=str(repo),
+        active_stream_id="stream-active-git",
+    )
+
+    monkeypatch.setattr(routes, "get_session", lambda sid: session)
+    handler = _CaptureHandler()
+    with STREAMS_LOCK:
+        STREAMS[session.active_stream_id] = object()
+    try:
+        assert routes._handle_git_commit(
+            handler,
+            {"session_id": session.session_id, "message": "Should be blocked"},
+        ) is True
+    finally:
+        with STREAMS_LOCK:
+            STREAMS.pop(session.active_stream_id, None)
+
+    assert handler.status == 409
+    payload = handler.payload()
+    assert payload["code"] == "active_stream"
+    assert "active" in payload["error"].lower()

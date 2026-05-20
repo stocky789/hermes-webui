@@ -8,7 +8,8 @@ process is started with `HERMES_WEBUI_WORKSPACE_GIT_DESTRUCTIVE=1`.
 > **Trust model - read this first.** Once mutating Git actions are enabled, a browser action can run
 > Git commands inside a mounted workspace. Some Git commands can also run repository hook code from
 > `.git/hooks/` or a configured `core.hooksPath`. That hook code runs as the WebUI process user, with
-> the WebUI process permissions and environment.
+> the WebUI process permissions and environment. Treat hooks that download or execute code as code
+> execution by the WebUI process user.
 
 ## What works by default
 
@@ -43,10 +44,11 @@ These actions are blocked unless `HERMES_WEBUI_WORKSPACE_GIT_DESTRUCTIVE=1` is s
 Leave the flag unset for deployments where WebUI should only inspect mounted workspaces. Set it only
 when browser users are trusted to modify those repositories from WebUI.
 
-When the flag is enabled, browser branch switching is designed to be uninterrupted. If the branch
-being left has local changes, WebUI parks those changes in a WebUI-owned Git stash, switches branches,
-and then restores any WebUI-owned stash for the branch being entered. If Git cannot restore the stash
-cleanly, WebUI leaves the stash in place and reports the restore failure instead of dropping it.
+When the flag is enabled, branch switching parks and restores local changes automatically. If the
+branch being left has local changes, WebUI parks those changes in a WebUI-owned Git stash, switches
+branches, and then restores any WebUI-owned stash for the branch being entered. If Git cannot restore
+the stash cleanly, WebUI leaves the stash in place and reports the restore failure instead of dropping
+it.
 
 ## Workspace and path scope
 
@@ -57,9 +59,10 @@ against that workspace, and then builds Git pathspecs from the checked paths.
 Git commands run through `subprocess.run` with `shell=False`. Local status and diff commands use a 5
 second timeout. Remote operations such as fetch, pull, and push use a 60 second timeout.
 
-Before any Git subprocess starts, WebUI removes inherited `GIT_DIR`, `GIT_WORK_TREE`, and
-`GIT_CONFIG_GLOBAL` values from the environment. Those variables can redirect Git to a different
-repository or config file, so WebUI does not trust them from the parent process.
+Before any Git subprocess starts, WebUI removes inherited `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, and injected
+`GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` values from the environment. Those variables can redirect
+Git to a different repository or inject config, so WebUI does not trust them from the parent process.
 
 `GIT_INDEX_FILE` is the intentional exception. Selected-file commits use a temporary index so WebUI
 can commit only the requested files, then remove the temporary index afterward.
@@ -78,11 +81,11 @@ WebUI does not bypass Git hooks. Hook code may come from `.git/hooks/` or from a
 `core.hooksPath`.
 
 Commit actions run normal commit hooks such as `pre-commit`, `commit-msg`, and `post-commit`. Push can
-run `pre-push`. Pull uses Git's normal behavior too; with `--ff-only` it does not create a merge
-commit, but it is still a Git operation running under the WebUI process.
+run `pre-push`. Pull uses `--ff-only`, so it does not create a merge commit, but it is still a Git
+operation running under the WebUI process.
 
-Pull uses `--ff-only`. Push keeps Git's normal non-fast-forward protection and reports
-non-fast-forward rejection separately from general Git failures.
+Push keeps Git's normal non-fast-forward protection and reports non-fast-forward rejection separately
+from general Git failures.
 
 If a hook fails, the API returns a structured Git error instead of hiding the failure. Other classified
 failures include authentication errors, missing upstream branches, conflicts, dirty worktrees, invalid

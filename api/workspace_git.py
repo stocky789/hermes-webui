@@ -27,7 +27,15 @@ STATUS_FILE_LIMIT = 500
 DIFF_SIZE_LIMIT = 512 * 1024
 COMMIT_MESSAGE_DIFF_LIMIT = 64 * 1024
 WORKSPACE_GIT_DESTRUCTIVE_ENV = "HERMES_WEBUI_WORKSPACE_GIT_DESTRUCTIVE"
-_GIT_ENV_SCRUB_KEYS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL")
+_GIT_ENV_SCRUB_KEYS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+)
+_GIT_ENV_SCRUB_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 _HERMES_BRANCH_SWITCH_STASH_PREFIX = "hermes-webui branch switch"
 
 
@@ -46,6 +54,9 @@ def _clean_git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         env.update(extra)
     for key in _GIT_ENV_SCRUB_KEYS:
         env.pop(key, None)
+    for key in list(env):
+        if key.startswith(_GIT_ENV_SCRUB_PREFIXES):
+            env.pop(key, None)
     return env
 
 
@@ -70,6 +81,9 @@ _OP_LOCKS: dict[str, threading.Lock] = {}
 
 @contextmanager
 def _git_mutation_lock(ctx: GitContext):
+    # Key by repo root so sessions in the same repository serialize mutations.
+    # Separate worktrees get separate locks; Git still protects shared metadata
+    # with its own locks.
     key = str(ctx.repo_root)
     with _LOCKS_GUARD:
         lock = _OP_LOCKS.setdefault(key, threading.Lock())
