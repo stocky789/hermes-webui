@@ -976,6 +976,9 @@ def test_workspace_git_static_contracts():
     ]:
         assert cls in style
     assert ".git-stat-add" in style and ".git-stat-del" in style
+    assert "grid-template-columns:max-content minmax(0,1fr) auto" in style
+    assert "grid-template-columns:18px max-content minmax(0,1fr) auto" in style
+    assert ".git-change-status{justify-self:start;min-width:24px;max-width:72px" in style
     assert "background:repeating-linear-gradient(to right" not in style
     assert "_editorLineIndentDepths" in workspace_js
     assert "Math.floor(_editorIndentColumns(line,tabSize)/tabSize)" in workspace_js
