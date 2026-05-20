@@ -26,6 +26,27 @@ GIT_REMOTE_TIMEOUT = 60
 STATUS_FILE_LIMIT = 500
 DIFF_SIZE_LIMIT = 512 * 1024
 COMMIT_MESSAGE_DIFF_LIMIT = 64 * 1024
+WORKSPACE_GIT_DESTRUCTIVE_ENV = "HERMES_WEBUI_WORKSPACE_GIT_DESTRUCTIVE"
+_GIT_ENV_SCRUB_KEYS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL")
+_HERMES_BRANCH_SWITCH_STASH_PREFIX = "hermes-webui branch switch"
+
+
+def workspace_git_destructive_enabled() -> bool:
+    return os.getenv(WORKSPACE_GIT_DESTRUCTIVE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _clean_git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    if extra:
+        env.update(extra)
+    for key in _GIT_ENV_SCRUB_KEYS:
+        env.pop(key, None)
+    return env
 
 
 class GitWorkspaceError(RuntimeError):
@@ -75,9 +96,13 @@ def _classify_git_error(message: str, args: list[str] | None = None) -> str:
         return "auth_failed"
     if "no upstream" in text or "no configured push destination" in text or "has no upstream branch" in text:
         return "no_upstream"
-    if "non-fast-forward" in text or "fetch first" in text or "rejected" in text and "push" in joined:
+    if (
+        "non-fast-forward" in text
+        or "fetch first" in text
+        or ("rejected" in text and "push" in joined)
+    ):
         return "non_fast_forward"
-    if "conflict" in text or "unmerged" in text or "merge" in text and "needs" in text:
+    if "conflict" in text or "unmerged" in text or ("merge" in text and "needs" in text):
         return "conflict"
     if "working tree" in text and ("clean" in text or "dirty" in text):
         return "dirty_worktree"
@@ -99,6 +124,7 @@ def _run_git(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     cwd = ctx_or_cwd.repo_root if isinstance(ctx_or_cwd, GitContext) else ctx_or_cwd
+    run_env = _clean_git_env(env)
     try:
         result = subprocess.run(
             ["git", *args],
@@ -107,7 +133,7 @@ def _run_git(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=env,
+            env=run_env,
         )
     except subprocess.TimeoutExpired as exc:
         raise GitWorkspaceError("Git command timed out", "timeout") from exc
@@ -218,8 +244,10 @@ def _parse_path_list(text: str, ctx: GitContext) -> set[str]:
     return paths
 
 
-def _collect_diff_paths(ctx: GitContext, cached: bool) -> set[str] | None:
-    args = ["diff", "--name-only", "-z", "--ignore-cr-at-eol"]
+def _collect_diff_paths(ctx: GitContext, cached: bool, *, ignore_cr_at_eol: bool = True) -> set[str] | None:
+    args = ["diff", "--name-only", "-z"]
+    if ignore_cr_at_eol:
+        args.append("--ignore-cr-at-eol")
     if cached:
         args.append("--cached")
     args.extend(["--", _workspace_pathspec(ctx)])
@@ -229,8 +257,15 @@ def _collect_diff_paths(ctx: GitContext, cached: bool) -> set[str] | None:
     return _parse_path_list(result.stdout, ctx)
 
 
-def _collect_numstat(ctx: GitContext, cached: bool) -> dict[str, tuple[int, int, bool]]:
-    args = ["diff", "--numstat", "--ignore-cr-at-eol"]
+def _collect_numstat(
+    ctx: GitContext,
+    cached: bool,
+    *,
+    ignore_cr_at_eol: bool = True,
+) -> dict[str, tuple[int, int, bool]]:
+    args = ["diff", "--numstat"]
+    if ignore_cr_at_eol:
+        args.append("--ignore-cr-at-eol")
     if cached:
         args.append("--cached")
     args.extend(["--", _workspace_pathspec(ctx)])
@@ -280,6 +315,8 @@ def git_status(workspace: str | Path) -> dict:
     )
     staged_stats = _collect_numstat(ctx, cached=True)
     unstaged_stats = _collect_numstat(ctx, cached=False)
+    staged_raw_stats = _collect_numstat(ctx, cached=True, ignore_cr_at_eol=False)
+    unstaged_raw_stats = _collect_numstat(ctx, cached=False, ignore_cr_at_eol=False)
     staged_diff_paths = _collect_diff_paths(ctx, cached=True)
     unstaged_diff_paths = _collect_diff_paths(ctx, cached=False)
 
@@ -379,14 +416,24 @@ def git_status(workspace: str | Path) -> dict:
                 old_workspace_path is not None and old_workspace_path in staged_diff_paths
             )
             if raw_staged and not staged:
-                filtered_noise["filemode_only"] += 1
+                if workspace_path in staged_raw_stats or (
+                    old_workspace_path is not None and old_workspace_path in staged_raw_stats
+                ):
+                    filtered_noise["crlf_only"] += 1
+                else:
+                    filtered_noise["filemode_only"] += 1
         if unstaged and unstaged_diff_paths is not None and not renamed:
             raw_unstaged = unstaged
             unstaged = workspace_path in unstaged_diff_paths or (
                 old_workspace_path is not None and old_workspace_path in unstaged_diff_paths
             )
             if raw_unstaged and not unstaged:
-                filtered_noise["filemode_only"] += 1
+                if workspace_path in unstaged_raw_stats or (
+                    old_workspace_path is not None and old_workspace_path in unstaged_raw_stats
+                ):
+                    filtered_noise["crlf_only"] += 1
+                else:
+                    filtered_noise["filemode_only"] += 1
         if ignored:
             files[workspace_path] = {
                 "path": workspace_path,
@@ -576,6 +623,60 @@ def _dirty_worktree(ctx: GitContext) -> bool:
     return bool(result.stdout.strip())
 
 
+def _current_checkout_label(ctx: GitContext) -> str:
+    branch = _run_git(ctx, ["branch", "--show-current"], check=False).stdout.strip()
+    if branch:
+        return branch
+    return _run_git(ctx, ["rev-parse", "--short", "HEAD"], check=True).stdout.strip() or "HEAD"
+
+
+def _stash_subject_parts(subject: str) -> tuple[str, str] | None:
+    subject = str(subject or "").strip()
+    if not subject.startswith("On ") or ": " not in subject:
+        return None
+    branch, message = subject[3:].split(": ", 1)
+    branch = branch.strip()
+    message = message.strip()
+    if not branch or not message.startswith(_HERMES_BRANCH_SWITCH_STASH_PREFIX):
+        return None
+    return branch, message
+
+
+def _hermes_branch_switch_stashes(ctx: GitContext) -> list[dict]:
+    result = _run_git(ctx, ["stash", "list", "--format=%gd%x00%gs"], check=False)
+    if result.returncode != 0:
+        return []
+    stashes = []
+    for line in result.stdout.splitlines():
+        try:
+            ref, subject = line.split("\0", 1)
+        except ValueError:
+            continue
+        parts = _stash_subject_parts(subject)
+        if not parts:
+            continue
+        branch, message = parts
+        stashes.append({"ref": ref, "branch": branch, "message": message})
+    return stashes
+
+
+def _restore_branch_switch_stash_locked(ctx: GitContext, branch: str) -> dict:
+    if _dirty_worktree(ctx):
+        return {}
+    for item in _hermes_branch_switch_stashes(ctx):
+        if item.get("branch") != branch:
+            continue
+        result = _run_git(ctx, ["stash", "pop", "--index", item["ref"]], check=False)
+        if result.returncode == 0:
+            return {"restored_stash": item}
+        return {
+            "restore_failed": True,
+            "restore_error": (result.stderr or result.stdout or "Git stash restore failed").strip(),
+            "restore_stash": item,
+        }
+    return {}
+
+
 def _validate_checkout_request_locked(
     ctx: GitContext,
     ref: str,
@@ -683,15 +784,24 @@ def git_stash_and_checkout(
     if ctx is None:
         raise GitWorkspaceError("Workspace is not a Git repository", "not_a_repo")
     mode = str(mode or "local").strip().lower()
-    stash_name = f"hermes-webui branch switch {ref}".strip()
+    target_label = str(new_branch or ref or "HEAD").strip() or "HEAD"
+    stash_name = f"{_HERMES_BRANCH_SWITCH_STASH_PREFIX} to {target_label}".strip()
+    restored: dict = {}
     with _git_mutation_lock(ctx):
         _validate_checkout_request_locked(ctx, ref, mode, new_branch)
         stashed = False
-        stash_result = _run_git(ctx, ["stash", "push", "-u", "-m", stash_name], check=True)
-        stash_text = _remote_message(stash_result)
-        if "No local changes to save" not in stash_text:
-            stashed = True
-        result = _perform_checkout_locked(ctx, workspace, ref, mode, new_branch, track)
+        if _dirty_worktree(ctx):
+            stash_result = _run_git(ctx, ["stash", "push", "-u", "-m", stash_name], check=True)
+            stash_text = _remote_message(stash_result)
+            stashed = "No local changes to save" not in stash_text
+        try:
+            result = _perform_checkout_locked(ctx, workspace, ref, mode, new_branch, track)
+        except Exception:
+            if stashed:
+                _run_git(ctx, ["stash", "pop", "--index", "stash@{0}"], check=False)
+            raise
+        current_branch = _current_checkout_label(ctx)
+        restored = _restore_branch_switch_stash_locked(ctx, current_branch)
     status = git_status(workspace)
     branches = git_branches(workspace)
     return {
@@ -699,6 +809,10 @@ def git_stash_and_checkout(
         "message": _remote_message(result),
         "stash_name": stash_name if stashed else "",
         "stashed": stashed,
+        "restored_stash": restored.get("restored_stash"),
+        "restore_failed": bool(restored.get("restore_failed")),
+        "restore_error": restored.get("restore_error", ""),
+        "restore_stash": restored.get("restore_stash"),
         "current_branch": branches.get("current"),
         "status": status,
         "branches": branches,
@@ -896,8 +1010,7 @@ def _selected_temp_index_env(ctx: GitContext, specs: list[str]) -> tuple[dict[st
     fd, index_path = tempfile.mkstemp(prefix="hermes-webui-git-index-")
     os.close(fd)
     Path(index_path).unlink(missing_ok=True)
-    env = os.environ.copy()
-    env["GIT_INDEX_FILE"] = index_path
+    env = {"GIT_INDEX_FILE": index_path}
     try:
         head = _run_git(ctx, ["rev-parse", "--verify", "HEAD"], check=False, env=env)
         if head.returncode == 0:
