@@ -499,8 +499,7 @@ async function checkoutGitBranch(ref,mode,opts={}){
   renderGitChanges();
   renderGitBranchControl();
   try{
-    const endpoint=opts.stash?'/api/git/stash-checkout':'/api/git/checkout';
-    const data=await api(endpoint,{method:'POST',body:JSON.stringify({
+    const data=await api('/api/git/stash-checkout',{method:'POST',body:JSON.stringify({
       session_id:S.session.session_id,
       ref,
       mode:mode==='remote'?'remote':mode==='new'?'new':'local',
@@ -510,24 +509,20 @@ async function checkoutGitBranch(ref,mode,opts={}){
     })});
     _setGitStatus(data.git);
     git.branches=data.branches||null;
-    const stashNote=data.stash_name?` · ${t('git_stashed')||'Stashed'}: ${data.stash_name}`:'';
-    showToast(data.current_branch?`${t('git_checked_out')||'Checked out'} ${data.current_branch}${stashNote}`:`${t('git_checked_out')||'Checked out'}${stashNote}`,3600);
+    const bits=[];
+    if(data.stashed)bits.push(t('git_stashed_local_changes')||'saved local changes');
+    if(data.restored_stash)bits.push(t('git_restored_local_changes')||'restored local changes');
+    const note=bits.length?` · ${bits.join(', ')}`:'';
+    showToast(data.current_branch?`${t('git_checked_out')||'Checked out'} ${data.current_branch}${note}`:`${t('git_checked_out')||'Checked out'}${note}`,4200);
+    if(data.restore_failed){
+      const stashRef=(data.restore_stash&&data.restore_stash.ref)||'';
+      const detail=data.restore_error?`: ${data.restore_error}`:'';
+      showToast(`${t('git_restore_failed')||'Could not restore local changes'}${stashRef?` (${stashRef})`:''}${detail}`,8000,'error');
+    }
     _closePreviewSurface();
     await loadDir('.');
     await refreshGitBranches();
   }catch(e){
-    let code='';
-    try{code=JSON.parse(e.body||'{}').code||'';}catch(_e){}
-    if(!opts.stash&&code==='dirty_worktree'){
-      const ok=await showConfirmDialog({
-        title:t('git_checkout_dirty_title')||'Checkout blocked',
-        message:t('git_checkout_dirty_message')||'The worktree has uncommitted changes. Stash local changes and switch branch?',
-        confirmLabel:t('git_stash_and_switch')||'Stash and switch',
-        danger:false,
-        focusCancel:true
-      });
-      if(ok)return checkoutGitBranch(ref,mode,{stash:true});
-    }
     const msg=e.message||t('git_checkout_failed')||'Checkout failed';
     showToast(`${t('git_checkout_failed')||'Checkout failed'}: ${msg}`,5000,'error');
   }finally{

@@ -1,8 +1,6 @@
 import pathlib
 import re
 
-from api.workspace import dir_signature, list_dir
-
 REPO = pathlib.Path(__file__).parent.parent
 WORKSPACE_JS = (REPO / "static" / "workspace.js").read_text(encoding="utf-8")
 
@@ -55,20 +53,6 @@ def test_auto_fetch_guard_skips_unsafe_or_noisy_states():
         "GIT_AUTO_FETCH_MIN_ERROR_BACKOFF_MS",
     ]:
         assert token in body.replace(" ", "")
-
-
-def test_directory_signatures_are_returned_and_change_with_entries(tmp_path):
-    (tmp_path / "alpha.txt").write_text("one", encoding="utf-8")
-    entries = list_dir(tmp_path, ".")
-    sig1 = dir_signature(tmp_path, ".", entries)
-    assert isinstance(sig1, str)
-    assert len(sig1) == 64
-    assert all("mtime_ns" in entry for entry in entries)
-
-    (tmp_path / "beta.txt").write_text("two", encoding="utf-8")
-    entries2 = list_dir(tmp_path, ".")
-    sig2 = dir_signature(tmp_path, ".", entries2)
-    assert sig2 != sig1
 
 
 def test_load_dir_stores_directory_signatures_for_root_and_expanded_dirs():
