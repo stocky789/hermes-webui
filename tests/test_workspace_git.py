@@ -1152,6 +1152,14 @@ def test_git_active_stream_lock_detection(monkeypatch):
 def test_git_commit_route_rejects_active_stream(monkeypatch, tmp_path):
     from api import routes
     from api.config import STREAMS, STREAMS_LOCK
+    from api.workspace_git import WORKSPACE_GIT_DESTRUCTIVE_ENV
+
+    # Enable destructive ops for this in-process test — conftest.py sets the env
+    # var on the test_server subprocess env block, but this test calls
+    # _handle_git_commit() directly in the pytest process, which inherits
+    # the default-OFF setting. Without this monkeypatch, the destructive-mode
+    # gate fires first (403) before the active-stream check (409) can run.
+    monkeypatch.setenv(WORKSPACE_GIT_DESTRUCTIVE_ENV, "1")
 
     repo = _init_repo(tmp_path / "repo")
     (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
