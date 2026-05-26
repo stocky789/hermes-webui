@@ -433,7 +433,7 @@ async function send(){
   setComposerStatus('');
 
   const uploadedNames=uploaded.map(u=>u.name||u);
-  const uploadedPaths=uploaded.map(u=>u&&u.is_image?(u.name||u.filename||u):(u.path||u.name||u));
+  const uploadedPaths=uploaded.map(u=>u&&u.path?u.path:(u&&u.name?u.name:(u&&u.filename?u.filename:u)));
   let msgText=text;
   if(uploaded.length&&!msgText)msgText=`I've uploaded ${uploaded.length} file(s): ${uploadedPaths.join(', ')}`;
   else if(uploaded.length)msgText=`${text}\n\n[Attached files: ${uploadedPaths.join(', ')}]`;
@@ -609,10 +609,11 @@ async function send(){
 
 const LIVE_STREAMS={};
 
-function closeLiveStream(sessionId, streamId){
+function closeLiveStream(sessionId, streamId, source){
   const live=LIVE_STREAMS[sessionId];
   if(!live) return;
   if(streamId&&live.streamId!==streamId) return;
+  if(source&&live.source!==source) return;
   try{live.source.close();}catch(_){ }
   delete LIVE_STREAMS[sessionId];
 }
@@ -747,8 +748,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(_persistTimer) return;
     _persistTimer=setTimeout(()=>{_persistTimer=null;persistInflightState();},2000);
   }
-  function _closeSource(){
-    closeLiveStream(activeSid, streamId);
+  function _closeSource(source){
+    closeLiveStream(activeSid, streamId, source);
   }
   function _stripLiveVisibleAssistantEchoFromThinking(text, snippets){
     let out=String(text||'');
@@ -1455,6 +1456,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
 
   function _wireSSE(source){
+    const existingLive=LIVE_STREAMS[activeSid];
+    if(existingLive&&existingLive.source&&existingLive.source!==source){
+      try{existingLive.source.close();}catch(_){ }
+    }
+    LIVE_STREAMS[activeSid]={streamId,source};
+
     // Note on #631 Bug B: the original PR description stated the server
     // "replays buffered token events" on reconnect, and proposed resetting
     // the accumulators here so the re-sent tokens wouldn't double the prefix.
@@ -1543,6 +1550,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       S.toolCalls=INFLIGHT[activeSid].toolCalls;
       persistInflightState();
 
+      if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
       // NOTE: don't removeThinking() here — keep the thinking card visible
       // above the tool card so the turn reads top-to-bottom as:
@@ -1589,6 +1597,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(d.duration!==undefined) tc.duration=d.duration;
       S.toolCalls=inflight.toolCalls;
       persistInflightState();
+      if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
       appendLiveToolCard(tc);
       snapshotLiveTurn();
@@ -1629,6 +1638,21 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           session_id:String(d.session_id||activeSid)
         });
       }catch(_){}
+    });
+
+    source.addEventListener('context_status',e=>{
+      let d={};
+      try{ d=JSON.parse(e.data||'{}'); }catch(_){}
+      if((d.session_id||activeSid)!==activeSid) return;
+      const prefill=d.prefill||{};
+      const status=String(prefill.status||'not_configured');
+      const label=String(prefill.label||'session recall');
+      if(status==='loaded'){
+        setComposerStatus(`Context loaded: ${label}`);
+      }else if(status==='error'){
+        setComposerStatus(`Context unavailable: ${label}`);
+        if(typeof showToast==='function') showToast(`Context unavailable: ${String(prefill.error||label)}`,3600,'warning');
+      }
     });
 
     function _resolveGoalMessage(d){
@@ -1682,6 +1706,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('done',e=>{
+      if(_streamFinalized) return;
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
       const _doneData=JSON.parse(e.data);
@@ -1804,6 +1829,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           } else {
             S.toolCalls=hasMessageToolMetadata?[]:S.toolCalls.map(tc=>({...tc,done:true}));
           }
+          if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
           if(typeof _copyActivityDisclosureState==='function'&&lastAsst){
             const assistantIdx=S.messages.indexOf(lastAsst);
             if(assistantIdx>=0) _copyActivityDisclosureState('live:'+streamId, 'assistant:'+assistantIdx);
@@ -1859,12 +1885,31 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _finishDone();
     });
 
-    source.addEventListener('stream_end',e=>{
+    source.addEventListener('stream_end',async e=>{
+      if(_streamFinalized){
+        source.close();
+        return;
+      }
       _terminalStateReached=true;
       try{
         const d=JSON.parse(e.data||'{}');
         if((d.session_id||activeSid)!==activeSid) return;
       }catch(_){}
+      // Some replay/journal paths can deliver stream_end without a preceding
+      // done event. In that case closing the EventSource is not enough: the
+      // live DOM/inflight state remains projected and can duplicate Thinking or
+      // assistant content until a later session switch. Settle from the persisted
+      // session before closing so the pane converges on canonical state.
+      if(await _restoreSettledSession()){
+        source.close();
+        return;
+      }
+      if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _streamFinalized=true;
+      _cancelAnimationFramePendingStreamRender();
+      _streamFadeCleanupReduceMotionListener();
+      _smdEndParser();
+      if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       source.close();
     });
 
@@ -2042,13 +2087,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('error',async e=>{
+      if(_terminalStateReached || _streamFinalized){
+        _closeSource(source);
+        return;
+      }
+      if(typeof recordClientSSEError==='function') recordClientSSEError('chat-response',{ready_state:source?source.readyState:null,session_id:activeSid,stream_id:streamId,reason:'chat EventSource.onerror'});
       source.close();
       if(_deferStreamErrorIfOffline()) return;
       if(_deferStreamErrorIfPageHidden()) return;
-      if(_terminalStateReached || _streamFinalized){
-        _closeSource();
-        return;
-      }
+      _closeSource(source);
       // Attempt one reconnect if the stream is still active server-side
       if(!_reconnectAttempted && streamId){
         _reconnectAttempted=true;
@@ -2124,7 +2171,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _setActivePaneIdleIfOwner();
     });
 
-    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','approval','clarify','title','title_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
+    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','approval','clarify','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
       source.addEventListener(_runJournalEventName,_rememberRunJournalCursor);
     }
   }
@@ -2132,9 +2179,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   async function _restoreSettledSession(){
     try{
       const data=await api(`/api/session?session_id=${encodeURIComponent(activeSid)}`);
+      // Opus #2852 race-fix: if a late `done` event ran the finalize path while
+      // we were awaiting the network roundtrip, bail out — done already settled.
+      if(_streamFinalized) return true;
       const session=data&&data.session;
       if(!session) return false;
       if(session.active_stream_id||session.pending_user_message) return false;
+      if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _streamFinalized=true;
+      _cancelAnimationFramePendingStreamRender();
+      _streamFadeCleanupReduceMotionListener();
+      _smdEndParser();
+      if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       _clearOwnerInflightState();
       _closeSource();
       _clearApprovalForOwner();
@@ -2198,12 +2254,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(S.session&&S.session.session_id===activeSid){
       S.activeStreamId=null;
       clearLiveToolCards();if(!assistantText)removeThinking();
-      S.messages.push({role:'assistant',content:'**Error:** Connection lost'});renderMessages({preserveScroll:true});
+      S.messages.push({role:'assistant',content:'**Connection interrupted:** The browser lost the live SSE connection before the response finished. If the worker completed, reopening this session should restore the settled transcript.'});renderMessages({preserveScroll:true});
       _markSessionViewed(activeSid, S.messages.length);
     }else{
       if(typeof trackBackgroundError==='function'){
         const _errTitle=(typeof _allSessions!=='undefined'&&_allSessions.find(s=>s.session_id===activeSid)||{}).title||null;
-        trackBackgroundError(activeSid,_errTitle,'Connection lost');
+        trackBackgroundError(activeSid,_errTitle,'Connection interrupted');
       }
     }
     _setActivePaneIdleIfOwner();
@@ -2428,7 +2484,9 @@ function showApprovalCard(pending, pendingCount) {
   card.classList.add("visible");
   if (typeof applyLocaleToDOM === "function") applyLocaleToDOM();
   const onceBtn = $("approvalBtnOnce");
-  if (onceBtn) setTimeout(() => onceBtn.focus({preventScroll: true}), 50);
+  if (onceBtn && document.activeElement !== $('msg')) {
+    setTimeout(() => onceBtn.focus({preventScroll: true}), 50);
+  }
 }
 
 async function respondApproval(choice) {
@@ -2627,12 +2685,63 @@ function _syncClarifyCollapseButton(card) {
   collapse.title = label;
 }
 
+let _clarifyResizeListenerReady = false;
+
+function _clarifyMessagesNearBottom(messages) {
+  if (!messages) return false;
+  return messages.scrollHeight - messages.scrollTop - messages.clientHeight < 150;
+}
+
+function _syncClarifyTranscriptSpace(card, opts) {
+  opts = opts || {};
+  const messages = $("messages");
+  if (!messages) return;
+  const wasNearBottom = _clarifyMessagesNearBottom(messages);
+  if (!card || !card.classList.contains("visible")) {
+    messages.classList.remove("clarify-open");
+    messages.classList.remove("clarify-collapsed");
+    messages.style.removeProperty("--clarify-card-height");
+    messages.style.removeProperty("--clarify-dock-height");
+    if (wasNearBottom && typeof scrollToBottom === "function" && typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(scrollToBottom);
+    }
+    return;
+  }
+  const collapsed = card.classList.contains("collapsed");
+  messages.classList.add("clarify-open");
+  messages.classList.toggle("clarify-collapsed", collapsed);
+  const measure = () => {
+    if (!card.classList.contains("visible")) return;
+    const target = collapsed ? card : (card.querySelector(".clarify-inner") || card);
+    const h = target && target.getBoundingClientRect().height;
+    if (h > 0) {
+      messages.style.setProperty(collapsed ? "--clarify-dock-height" : "--clarify-card-height", Math.ceil(h + 24) + "px");
+    }
+    if (wasNearBottom && typeof scrollToBottom === "function") scrollToBottom();
+  };
+  if (opts.immediate) measure();
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(measure);
+  setTimeout(measure, 420);
+}
+
+function _ensureClarifyResizeListener() {
+  if (_clarifyResizeListenerReady || typeof window === "undefined") return;
+  _clarifyResizeListenerReady = true;
+  window.addEventListener("resize", () => {
+    const card = $("clarifyCard");
+    if (card && card.classList.contains("visible")) {
+      _syncClarifyTranscriptSpace(card, {immediate: true});
+    }
+  }, {passive: true});
+}
+
 function toggleClarifyCardCollapsed(forceCollapsed) {
   const card = $("clarifyCard");
   if (!card) return;
   const collapsed = typeof forceCollapsed === "boolean" ? forceCollapsed : !card.classList.contains("collapsed");
   card.classList.toggle("collapsed", collapsed);
   _syncClarifyCollapseButton(card);
+  _syncClarifyTranscriptSpace(card, {immediate: true});
 }
 
 function _clearClarifyHideTimer() {
@@ -2747,6 +2856,7 @@ function hideClarifyCard(force=false, reason="dismissed") {
   _clarifySessionId = null;
   _resetClarifyCardState();
   card.classList.remove("visible");
+  _syncClarifyTranscriptSpace(null);
   if (typeof unlockComposerForClarify === "function") unlockComposerForClarify();
   $("clarifyQuestion").textContent = "";
   $("clarifyChoices").innerHTML = "";
@@ -2861,10 +2971,16 @@ function showClarifyCard(pending) {
     lockComposerForClarify(question ? `Clarification needed: ${question}` : "Clarification needed");
   }
   _clarifySetControlsDisabled(false, false);
+  _ensureClarifyResizeListener();
   card.classList.add("visible");
   _syncClarifyCollapseButton(card);
+  _syncClarifyTranscriptSpace(card, {immediate: true});
   if (typeof applyLocaleToDOM === "function") applyLocaleToDOM();
-  if (input && !sameClarify) setTimeout(() => input.focus({preventScroll: true}), 50);
+  // Move focus to clarify input synchronously (not in setTimeout) and
+  // only if the user wasn't mid-type in the composer textarea.
+  if (input && !sameClarify && document.activeElement !== $('msg')) {
+    input.focus({preventScroll: true});
+  }
 }
 
 async function respondClarify(response) {
@@ -2896,6 +3012,16 @@ async function respondClarify(response) {
         _clarifyId = null;
         _clearClarifyPendingForSession(sid);
         hideClarifyCard(true, 'sent');
+        // Echo the user's clarify choice as a visible message in the conversation
+        if (S.session && S.session.session_id === sid) {
+          S.messages.push({
+            role: 'user',
+            content: value,
+            _clarify_response: true,
+            _ts: Date.now() / 1000,
+          });
+          if (typeof renderMessages === 'function') renderMessages({preserveScroll: true});
+        }
       }
     } else {
       // Stale / expired / wrong session — keep the card and draft visible.

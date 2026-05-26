@@ -543,6 +543,10 @@ async function newSession(flash, options={}){
 
 async function loadSession(sid){
   const opts = arguments[1] || {};
+  if(!opts.skipLineageResolve && typeof _resolveSessionIdFromSidebarLineage==='function'){
+    const resolvedSid=_resolveSessionIdFromSidebarLineage(sid);
+    if(resolvedSid&&resolvedSid!==sid) sid=resolvedSid;
+  }
   const forceReload = !!opts.force;
   const currentSid = S.session ? S.session.session_id : null;
   // Clicking the already-open session in the sidebar is a no-op. Reloading it
@@ -647,6 +651,7 @@ async function loadSession(sid){
     if(!Array.isArray(messages)) return false;
     const pendingMsg=typeof getPendingSessionMessage==='function'?getPendingSessionMessage(session,messages):null;
     if(!pendingMsg) return false;
+    if(messages.some(existing=>_sameTranscriptMessage(existing,pendingMsg))) return false;
     const liveAssistantIdx=messages.findIndex(m=>m&&m.role==='assistant'&&m._live);
     if(liveAssistantIdx>=0) messages.splice(liveAssistantIdx,0,pendingMsg);
     else messages.push(pendingMsg);
@@ -789,7 +794,10 @@ async function loadSession(sid){
       syncTopbar();renderMessages();
       if(typeof resumeManualCompressionForSession==='function') resumeManualCompressionForSession(sid);
       const _dirP=loadDir('.');
-      await _dirP;
+      // Workspace refresh is guarded by session id inside loadDir(); do not
+      // block session-load completion, draft restore, or model resolution on
+      // file-tree IO for users focused on the chat.
+      if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
     }
   }
 
@@ -823,6 +831,8 @@ async function loadSession(sid){
   _resolveSessionModelForDisplaySoon(sid);
   // Clear the in-flight session marker now that this load has completed (#1060).
   if (_loadingSessionId === sid) _loadingSessionId = null;
+
+  if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
 
   // ── Cross-channel handoff hint ──
   // After session fully loaded, check if this is a messaging session with
@@ -1539,6 +1549,24 @@ function _sessionArchiveToast(response, session){
 function _sessionDeleteDescription(session){
   return session&&session.worktree_path?t('session_delete_worktree_desc'):t('session_delete_desc');
 }
+function _optimisticallyArchiveSessionInList(sid, archived){
+  if(!sid||!Array.isArray(_allSessions)) return;
+  let changed=false;
+  _allSessions=_allSessions.map(s=>{
+    if(!s||s.session_id!==sid) return s;
+    changed=true;
+    return {...s,archived:!!archived};
+  });
+  if(changed) renderSessionListFromCache();
+}
+function _optimisticallyRemoveSessionFromList(sid){
+  if(!sid||!Array.isArray(_allSessions)) return;
+  const before=_allSessions.length;
+  _allSessions=_allSessions.filter(s=>!s||s.session_id!==sid);
+  if(_selectedSessions&&_selectedSessions.has(sid)) _selectedSessions.delete(sid);
+  if(typeof _dropStaleOptimisticSessionRow==='function') _dropStaleOptimisticSessionRow(sid);
+  if(_allSessions.length!==before) renderSessionListFromCache();
+}
 
 function _sessionIdFromLocation(){
   if(typeof window==='undefined'||!window.location) return null;
@@ -1551,7 +1579,7 @@ function _sessionIdFromLocation(){
   }
   try{
     const qs=new URLSearchParams(window.location.search||'');
-    return qs.get('session')||null;
+    return qs.get('session')||qs.get('session_id')||null;
   }catch(_e){return null;}
 }
 function _sessionUrlForSid(sid){
@@ -1825,26 +1853,24 @@ function _openSessionActionMenu(session, anchorEl){
       }
     ));
   }
-  const pinLimitReached=!session.pinned&&_pinnedSessionCount()>=_getPinnedSessionsLimit();
   menu.appendChild(_buildSessionAction(
     session.pinned?t('session_unpin'):t('session_pin'),
-    pinLimitReached?_pinnedSessionsLimitMessage():(session.pinned?t('session_unpin_desc'):t('session_pin_desc')),
+    session.pinned?t('session_unpin_desc'):t('session_pin_desc'),
     session.pinned?ICONS.pin:ICONS.unpin,
     async()=>{
       closeSessionActionMenu();
-      if(pinLimitReached){
-        if(typeof showToast==='function') showToast(_pinnedSessionsLimitMessage(),3000,'error');
-        return;
-      }
       const newPinned=!session.pinned;
       try{
         await api('/api/session/pin',{method:'POST',body:JSON.stringify({session_id:session.session_id,pinned:newPinned})});
         session.pinned=newPinned;
         if(S.session&&S.session.session_id===session.session_id) S.session.pinned=newPinned;
         renderSessionList();
-      }catch(err){showToast(t('session_pin_failed')+err.message);}
+      }catch(err){
+        showToast(t('session_pin_failed')+err.message);
+        await renderSessionList();
+      }
     },
-    (session.pinned?'is-active':'')+(pinLimitReached?' is-disabled':'')
+    session.pinned?'is-active':''
   ));
   menu.appendChild(_buildSessionAction(
     t('session_move_project'),
@@ -1863,9 +1889,10 @@ function _openSessionActionMenu(session, anchorEl){
       closeSessionActionMenu();
       try{
         const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:session.session_id,archived:!session.archived})});
+        _optimisticallyArchiveSessionInList(session.session_id,!session.archived);
         session.archived=!session.archived;
         if(S.session&&S.session.session_id===session.session_id) S.session.archived=session.archived;
-        await renderSessionList();
+        void renderSessionList();
         showToast(session.archived?_sessionArchiveToast(response,session):t('session_restored'));
       }catch(err){showToast(t('session_archive_failed')+err.message);}
     }
@@ -1879,9 +1906,10 @@ function _openSessionActionMenu(session, anchorEl){
         closeSessionActionMenu();
         try{
           await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:session.session_id,archived:true})});
+          _optimisticallyArchiveSessionInList(session.session_id,true);
           session.archived=true;
           if(S.session&&S.session.session_id===session.session_id) S.session.archived=true;
-          await renderSessionList();
+          void renderSessionList();
           showToast(t('session_hidden'));
         }catch(err){showToast(t('session_archive_failed')+err.message);}
       }
@@ -2435,6 +2463,7 @@ function startGatewaySSE(){
       }catch(e){ /* ignore parse errors */ }
     });
     _gatewaySSE.onerror = () => {
+      if(typeof recordClientSSEError==='function') recordClientSSEError('gateway-sessions',{ready_state:_gatewaySSE?_gatewaySSE.readyState:null,reason:'gateway EventSource.onerror'});
       if(_gatewaySSE){
         _gatewaySSE.close();
         _gatewaySSE = null;
@@ -2636,6 +2665,39 @@ function _sessionLineageContainsSession(s, sid){
   return false;
 }
 
+function _resolveSessionIdFromSidebarLineage(sid){
+  sid=String(sid||'').trim();
+  if(!sid||!Array.isArray(_allSessions)||!_allSessions.length) return sid||null;
+  const visibleRows=_collapseSessionLineageForSidebar(_allSessions).filter(row=>row&&!_isChildSession(row));
+  if(visibleRows.some(row=>row&&row.session_id===sid)) return sid;
+  const candidates=[];
+  for(const row of visibleRows){
+    if(!row||!row.session_id) continue;
+    if(row.session_source==='fork'||row.relationship_type==='child_session') continue;
+    const lineageLike=!!(
+      row._lineage_key||row._lineage_root_id||row.lineage_root_id||
+      row._compression_segment_count||row.pre_compression_snapshot||
+      (Array.isArray(row._lineage_segments)&&row._lineage_segments.length>1)
+    );
+    if(!lineageLike) continue;
+    const key=_sidebarLineageKeyForRow(row);
+    if(key===sid||row.parent_session_id===sid||row._lineage_root_id===sid||row.lineage_root_id===sid||_sessionLineageContainsSession(row,sid)){
+      candidates.push(row);
+    }
+  }
+  if(!candidates.length) return sid;
+  candidates.sort((a,b)=>{
+    const bSeg=Number(b&&b._compression_segment_count||b&&b._lineage_collapsed_count||0);
+    const aSeg=Number(a&&a._compression_segment_count||a&&a._lineage_collapsed_count||0);
+    if(bSeg!==aSeg) return bSeg-aSeg;
+    const bSnapshot=!!(b&&b.pre_compression_snapshot);
+    const aSnapshot=!!(a&&a.pre_compression_snapshot);
+    if(bSnapshot!==aSnapshot) return aSnapshot-bSnapshot;
+    return _sessionTimestampMs(b)-_sessionTimestampMs(a);
+  });
+  return candidates[0].session_id||sid;
+}
+
 function _sessionSegmentCount(s){
   if(!s) return 0;
   const counts=[];
@@ -2813,6 +2875,13 @@ function _collapseSessionLineageForSidebar(sessions){
       if(bSeg||aSeg){
         if(bSeg!==aSeg) return bSeg-aSeg;
       }
+      // Preserved pre-compression parents can share the same backend segment
+      // count as the continuation. Prefer the non-snapshot tip before falling
+      // back to timestamps, otherwise a recently-polled parent reopens the
+      // older transcript and makes the active continuation look lost.
+      const bSnapshot=!!(b&&b.pre_compression_snapshot);
+      const aSnapshot=!!(a&&a.pre_compression_snapshot);
+      if(bSnapshot!==aSnapshot) return aSnapshot-bSnapshot;
       return _sessionTimestampMs(b)-_sessionTimestampMs(a);
     });
     const chosen=sorted[0];
@@ -3870,6 +3939,7 @@ async function deleteSession(sid){
   let response=null;
   try{
     response=await api('/api/session/delete',{method:'POST',body:JSON.stringify({session_id:sid})});
+    _optimisticallyRemoveSessionFromList(sid);
     _clearHandoffStorageForSession(sid);
   }catch(e){setStatus(`Delete failed: ${e.message}`);return;}
   if(S.session&&S.session.session_id===sid){
@@ -3890,7 +3960,7 @@ async function deleteSession(sid){
     }
   }
   showToast(_sessionResponseRetainsWorktree(response,session)?t('session_deleted_worktree'):t('session_deleted'));
-  await renderSessionList();
+  void renderSessionList();
 }
 
 // ── Project helpers ─────────────────────────────────────────────────────

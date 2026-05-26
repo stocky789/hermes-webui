@@ -389,7 +389,8 @@ class TestRuntimeRouteInjection(unittest.TestCase):
         init_kwargs = captured["init_kwargs"]
         self.assertIsNotNone(init_kwargs["interim_assistant_callback"])
         self.assertTrue(callable(init_kwargs["interim_assistant_callback"]))
-        self.assertIn("WebUI progress contract", captured["agent"].ephemeral_system_prompt)
+        self.assertIn("WebUI progress guidance", captured["agent"].ephemeral_system_prompt)
+        self.assertIn("Match the normal Hermes messaging style", captured["agent"].ephemeral_system_prompt)
         self.assertIn("user-visible progress updates", captured["agent"].ephemeral_system_prompt)
 
         interim_events = []
@@ -679,9 +680,11 @@ def test_streaming_persists_reasoning_in_session():
     assert "_reasoning_text = ''" in src, \
         "_reasoning_text variable not initialised in streaming.py"
 
-    # on_reasoning must accumulate into _reasoning_text
-    assert '_reasoning_text += str(text)' in src, \
-        "on_reasoning callback does not accumulate into _reasoning_text"
+    # on_reasoning must accumulate non-echo reasoning into _reasoning_text
+    assert '_reasoning_text += reasoning_delta' in src, \
+        "on_reasoning callback does not accumulate accepted reasoning deltas into _reasoning_text"
+    assert '_is_visible_output_echo(reasoning_delta)' in src, \
+        "on_reasoning callback should suppress reasoning deltas that only echo visible streamed output"
 
     # Persistence block must exist before raw_session is built
     assert "Persist reasoning trace in the session so it survives reload" in src, \
