@@ -120,31 +120,6 @@ function _restoreExpandedDirs(){
   }catch(e){S._expandedDirs=new Set();}
 }
 
-function _normalizeWorkspaceDirPath(path){
-  return (!path||path==='')?'.':String(path);
-}
-
-function _ensureWorkspaceDirMetadata(){
-  if(!S._dirCache)S._dirCache={};
-  if(!S._dirSignatures)S._dirSignatures={};
-  return S._dirSignatures;
-}
-
-async function _fetchWorkspaceDir(path){
-  const dirPath=_normalizeWorkspaceDirPath(path);
-  return api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(dirPath)}`);
-}
-
-function _storeWorkspaceDirListing(path,data){
-  const dirPath=_normalizeWorkspaceDirPath(path);
-  const signatures=_ensureWorkspaceDirMetadata();
-  const entries=(data&&data.entries)||[];
-  if(typeof data?.signature==='string')signatures[dirPath]=data.signature;
-  if(dirPath===_normalizeWorkspaceDirPath(S.currentDir))S.entries=entries;
-  if(dirPath!=='.')S._dirCache[dirPath]=entries;
-  return entries;
-}
-
 let _workspacePanelActiveTab = 'files';
 let _renderSessionArtifactsTimer = null;
 
@@ -269,6 +244,32 @@ function openArtifactPath(path){
   openFile(rel);
 }
 
+function _normalizeWorkspaceDirPath(path){
+  return (!path||path==='')?'.':String(path);
+}
+
+function _ensureWorkspaceDirMetadata(){
+  if(!S._dirCache)S._dirCache={};
+  if(!S._dirSignatures)S._dirSignatures={};
+  return S._dirSignatures;
+}
+
+async function _fetchWorkspaceDir(path,sessionParam){
+  const dirPath=_normalizeWorkspaceDirPath(path);
+  const encodedSessionId=sessionParam||encodeURIComponent(S.session.session_id);
+  return api(`/api/list?session_id=${encodedSessionId}&path=${encodeURIComponent(dirPath)}`);
+}
+
+function _storeWorkspaceDirListing(path,data){
+  const dirPath=_normalizeWorkspaceDirPath(path);
+  const signatures=_ensureWorkspaceDirMetadata();
+  const entries=(data&&data.entries)||[];
+  if(typeof data?.signature==='string')signatures[dirPath]=data.signature;
+  if(dirPath===_normalizeWorkspaceDirPath(S.currentDir))S.entries=entries;
+  if(dirPath!=='.')S._dirCache[dirPath]=entries;
+  return entries;
+}
+
 async function loadDir(path){
   if(!S.session)return;
   const sessionId=S.session.session_id;
@@ -280,7 +281,8 @@ async function loadDir(path){
       _restoreExpandedDirs();  // restore per-workspace expanded state on root load
     }
     S.currentDir=dirPath;
-    const data=await _fetchWorkspaceDir(dirPath);
+    const sessionParam=encodeURIComponent(sessionId);
+    const data=await _fetchWorkspaceDir(dirPath,sessionParam);
     if(!S.session||S.session.session_id!==sessionId)return;
     _storeWorkspaceDirListing(dirPath,data);renderBreadcrumb();renderFileTree();
     if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
@@ -291,7 +293,7 @@ async function loadDir(path){
       const pending=[...expanded].filter(dirPath=>!S._dirCache[dirPath]);
       if(pending.length){
         const results=await Promise.all(pending.map(dirPath=>
-          _fetchWorkspaceDir(dirPath)
+          _fetchWorkspaceDir(dirPath,sessionParam)
             .then(dc=>({dirPath,data:dc}))
             .catch(()=>({dirPath,data:{entries:[]}}))
         ));
@@ -315,7 +317,6 @@ async function loadDir(path){
 async function _refreshGitBadge(){
   return refreshGitStatus();
 }
-
 const GIT_AUTO_REFRESH_MS = 5000;
 const WORKSPACE_TREE_AUTO_REFRESH_MS = 7000;
 const WORKSPACE_TREE_AUTO_REFRESH_MAX_DIRS = 50;
@@ -680,19 +681,19 @@ async function checkoutGitBranch(ref,mode,opts={}){
 function renderGitBadge(status){
   const badge=$('gitBadge');
   if(!badge)return;
+  const changesTab=$('btnWorkspaceChangesTab');
   if(!status||!status.is_git){
     badge.style.display='none';
     badge.textContent='';
-    const changesTab=$('btnWorkspaceChangesTab');
     if(changesTab)changesTab.hidden=true;
     const git=_ensureGitState();
+    if(_workspacePanelActiveTab==='changes')_workspacePanelActiveTab='files';
     if(git.selectedTab==='changes')git.selectedTab='files';
     _renderGitAutoFetchStatus();
     renderGitBranchControl();
     renderWorkspacePanelTabState();
     return;
   }
-  const changesTab=$('btnWorkspaceChangesTab');
   if(changesTab)changesTab.hidden=false;
   const totals=status.totals||{};
   let text=status.branch||'git';
@@ -799,35 +800,37 @@ async function refreshGitStatus(opts={}){
 
 function renderWorkspacePanelTabState(){
   const git=_ensureGitState();
-  const filesTab=$('btnWorkspaceFilesTab'), changesTab=$('btnWorkspaceChangesTab'), artifactsTab=$('workspaceArtifactsTab');
-  const changesView=$('gitChangesView'), artifacts=$('workspaceArtifacts'), fileTree=$('fileTree'), emptyEl=$('wsEmptyState');
-  const previewVisible=$('previewArea')&&$('previewArea').classList.contains('visible');
-  _workspacePanelActiveTab=git.selectedTab==='changes'?'changes':git.selectedTab==='artifacts'?'artifacts':'files';
+  const hasGit=!!(git.status&&git.status.is_git);
+  if(_workspacePanelActiveTab==='changes'&&!hasGit)_workspacePanelActiveTab='files';
+  const active=_workspacePanelActiveTab==='artifacts'?'artifacts':(_workspacePanelActiveTab==='changes'?'changes':'files');
+  git.selectedTab=active==='changes'?'changes':'files';
   _setWorkspacePanelTabDataset();
-  if(filesTab){
-    filesTab.classList.toggle('active',_workspacePanelActiveTab==='files');
-    filesTab.setAttribute('aria-selected',_workspacePanelActiveTab==='files'?'true':'false');
-  }
-  if(changesTab){
-    const canShowChanges=!!(git.status&&git.status.is_git);
-    changesTab.hidden=!canShowChanges;
-    changesTab.classList.toggle('active',_workspacePanelActiveTab==='changes');
-    changesTab.setAttribute('aria-selected',_workspacePanelActiveTab==='changes'?'true':'false');
-  }
-  if(artifactsTab){
-    artifactsTab.classList.toggle('active',_workspacePanelActiveTab==='artifacts');
-    artifactsTab.setAttribute('aria-selected',_workspacePanelActiveTab==='artifacts'?'true':'false');
-  }
-  if(artifacts)artifacts.hidden=_workspacePanelActiveTab!=='artifacts';
-  if(git.selectedTab==='changes'){
-    if(fileTree)fileTree.style.display='none';
-    if(emptyEl)emptyEl.style.display='none';
-    if(changesView)changesView.style.display=previewVisible?'none':'flex';
-  }else if(git.selectedTab==='artifacts'){
+  const filesTab=$('btnWorkspaceFilesTab')||$('workspaceFilesTab');
+  const changesTab=$('btnWorkspaceChangesTab');
+  const artifactsTab=$('workspaceArtifactsTab');
+  const changesView=$('gitChangesView'), fileTree=$('fileTree'), emptyEl=$('wsEmptyState'), artifacts=$('workspaceArtifacts');
+  const previewArea=$('previewArea');
+  const previewVisible=previewArea&&previewArea.classList.contains('visible');
+  if(changesTab)changesTab.hidden=!hasGit;
+  const setTab=(el,isActive)=>{
+    if(!el)return;
+    el.classList.toggle('active',isActive);
+    el.setAttribute('aria-selected',isActive?'true':'false');
+  };
+  setTab(filesTab,active==='files');
+  setTab(changesTab,active==='changes');
+  setTab(artifactsTab,active==='artifacts');
+  if(artifacts)artifacts.hidden=active!=='artifacts';
+  if(active==='artifacts'){
     if(fileTree)fileTree.style.display='none';
     if(emptyEl)emptyEl.style.display='none';
     if(changesView)changesView.style.display='none';
-    if(artifacts)artifacts.hidden=false;
+    if(previewArea)previewArea.classList.remove('visible');
+    renderSessionArtifacts();
+  }else if(active==='changes'){
+    if(fileTree)fileTree.style.display='none';
+    if(emptyEl)emptyEl.style.display='none';
+    if(changesView)changesView.style.display=previewVisible?'none':'flex';
   }else{
     if(changesView)changesView.style.display='none';
     if(fileTree&&!previewVisible)fileTree.style.display='';
@@ -836,13 +839,23 @@ function renderWorkspacePanelTabState(){
 
 function switchWorkspacePanelTab(tab){
   const git=_ensureGitState();
-  git.selectedTab=tab==='changes'&&git.status&&git.status.is_git?'changes':tab==='artifacts'?'artifacts':'files';
-  if(git.selectedTab==='changes'||git.selectedTab==='artifacts'){
+  const next=tab==='artifacts'?'artifacts':(tab==='changes'?'changes':'files');
+  if(next==='changes'&&!(git.status&&git.status.is_git)){
+    _workspacePanelActiveTab='files';
+  }else{
+    _workspacePanelActiveTab=next;
+  }
+  git.selectedTab=_workspacePanelActiveTab==='changes'?'changes':'files';
+  if(_workspacePanelActiveTab==='changes'){
     if($('previewArea'))$('previewArea').classList.remove('visible');
     git.selectedDiff=null;
+    renderGitChanges();
   }
-  if(git.selectedTab==='changes')renderGitChanges();
-  if(git.selectedTab==='artifacts')renderSessionArtifacts();
+  if(_workspacePanelActiveTab==='artifacts'){
+    if($('previewArea'))$('previewArea').classList.remove('visible');
+    git.selectedDiff=null;
+    renderSessionArtifacts();
+  }
   renderWorkspacePanelTabState();
 }
 
@@ -1471,6 +1484,7 @@ async function returnFromPreview(){
   }
   if(_previewReturnTarget==='changes'){
     if(S.git){
+      _workspacePanelActiveTab='changes';
       S.git.selectedTab='changes';
       S.git.selectedDiff=null;
     }
@@ -1754,6 +1768,7 @@ function openMarkdownPopout(){
 async function openGitDiff(path,kind='unstaged'){
   if(!S.session)return;
   const git=_ensureGitState();
+  _workspacePanelActiveTab='changes';
   git.selectedTab='changes';
   git.selectedDiff={path,kind};
   $('previewPathText').textContent=`Changes / ${path}`;
