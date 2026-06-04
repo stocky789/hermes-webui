@@ -3,6 +3,7 @@ async function api(path,opts={}){
   const rel = path.startsWith('/') ? path.slice(1) : path;
   const url=new URL(rel,document.baseURI||location.href);
   const timeoutMs=Object.prototype.hasOwnProperty.call(opts,'timeoutMs')?opts.timeoutMs:30000;
+  const timeoutToast=opts.timeoutToast!==false;
   // Retry up to 2 times on network errors (e.g. stale keep-alive after long idle).
   // Server errors (4xx/5xx) and client-side timeouts are NOT retried.
   let lastErr;
@@ -15,6 +16,8 @@ async function api(path,opts={}){
     try{
       const fetchOpts={...opts};
       delete fetchOpts.timeoutMs;
+      delete fetchOpts.timeoutToast;
+
       const useTimeout=Number.isFinite(Number(timeoutMs))&&Number(timeoutMs)>0;
       if(useTimeout&&typeof AbortController!=='undefined'){
         controller=new AbortController();
@@ -69,7 +72,7 @@ async function api(path,opts={}){
         const err=(e&&e.name==='TimeoutError')?e:new Error('Request timed out. Please try again.');
         err.name='TimeoutError';
         err.timeout=true;
-        if(typeof showToast==='function') showToast('Request timed out. Please try again.',5000,'error');
+        if(timeoutToast&&typeof showToast==='function') showToast('Request timed out. Please try again.',5000,'error');
         throw err;
       }
       // Only retry on network errors (TypeError from fetch), not on HTTP errors
@@ -98,7 +101,7 @@ function recordClientSSEError(source, details={}){
       url_path:(typeof location!=='undefined'&&location.pathname)||'/',
       reason:details.reason||'EventSource.onerror',
     };
-    void api('/api/client-events/log',{method:'POST',body:JSON.stringify(payload),timeoutMs:3000}).catch(()=>{});
+    void api('/api/client-events/log',{method:'POST',body:JSON.stringify(payload),timeoutMs:3000,timeoutToast:false}).catch(()=>{});
   }catch(_){}
 }
 
@@ -149,6 +152,12 @@ function _normalizeArtifactPath(path){
   if(!path) return '';
   path = String(path).trim().replace(/[\`"'<>),.;:]+$/g,'').replace(/^[\`"'(<]+/g,'');
   if(!path || path.length > 240 || path.includes('://')) return '';
+  // Canonicalize workspace-relative prefixes so a file-tree open ("foo.md") and a
+  // tool arg recorded as "./foo.md" or "~/foo.md" compare equal for mutation
+  // tracking; otherwise an agent edit via a ./-prefixed path leaves the open
+  // preview stale (#3262 / pre-release regression-gate finding).
+  path = path.replace(/^~\//,'').replace(/^(?:\.\/)+/,'');
+  if(!path) return '';
   if(ARTIFACT_IGNORE_RE.test(path)) return '';
   if(!/[./]/.test(path)) return '';
   return path;
@@ -202,6 +211,37 @@ function _artifactCandidatesFromToolCall(tc){
   return out;
 }
 
+const _turnMutatedPreviewPaths = new Set();
+
+function resetTurnWorkspaceMutations(){
+  _turnMutatedPreviewPaths.clear();
+}
+
+function noteWorkspaceMutationsFromToolCall(tc){
+  for(const a of _artifactCandidatesFromToolCall(tc)){
+    const path=_normalizeArtifactPath(a.path);
+    if(path) _turnMutatedPreviewPaths.add(path);
+  }
+}
+
+function noteWorkspaceMutationsFromToolCalls(toolCalls){
+  if(!Array.isArray(toolCalls)) return;
+  for(const tc of toolCalls) noteWorkspaceMutationsFromToolCall(tc);
+}
+
+function _isOpenPreviewPathMutated(){
+  if(!_previewCurrentPath) return false;
+  const current=_normalizeArtifactPath(_previewCurrentPath);
+  return !!(current&&_turnMutatedPreviewPaths.has(current));
+}
+
+async function refreshOpenPreviewIfMutated(){
+  if(typeof _previewDirty!=='undefined'&&_previewDirty) return;
+  if(!_isOpenPreviewPathMutated()) return;
+  if(!_previewCurrentPath||!S.session) return;
+  await openFile(_previewCurrentPath, { bustCache: true });
+}
+
 function collectSessionArtifacts(){
   const items = [];
   const seen = new Set();
@@ -210,12 +250,42 @@ function collectSessionArtifacts(){
     if(!path || seen.has(path)) return;
     seen.add(path); items.push({path, source});
   };
+  // Source 1: session-level tool call summaries (may be empty when messages
+  // carry their own tool metadata — see _syncToolCallsForLoadedMessages).
   for(const tc of (S.toolCalls || [])){
     for(const a of _artifactCandidatesFromToolCall(tc)) push(a.path, a.kind || tc.name || 'tool');
   }
+  // Source 2 & 3: message-level data — both text-mined diffs and structured
+  // tool_calls / tool_use content blocks that survive the S.toolCalls clear.
   for(const msg of (S.messages || [])){
-    const text = msg && (msg.content || msg.text || msg.message || '');
-    for(const a of _artifactCandidatesFromText(text)) push(a.path, a.kind);
+    if(!msg) continue;
+    const text = msg.content || msg.text || msg.message || '';
+    // Text-mined diff/patch fences (existing path).
+    if(typeof text === 'string'){
+      for(const a of _artifactCandidatesFromText(text)) push(a.path, a.kind);
+    }
+    // Structured tool_calls array (OpenAI format: {function:{name,arguments}}).
+    if(Array.isArray(msg.tool_calls)){
+      for(const tc of msg.tool_calls){
+        if(!tc || typeof tc !== 'object') continue;
+        const fn = (tc.function && typeof tc.function === 'object') ? tc.function : tc;
+        const name = fn.name || tc.name || '';
+        let args = fn.arguments || tc.arguments || tc.args || tc.input || {};
+        if(typeof args === 'string'){ try{ args = JSON.parse(args); }catch(_){} }
+        const fakeTc = {name, args, result: tc.result || tc.output || ''};
+        for(const a of _artifactCandidatesFromToolCall(fakeTc)) push(a.path, a.kind || name || 'tool');
+      }
+    }
+    // Structured content array with tool_use blocks (Anthropic format).
+    if(Array.isArray(msg.content)){
+      for(const block of msg.content){
+        if(!block || block.type !== 'tool_use') continue;
+        let inp = block.input || {};
+        if(typeof inp === 'string'){ try{ inp = JSON.parse(inp); }catch(_){} }
+        const fakeTc = {name: block.name || '', args: inp, result: block.result || ''};
+        for(const a of _artifactCandidatesFromToolCall(fakeTc)) push(a.path, a.kind || block.name || 'tool');
+      }
+    }
   }
   return items.slice(0, 50);
 }
@@ -234,13 +304,47 @@ function renderSessionArtifacts(){
     root.innerHTML = '<div class="workspace-artifact-empty">No artifacts detected yet. Files created or edited during this session will appear here.</div>';
     return;
   }
-  root.innerHTML = items.map(item => `<button type="button" class="workspace-artifact-item" data-artifact-path="${esc(item.path)}" onclick="openArtifactPath(this.dataset.artifactPath)"><div class="workspace-artifact-path">${esc(item.path)}</div><div class="workspace-artifact-meta">${esc(item.source || 'session')}</div></button>`).join('');
+  // Strip workspace prefix for display so long absolute paths don't clutter the list.
+  const ws = S.session && S.session.workspace;
+  const normWs = ws ? ws.replace(/\/+$/,'') + '/' : '';
+  const displayPath = (p) => {
+    if(normWs && p.startsWith(normWs)) return p.slice(normWs.length);
+    return p;
+  };
+  root.innerHTML = items.map(item => `<button type="button" class="workspace-artifact-item" data-artifact-path="${esc(item.path)}" onclick="openArtifactPath(this.dataset.artifactPath)"><div class="workspace-artifact-path">${esc(displayPath(item.path))}</div><div class="workspace-artifact-meta">${esc(item.source || 'session')}</div></button>`).join('');
 }
 
-function openArtifactPath(path){
+async function _workspacePathExists(path){
+  if(!S.session||!path) return false;
+  const parts=String(path).split('/').filter(Boolean);
+  const name=parts.pop();
+  if(!name) return false;
+  const dir=parts.length?parts.join('/'):'.';
+  const data=await api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(dir)}`);
+  return (data.entries||[]).some(entry=>entry&&((entry.path===path)||entry.name===name));
+}
+
+async function openArtifactPath(path){
   if(!path) return;
   switchWorkspacePanelTab('files');
-  const rel = path.replace(/^~\//,'').replace(/^\.\//,'');
+  let rel = path.replace(/^~\//,'').replace(/^\.\/+/,'');
+  // Strip workspace prefix so /api/list receives a workspace-relative path.
+  const ws = S.session && S.session.workspace;
+  if(ws){
+    const normWs = ws.replace(/\/+$/,'') + '/';
+    if(rel.startsWith(normWs)) rel = rel.slice(normWs.length);
+    else if(rel === ws.replace(/\/+$/,'')) rel = '.';
+  }
+  if(!rel) rel = '.';
+  try{
+    if(!(await _workspacePathExists(rel))){
+      setStatus(t('file_open_failed'));
+      return;
+    }
+  }catch(_){
+    setStatus(t('file_open_failed'));
+    return;
+  }
   openFile(rel);
 }
 
@@ -270,7 +374,8 @@ function _storeWorkspaceDirListing(path,data){
   return entries;
 }
 
-async function loadDir(path){
+async function loadDir(path, opts={}){
+  const preservePreview=!!(opts&&opts.preservePreview);
   if(!S.session)return;
   const sessionId=S.session.session_id;
   try{
@@ -302,12 +407,14 @@ async function loadDir(path){
       }
       if(expanded.size>0)renderFileTree();
     }
-    if(typeof clearPreview==='function'){
+    if(!preservePreview&&typeof clearPreview==='function'){
       if(typeof _previewDirty!=='undefined'&&_previewDirty){
         showConfirmDialog({title:t('unsaved_confirm'),message:'',confirmLabel:'Discard',danger:true,focusCancel:true}).then(ok=>{if(ok)clearPreview({keepPanelOpen:true});});
       }else{
         clearPreview({keepPanelOpen:true});
       }
+    }else if(preservePreview){
+      await refreshOpenPreviewIfMutated();
     }
     // Fetch git status for workspace root (non-blocking)
     if(dirPath==='.') refreshGitStatus();
@@ -1199,8 +1306,8 @@ const HTML_EXTS   = new Set(['.html','.htm']);
 const PDF_EXTS    = new Set(['.pdf']);
 const AUDIO_EXTS  = new Set(['.mp3','.wav','.m4a','.aac','.ogg','.oga','.opus','.flac']);
 const VIDEO_EXTS  = new Set(['.mp4','.mov','.m4v','.webm','.ogv','.avi','.mkv']);
-const MD_PREVIEW_RICH_RENDER_MAX_BYTES = 64 * 1024;
-const MD_PREVIEW_RICH_RENDER_MAX_LINES = 1500;
+const MD_PREVIEW_RICH_RENDER_MAX_BYTES = 256 * 1024;
+const MD_PREVIEW_RICH_RENDER_MAX_LINES = 5000;
 // Binary formats that should download rather than preview
 const DOWNLOAD_EXTS = new Set([
   '.docx','.doc','.xlsx','.xls','.pptx','.ppt','.odt','.ods','.odp',
@@ -1234,7 +1341,28 @@ function largeMarkdownPlainTextStatus(content){
   const bytes=markdownPreviewByteLength(content);
   const lines=markdownPreviewLineCount(content);
   const sizeLabel=bytes>=1024?`${Math.round(bytes/1024)} KB`:`${bytes} B`;
-  return `Large markdown file (${sizeLabel}, ${lines} lines) shown as plain text. Click Edit to view raw.`;
+  return `Large markdown file (${sizeLabel}, ${lines} lines) shown as plain text. Click "Render as markdown anyway" to force rich rendering, or Edit to view raw.`;
+}
+
+function setLargeMarkdownForceRenderVisible(visible){
+  const btn=$('btnRenderMarkdownAnyway');
+  if(btn) btn.style.display=visible?'inline-flex':'none';
+}
+
+function renderMarkdownPreviewContent(data){
+  showPreview('md');
+  $('previewMd').innerHTML=renderMd(data.content);
+  requestAnimationFrame(()=>{if(typeof renderKatexBlocks==='function')renderKatexBlocks();});
+}
+
+function forceRenderMarkdownPreview(){
+  // #3378 review (Codex): don't force-render from a dirty/open editor — the
+  // cached raw content would not reflect the unsaved edit. Require a saved,
+  // non-dirty state and cached content that belongs to the current file.
+  if(_previewDirty || $('previewEditArea').style.display!=='none') return;
+  if(!_previewRawContent || _previewRawContentPath!==_previewCurrentPath) return;
+  openFile(_previewCurrentPath,{forceRichMarkdown:true});
+  setStatus('Markdown rendered for this file.');
 }
 
 let _previewCurrentPath = '';  // relative path of currently previewed file
@@ -1276,6 +1404,7 @@ function showPreview(mode){
   // Show "Open in browser" button for iframe-backed document previews
   const openBtn=$('btnOpenInBrowser');
   if(openBtn) openBtn.style.display = (mode==='html'||mode==='pdf')?'inline-flex':'none';
+  setLargeMarkdownForceRenderVisible(false);
   const mdPopoutBtn=$('btnMarkdownPopout');
   if(mdPopoutBtn) mdPopoutBtn.style.display = mode==='md'?'inline-flex':'none';
   const downloadBtn=$('btnDownloadFile');
@@ -1518,10 +1647,12 @@ async function toggleEditMode(){
         session_id:S.session.session_id, path:_previewCurrentPath, content
       })});
       _previewDirty=false;
-      _previewRawContent=content;
-      // Update read-only views
+      // Update read-only views AND the cached raw content so a later
+      // force-render reflects the just-saved text rather than stale pre-edit content.
+      _previewRawContent = content;
+      _previewRawContentPath = _previewCurrentPath;
       if(_previewCurrentMode==='code') $('previewCode').textContent=content;
-      else { renderWorkspaceMarkdown(content); }
+      else renderMarkdownPreviewContent({content});
       const editShell=$('previewEditShell'); if(editShell)editShell.style.display='none';
       const readShell=$('previewReadShell'); if(readShell&&_previewCurrentMode==='code')readShell.style.display='grid';
       else { const editorShell=$('workspaceEditorShell'); if(editorShell)editorShell.style.display='none'; $('previewMd').style.display=''; }
@@ -1549,6 +1680,7 @@ async function toggleEditMode(){
 }
 
 let _previewRawContent = '';  // raw text for md files (to populate editor)
+let _previewRawContentPath = '';  // path that _previewRawContent belongs to (#3378 force-render cache guard)
 
 function renderWorkspaceMarkdown(content){
   const target=$('previewMd');
@@ -1581,9 +1713,46 @@ function cancelEditMode(){
   updateEditBtn();
 }
 
-async function openFile(path,opts={}){
+// Map file extensions to Prism.js language identifiers.
+// Prism autoloader fetches missing language components from CDN on demand.
+const _PRISM_LANG_MAP={
+  js:'javascript',mjs:'javascript',jsx:'jsx',ts:'typescript',tsx:'tsx',
+  py:'python',pyw:'python',pyi:'python',
+  rb:'ruby',go:'go',rs:'rust',java:'java',kt:'kotlin',kts:'kotlin',
+  c:'c',h:'c',cpp:'cpp',cxx:'cpp',hpp:'cpp',cc:'cpp',
+  cs:'csharp',swift:'swift',scala:'scala',
+  php:'php',pl:'perl',pm:'perl',r:'r',lua:'lua',
+  sh:'bash',bash:'bash',zsh:'bash',fish:'bash',
+  ps1:'powershell',psm1:'powershell',
+  sql:'sql',graphql:'graphql',
+  json:'json',yaml:'yaml',yml:'yaml',toml:'toml',xml:'xml',
+  html:'markup',htm:'markup',svg:'markup',vue:'markup',
+  css:'css',scss:'scss',sass:'sass',less:'less',
+  md:'markdown',markdown:'markdown',
+  dockerfile:'docker',makefile:'makefile',cmake:'cmake',
+  ini:'ini',cfg:'ini',conf:'ini',properties:'properties',
+  diff:'diff',patch:'diff',
+  txt:'',log:'',csv:'',tsv:'',
+};
+const _PRISM_BASENAME_LANG_MAP={
+  'dockerfile':'docker','makefile':'makefile','gnumakefile':'makefile',
+  'cmakelists.txt':'cmake',
+  '.gitignore':'ignore','.dockerignore':'ignore',
+};
+function _prismLanguageForPath(path){
+  const base=String(path||'').split(/[\\/]/).pop().toLowerCase();
+  if(base.startsWith('dockerfile.')) return 'docker';
+  if(_PRISM_BASENAME_LANG_MAP[base]!==undefined) return _PRISM_BASENAME_LANG_MAP[base];
+  const ext=fileExt(path).replace(/^\./,'');
+  return _PRISM_LANG_MAP[ext]!==undefined?_PRISM_LANG_MAP[ext]:'plaintext';
+}
+
+async function openFile(path, opts={}){
   if(!S.session)return;
   const ext=fileExt(path);
+  const bustCache=!!(opts&&opts.bustCache);
+  const forceRichMarkdown=!!(opts&&opts.forceRichMarkdown);
+  const cacheBust=bustCache?`&_=${Date.now()}`:'';
 
   // Binary/download-only formats: trigger browser download, don't preview
   if(DOWNLOAD_EXTS.has(ext)){
@@ -1602,14 +1771,14 @@ async function openFile(path,opts={}){
   if(IMAGE_EXTS.has(ext)){
     // Image: load via raw endpoint, show as <img>
     showPreview('image');
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`;
+    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}${cacheBust}`;
     $('previewImg').alt=path;
     $('previewImg').src=url;
     $('previewImg').onerror=()=>setStatus(t('image_load_failed'));
   } else if(AUDIO_EXTS.has(ext)||VIDEO_EXTS.has(ext)){
     const mode=VIDEO_EXTS.has(ext)?'video':'audio';
     showPreview(mode);
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1`;
+    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1${cacheBust}`;
     const wrap=$('previewMediaWrap');
     if(wrap){
       wrap.innerHTML=(typeof _mediaPlayerHtml==='function')
@@ -1619,7 +1788,7 @@ async function openFile(path,opts={}){
     }
   } else if(PDF_EXTS.has(ext)){
     showPreview('pdf');
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1`;
+    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1${cacheBust}`;
     const frame=$('previewPdfFrame');
     if(frame){
       frame.src=''; // clear first to avoid stale content
@@ -1629,29 +1798,24 @@ async function openFile(path,opts={}){
   } else if(MD_EXTS.has(ext)){
     // Markdown: fetch text, render with renderMd, display as formatted HTML
     try{
-      const data=await api(`/api/file?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`);
+      // #3378 review (Codex): only reuse cached raw content when it actually
+      // belongs to the requested path. `path===_previewCurrentPath` is tautological
+      // here (_previewCurrentPath was just assigned above), so guard on the
+      // dedicated _previewRawContentPath instead — otherwise a force-render after a
+      // file switch could re-render the previous file's cached content.
+      const data=forceRichMarkdown&&path===_previewRawContentPath&&_previewRawContent
+        ? {content:_previewRawContent}
+        : await api(`/api/file?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}`);
       _previewRawContent = data.content;
-      if(shouldRenderMarkdownPreviewAsPlainText(data.content)){
+      _previewRawContentPath = path;
+      if(!forceRichMarkdown && shouldRenderMarkdownPreviewAsPlainText(data.content)){
         showPreview('code');
         $('previewCode').textContent=data.content;
+        setLargeMarkdownForceRenderVisible(true);
         setStatus(largeMarkdownPlainTextStatus(data.content));
         return;
       }
-      showPreview('md');
-      const previewMd=$('previewMd');
-      if(previewMd){
-        previewMd.innerHTML=renderMd(data.content);
-        requestAnimationFrame(()=>{
-          if(typeof postProcessRenderedMessages==='function')postProcessRenderedMessages(previewMd);
-          else{
-            if(typeof highlightCode==='function')highlightCode(previewMd);
-            if(typeof addCopyButtons==='function')addCopyButtons(previewMd);
-            if(typeof renderMermaidBlocks==='function')renderMermaidBlocks(previewMd);
-            if(typeof renderKatexBlocks==='function')renderKatexBlocks(previewMd);
-            if(typeof initTreeViews==='function')initTreeViews(previewMd);
-          }
-        });
-      }
+      renderMarkdownPreviewContent(data);
     }catch(e){setStatus(t('file_open_failed'));}
   } else if(HTML_EXTS.has(ext)){
     // HTML: render in sandboxed iframe via raw endpoint.
@@ -1663,7 +1827,7 @@ async function openFile(path,opts={}){
     // or reading other origin data. If a stricter mode is needed, remove
     // allow-scripts (or add sandbox="") to disable all JS execution.
     showPreview('html');
-    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1`;
+    const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(path)}&inline=1${cacheBust}`;
     const iframe=$('previewHtmlIframe');
     if(iframe){
       iframe.src=''; // clear first to avoid stale content
@@ -1679,10 +1843,21 @@ async function openFile(path,opts={}){
         return;
       }
       showPreview('code');
-      $('previewCode').textContent=data.content;
-      $('previewCode').onscroll=()=>syncEditorScroll('read');
+      // Syntax highlighting with Prism.js (already loaded on the page).
+      const codeEl=document.createElement('code');
+      codeEl.textContent=data.content;
+      const lang=_prismLanguageForPath(path);
+      if(lang) codeEl.className='language-'+lang;
+      const pre=$('previewCode');
+      pre.textContent='';
+      // Strip stale language-* tokens so highlighting never leaks across files.
+      pre.className=pre.className.replace(/\blanguage-\S+/g,'').replace(/\s+/g,' ').trim();
+      pre.appendChild(codeEl);
+      pre.onscroll=()=>syncEditorScroll('read');
       refreshEditorChrome();
-      if(window.Prism&&typeof Prism.highlightElement==='function')Prism.highlightElement($('previewCode'));
+      if(lang&&typeof Prism!=='undefined'&&typeof Prism.highlightElement==='function'){
+        Prism.highlightElement(codeEl);
+      }
     }catch(e){
       // If it's a 400/too-large error, offer download instead
       downloadFile(path);
@@ -1743,8 +1918,211 @@ function renderFileBreadcrumb(filePath) {
 
 function openInBrowser(){
   if(!_previewCurrentPath||!S.session) return;
-  const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(_previewCurrentPath)}`;
-  window.open(url,'_blank');
+  const url=`api/file/raw?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(_previewCurrentPath)}&inline=1`;
+  window.open(url,'_blank','noopener');
+}
+
+// ── Workspace upload ──────────────────────────────────────────────────
+function triggerWorkspaceUpload() {
+  const input = $('workspaceFileInput');
+  if (!input) return;
+  input.value = '';
+  input.onchange = async () => {
+    const files = input.files;
+    if (!files || !files.length) return;
+    for (const file of files) {
+      await uploadToWorkspace(file, S.currentDir || '.');
+    }
+    if (S.session) loadDir(S.currentDir);
+  };
+  input.click();
+}
+
+async function uploadToWorkspace(file, dir) {
+  if (!S.session) return;
+  const formData = new FormData();
+  formData.append('session_id', S.session.session_id);
+  formData.append('path', dir || '.');
+  formData.append('file', file, file.name);
+  try {
+    showToast(t('uploading') || 'Uploading\u2026', 2000);
+    const data = await api('/api/workspace/upload', {
+      method: 'POST',
+      body: formData,
+      headers: {},
+      timeoutMs: 120000,
+    });
+    if (data && data.error) {
+      showToast(data.error, 5000, 'error');
+    } else if (data && (data.extract_error || (Array.isArray(data.files) && data.files.some(function(f){return f && f.extract_error;})))) {
+      // Archive was rejected (zip-slip / zip-bomb / corrupt / too-many-members):
+      // the file uploaded but extraction failed. Surface it as an error instead
+      // of a misleading "Uploaded" success toast.
+      var msg = data.extract_error
+        || (data.files.find(function(f){return f && f.extract_error;}) || {}).extract_error
+        || 'Archive extraction failed';
+      showToast(msg, 5000, 'error');
+    } else {
+      showToast(t('uploaded') || ('Uploaded ' + (data.filename || file.name)), 2000);
+    }
+  } catch (e) {
+    showToast(t('upload_failed') || ('Upload failed: ' + e.message), 5000, 'error');
+  }
+}
+
+function _isOsFilesDrag(e) {
+  return !!(e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files'));
+}
+
+function _joinWorkspacePath(base, rel) {
+  const b = base || '.';
+  const r = (rel || '').replace(/^\/+|\/+$/g, '');
+  if (!r) return b;
+  return b === '.' ? r : `${b}/${r}`;
+}
+
+function _targetDirForRelDir(destDir, relDir) {
+  const dirPart = (relDir || '').replace(/\/+$/, '');
+  if (!dirPart) return destDir || '.';
+  return _joinWorkspacePath(destDir, dirPart);
+}
+
+async function _readAllDirectoryEntries(reader) {
+  const entries = [];
+  while (true) {
+    const batch = await new Promise((resolve, reject) => {
+      reader.readEntries(resolve, reject);
+    });
+    if (!batch.length) break;
+    entries.push(...batch);
+  }
+  return entries;
+}
+
+async function _collectFilesFromEntry(entry, relPrefix) {
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => {
+      entry.file(resolve, reject);
+    });
+    return [{ file, relDir: relPrefix || '' }];
+  }
+  if (!entry.isDirectory) return [];
+  const reader = entry.createReader();
+  const children = await _readAllDirectoryEntries(reader);
+  const dirPrefix = `${relPrefix || ''}${entry.name}/`;
+  let out = [];
+  for (const child of children) {
+    out = out.concat(await _collectFilesFromEntry(child, dirPrefix));
+  }
+  return out;
+}
+
+async function _collectOsDropUploads(dataTransfer) {
+  const out = [];
+  const items = dataTransfer.items ? [...dataTransfer.items] : [];
+  if (items.length && typeof items[0].webkitGetAsEntry === 'function') {
+    for (const item of items) {
+      if (item.kind !== 'file') continue;
+      const entry = item.webkitGetAsEntry();
+      if (!entry) continue;
+      out.push(...await _collectFilesFromEntry(entry, ''));
+    }
+    if (out.length) return out;
+  }
+  for (const file of dataTransfer.files) {
+    out.push({ file, relDir: '' });
+  }
+  return out;
+}
+
+async function uploadOsDropToWorkspace(dataTransfer, destDir) {
+  if (!S.session || !dataTransfer) return;
+  const uploads = await _collectOsDropUploads(dataTransfer);
+  for (const { file, relDir } of uploads) {
+    await uploadToWorkspace(file, _targetDirForRelDir(destDir, relDir));
+  }
+  if (S.session) await loadDir(S.currentDir);
+}
+
+function _clearWorkspaceOsUploadDragOver() {
+  document.querySelectorAll('.file-item.drag-over-upload,.breadcrumb-seg.drag-over-upload').forEach((el) => {
+    el.classList.remove('drag-over-upload');
+  });
+}
+
+function _bindWorkspaceOsUploadDropTarget(el, destDir) {
+  // Use addEventListener (not on-property assignment) so these OS-upload
+  // handlers COMPOSE with the workspace tree-MOVE handlers bound by
+  // _bindWorkspaceMoveDropTarget() on the same element. A property assignment
+  // for the drop handler here would overwrite the move handler, and a
+  // workspace-file drag would fall through to the document drop (inserting
+  // @path into the composer) instead of moving the file. Each handler gates on
+  // its own drag type (_isOsFilesDrag vs _isWorkspaceTreeMoveDrag), so only the
+  // matching one acts.
+  el.addEventListener('dragenter', (e) => {
+    if (!_isOsFilesDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.add('drag-over-upload');
+  });
+  el.addEventListener('dragover', (e) => {
+    if (!_isOsFilesDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'copy';
+    el.classList.add('drag-over-upload');
+  });
+  el.addEventListener('dragleave', (e) => {
+    if (el.contains(e.relatedTarget)) return;
+    el.classList.remove('drag-over-upload');
+  });
+  el.addEventListener('drop', async (e) => {
+    if (!_isOsFilesDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove('drag-over-upload');
+    await uploadOsDropToWorkspace(e.dataTransfer, destDir);
+  });
+}
+
+// Drag-and-drop files onto workspace file tree
+if (typeof document !== 'undefined') {
+  const _wsUploadInit = () => {
+    const tree = $('fileTree');
+    if (!tree) return;
+    tree.addEventListener('dragenter', (e) => {
+      if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files')) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    });
+    tree.addEventListener('dragover', (e) => {
+      if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.target.closest('.file-item[data-ws-type="dir"],.breadcrumb-seg')) return;
+        e.dataTransfer.dropEffect = 'copy';
+        tree.classList.add('drag-over-upload');
+      }
+    });
+    tree.addEventListener('dragleave', (e) => {
+      if (tree.contains(e.relatedTarget)) return;
+      tree.classList.remove('drag-over-upload');
+    });
+    tree.addEventListener('drop', async (e) => {
+      tree.classList.remove('drag-over-upload');
+      if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes('Files')) return;
+      if (e.target.closest('.file-item[data-ws-type="dir"],.breadcrumb-seg')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      await uploadOsDropToWorkspace(e.dataTransfer, S.currentDir || '.');
+    });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _wsUploadInit, {once: true});
+  } else {
+    _wsUploadInit();
+  }
 }
 
 function openMarkdownPopout(){
@@ -2166,6 +2544,24 @@ function _gitRemoteToastMessage(action,data){
   return [label, ...fallback.slice(0,3)].filter(Boolean).join('\n');
 }
 
+// Recover from a stale session (e.g. server restarted before the session was
+// persisted to disk). Creates a fresh session with the same workspace so git
+// operations can proceed without losing the workspace context.
+let _gitSessionRecovering=false;
+async function _tryRecoverGitSession(){
+  if(_gitSessionRecovering||!S.session||!S.session.workspace)return false;
+  _gitSessionRecovering=true;
+  try{
+    const fresh=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:S.session.workspace,profile:S.activeProfile||'default'})});
+    S.session=fresh.session;
+    return true;
+  }catch(_){
+    return false;
+  }finally{
+    _gitSessionRecovering=false;
+  }
+}
+
 async function runGitRemoteAction(action){
   if(!S.session||!['fetch','pull','push'].includes(action))return;
   const git=_ensureGitState();
@@ -2178,6 +2574,21 @@ async function runGitRemoteAction(action){
     showToast(_gitRemoteToastMessage(action,data),4200);
     await loadDir(S.currentDir);
   }catch(e){
+    if(e.status===404&&e.message==='Session not found'){
+      const recovered=await _tryRecoverGitSession();
+      if(recovered&&S.session){
+        try{
+          const data=await api(`/api/git/${action}`,{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
+          _setGitStatus(data.status);
+          showToast(_gitRemoteToastMessage(action,data),4200);
+          await loadDir(S.currentDir);
+          return;
+        }catch(e2){
+          showToast(`${t('git_sync_failed')}: ${e2.message}`,4000,'error');
+          return;
+        }
+      }
+    }
     showToast(`${t('git_sync_failed')}: ${e.message}`,4000,'error');
   }finally{
     git.syncing=null;
@@ -2248,6 +2659,14 @@ async function _autoFetchWorkspaceGit(){
     if(changed&&(git.branchMenuOpen||git.branches))refreshGitBranches();
     return data;
   }catch(e){
+    if(e.status===404&&e.message==='Session not found'){
+      await _tryRecoverGitSession();
+      git.autoFetchFailureCount=0;
+      git.lastAutoFetchErrorAt=0;
+      git.lastAutoFetchError='';
+      _renderGitAutoFetchStatus();
+      return null;
+    }
     git.lastAutoFetchErrorAt=Date.now();
     git.lastAutoFetchError=e&&e.message?e.message:String(e||'Auto-fetch failed');
     git.autoFetchFailureCount=(git.autoFetchFailureCount||0)+1;
