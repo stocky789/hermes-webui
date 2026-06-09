@@ -1,11 +1,13 @@
 import json
 import pathlib
 import subprocess
+import threading
 import types
 import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 
 import pytest
@@ -290,6 +292,33 @@ def test_git_status_reports_untracked_files_inside_directories(tmp_path):
 
     git_discard(repo, ["newdir/a.txt"], delete_untracked=True)
     assert not (nested / "a.txt").exists()
+
+
+def test_git_discard_untracked_file_tolerates_concurrent_missing_file(tmp_path, monkeypatch):
+    import api.workspace_git as workspace_git
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    transient = repo / "transient.txt"
+    transient.write_text("gone soon\n", encoding="utf-8")
+
+    original_unlink_anchored = workspace_git.unlink_anchored
+    raced = {"seen": False}
+
+    def remove_before_unlink(root, target):
+        if target == transient:
+            raced["seen"] = True
+            transient.unlink()
+        return original_unlink_anchored(root, target)
+
+    monkeypatch.setattr(workspace_git, "unlink_anchored", remove_before_unlink)
+
+    status = workspace_git.git_discard(repo, ["transient.txt"], delete_untracked=True)
+
+    assert raced["seen"] is True
+    assert not transient.exists()
+    assert status["totals"]["changed"] == 0
 
 
 def test_git_status_reports_ignored_files_without_counting_them_as_changed(tmp_path):
@@ -960,7 +989,8 @@ def test_workspace_git_static_contracts():
     assert ".git-badge{grid-column:1 / -1;grid-row:2;justify-self:start;font-size:11px" in style
     assert ".git-branch-button{height:30px" in style
     assert ".git-summary{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:\"SF Mono\",ui-monospace,monospace;font-size:13px" in style
-    assert ".toast{pointer-events:auto;position:fixed;top:24px;right:24px;left:auto;bottom:auto;transform:translateY(-6px);display:flex;align-items:flex-start" in style
+    assert ".toast{pointer-events:none;position:fixed;top:24px;right:24px;left:auto;bottom:auto;transform:translateY(-6px);display:flex;align-items:flex-start" in style
+    assert ".toast.show{opacity:1;transform:translateY(0);pointer-events:auto;}" in style
     assert ".toast-title" in style and ".toast-detail" in style
     assert "selectedPaths:new Set()" in workspace_js
     assert "selectionKey:scopeKey" in workspace_js
@@ -1091,6 +1121,211 @@ def test_workspace_git_static_contracts():
     for key in ["git_tracked", "git_select_files", "git_commit_message_privacy"]:
         assert i18n.count(f"{key}:") >= 11
 
+def test_git_discard_untracked_delete_uses_anchored_unlink_after_validation_race(tmp_path, monkeypatch):
+    import os
+    import shutil
+
+    import api.workspace_git as workspace_git
+    from api.workspace import safe_resolve_ws as real_safe_resolve_ws
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    _commit_all(repo)
+
+    (repo / "d").mkdir()
+    (repo / "d" / "f").write_text("workspace untracked\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "f"
+    victim.write_text("outside victim\n", encoding="utf-8")
+
+    state = {"calls": 0, "swapped": False}
+
+    def racing_safe_resolve(root, requested):
+        target = real_safe_resolve_ws(root, requested)
+        if requested == "d/f":
+            state["calls"] += 1
+        # git_discard validates once for the Git pathspec and once immediately
+        # before deletion. Race the second validation-to-use window.
+        if requested == "d/f" and state["calls"] == 2 and not state["swapped"]:
+            shutil.rmtree(repo / "d")
+            os.symlink(outside, repo / "d")
+            state["swapped"] = True
+        return target
+
+    monkeypatch.setattr(workspace_git, "safe_resolve_ws", racing_safe_resolve)
+
+    with pytest.raises(ValueError, match="Path traversal blocked"):
+        workspace_git.git_discard(repo, ["d/f"], delete_untracked=True)
+
+    assert state["swapped"] is True
+    assert victim.exists()
+    assert victim.read_text(encoding="utf-8") == "outside victim\n"
+
+
+def test_git_status_ignores_repo_local_fsmonitor_command(tmp_path):
+    import os
+    import sys
+
+    if os.name == "nt":
+        pytest.skip("executable fsmonitor helper setup is POSIX-only")
+
+    from api.workspace_git import git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    marker = tmp_path / "fsmonitor-ran"
+    helper = tmp_path / "fsmonitor_helper.py"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text('fsmonitor executed', encoding='utf-8')\n"
+        "print('')\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    _git(repo, "config", "core.fsmonitor", f"{sys.executable} {helper} {marker}")
+
+    status = git_status(repo)
+
+    assert status["is_git"] is True
+    assert not marker.exists()
+
+
+def test_git_fetch_blocks_repo_local_ext_transport_execution(tmp_path):
+    import os
+    import sys
+
+    if os.name == "nt":
+        pytest.skip("ext transport helper setup is POSIX-only")
+
+    from api.workspace_git import GitWorkspaceError, git_fetch
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    marker = tmp_path / "ext-transport-ran"
+    helper = tmp_path / "ext_helper.py"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text('ext executed: ' + ' '.join(sys.argv[2:]), encoding='utf-8')\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    _git(repo, "config", "protocol.ext.allow", "always")
+    _git(repo, "remote", "add", "origin", f"ext::{sys.executable} {helper} {marker} %S foo")
+
+    with pytest.raises(GitWorkspaceError) as exc:
+        git_fetch(repo)
+
+    assert exc.value.code == "git_failed"
+    assert not marker.exists()
+
+
+def test_git_fetch_blocks_repo_local_credential_helper_execution(tmp_path):
+    import os
+    import sys
+
+    if os.name == "nt":
+        pytest.skip("executable credential helper setup is POSIX-only")
+
+    from api.workspace_git import GitWorkspaceError, git_fetch
+
+    class AuthRequiredHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="hermes-test"')
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            del format, args
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    marker = tmp_path / "credential-helper-ran"
+    helper = tmp_path / "credential_helper.py"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text('credential helper executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), AuthRequiredHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/repo.git"
+        _git(repo, "remote", "add", "origin", url)
+        _git(repo, "config", "credential.helper", f"!{sys.executable} {helper} {marker}")
+
+        with pytest.raises(GitWorkspaceError) as exc:
+            git_fetch(repo)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert exc.value.code == "auth_failed"
+    assert not marker.exists()
+
+
+def test_git_fetch_blocks_repo_local_askpass_execution(tmp_path):
+    import os
+    import sys
+
+    if os.name == "nt":
+        pytest.skip("executable askpass helper setup is POSIX-only")
+
+    from api.workspace_git import GitWorkspaceError, git_fetch
+
+    class AuthRequiredHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="hermes-test"')
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            del format, args
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    marker = tmp_path / "askpass-ran"
+    helper = tmp_path / "askpass_helper.py"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text('askpass executed', encoding='utf-8')\n"
+        "print('pw')\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), AuthRequiredHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/repo.git"
+        _git(repo, "remote", "add", "origin", url)
+        _git(repo, "config", "core.askPass", f"{sys.executable} {helper} {marker}")
+
+        with pytest.raises(GitWorkspaceError) as exc:
+            git_fetch(repo)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert exc.value.code == "auth_failed"
+    assert not marker.exists()
+
+
 def test_git_env_scrub_removes_redirecting_vars_and_preserves_temp_index(monkeypatch):
     from api.workspace_git import _clean_git_env
 
@@ -1102,6 +1337,11 @@ def test_git_env_scrub_removes_redirecting_vars_and_preserves_temp_index(monkeyp
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "ssh -i /tmp/evil-key")
     monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.sshCommand=ssh -i /tmp/evil-key'")
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/evil-askpass")
+    monkeypatch.setenv("SSH_ASKPASS", "/tmp/evil-ssh-askpass")
+    monkeypatch.setenv("GIT_SSH", "/tmp/evil-ssh")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /tmp/evil-key")
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
 
     env = _clean_git_env({"GIT_INDEX_FILE": "/tmp/hermes-index"})
 
@@ -1113,6 +1353,11 @@ def test_git_env_scrub_removes_redirecting_vars_and_preserves_temp_index(monkeyp
     assert "GIT_CONFIG_KEY_0" not in env
     assert "GIT_CONFIG_VALUE_0" not in env
     assert "GIT_CONFIG_PARAMETERS" not in env
+    assert "GIT_ASKPASS" not in env
+    assert "SSH_ASKPASS" not in env
+    assert "GIT_SSH" not in env
+    assert "GIT_SSH_COMMAND" not in env
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert env["GIT_INDEX_FILE"] == "/tmp/hermes-index"
 
 
