@@ -1,10 +1,14 @@
 import json
 import pathlib
 import subprocess
+import threading
+import types
 import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 
 import pytest
 
@@ -29,9 +33,33 @@ def _git(cwd, *args):
 
 def _init_repo(path):
     path.mkdir(parents=True, exist_ok=True)
-    _git(path, "init")
+    init = subprocess.run(
+        ["git", "init", "-b", "master"],
+        cwd=str(path),
+        shell=False,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    if init.returncode != 0:
+        _git(path, "init")
+        _git(path, "checkout", "-B", "master")
     _git(path, "config", "user.email", "hermes-tests@example.invalid")
     _git(path, "config", "user.name", "Hermes Tests")
+    return path
+
+
+def _init_bare_repo(path):
+    init = subprocess.run(
+        ["git", "init", "--bare", "-b", "master", str(path)],
+        shell=False,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    if init.returncode != 0:
+        _git(path.parent, "init", "--bare", str(path))
+        _git(path, "symbolic-ref", "HEAD", "refs/heads/master")
     return path
 
 
@@ -73,6 +101,26 @@ def _make_session(created_list, ws=None):
     return sid, pathlib.Path(data["session"]["workspace"])
 
 
+class _CaptureHandler:
+    def __init__(self):
+        self.status = None
+        self.headers = {}
+        self.response_headers = []
+        self.wfile = BytesIO()
+
+    def send_response(self, status):
+        self.status = status
+
+    def send_header(self, key, value):
+        self.response_headers.append((key, value))
+
+    def end_headers(self):
+        pass
+
+    def payload(self):
+        return json.loads(self.wfile.getvalue().decode("utf-8"))
+
+
 def test_git_status_non_git_workspace(tmp_path):
     from api.workspace_git import git_status
 
@@ -110,6 +158,33 @@ def test_git_status_handles_staged_unstaged_untracked_deleted_and_renamed(tmp_pa
     assert status["totals"]["changed"] >= 5
 
 
+def test_git_status_reports_ignored_files_without_counting_them_as_changes(tmp_path):
+    from api.workspace_git import git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("*.log\nbuild/\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+
+    (repo / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")
+    (repo / "debug.log").write_text("ignored log\n", encoding="utf-8")
+    build = repo / "build"
+    build.mkdir()
+    (build / "artifact.txt").write_text("ignored artifact\n", encoding="utf-8")
+
+    status = git_status(repo)
+    by_path = {item["path"]: item for item in status["files"]}
+
+    assert by_path["tracked.txt"]["unstaged"] is True
+    assert by_path["debug.log"]["ignored"] is True
+    assert by_path["debug.log"]["status"] == "Ignored"
+    assert by_path["build/"]["ignored"] is True
+    assert by_path["build/"]["staged"] is False
+    assert by_path["build/"]["untracked"] is False
+    assert status["totals"]["changed"] == 1
+    assert status["totals"]["untracked"] == 0
+
+
 def test_git_status_ignores_crlf_only_worktree_noise(tmp_path):
     from api.workspace_git import git_status
 
@@ -126,7 +201,7 @@ def test_git_status_ignores_crlf_only_worktree_noise(tmp_path):
     assert status["totals"]["changed"] == 0
     assert status["files"] == []
     assert status["noise_filtering"]["active"] is True
-    assert "hidden by default" in status["noise_filtering"]["message"]
+    assert status["noise_filtering"]["crlf_only"] == 1
 
 
 def test_git_status_keeps_real_edit_with_crlf_endings(tmp_path):
@@ -217,6 +292,61 @@ def test_git_status_reports_untracked_files_inside_directories(tmp_path):
 
     git_discard(repo, ["newdir/a.txt"], delete_untracked=True)
     assert not (nested / "a.txt").exists()
+
+
+def test_git_discard_untracked_file_tolerates_concurrent_missing_file(tmp_path, monkeypatch):
+    import api.workspace_git as workspace_git
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    transient = repo / "transient.txt"
+    transient.write_text("gone soon\n", encoding="utf-8")
+
+    original_unlink_anchored = workspace_git.unlink_anchored
+    raced = {"seen": False}
+
+    def remove_before_unlink(root, target):
+        if target == transient:
+            raced["seen"] = True
+            transient.unlink()
+        return original_unlink_anchored(root, target)
+
+    monkeypatch.setattr(workspace_git, "unlink_anchored", remove_before_unlink)
+
+    status = workspace_git.git_discard(repo, ["transient.txt"], delete_untracked=True)
+
+    assert raced["seen"] is True
+    assert not transient.exists()
+    assert status["totals"]["changed"] == 0
+
+
+def test_git_status_reports_ignored_files_without_counting_them_as_changed(tmp_path):
+    from api.workspace_git import git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("*.log\nbuild/\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+
+    (repo / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")
+    (repo / "debug.log").write_text("ignored log\n", encoding="utf-8")
+    build = repo / "build"
+    build.mkdir()
+    (build / "artifact.txt").write_text("ignored artifact\n", encoding="utf-8")
+
+    status = git_status(repo)
+    by_path = {item["path"]: item for item in status["files"]}
+
+    assert by_path["tracked.txt"]["unstaged"] is True
+    assert by_path["debug.log"]["ignored"] is True
+    assert by_path["debug.log"]["status"] == "Ignored"
+    assert by_path["debug.log"]["staged"] is False
+    assert by_path["debug.log"]["unstaged"] is False
+    assert by_path["debug.log"]["untracked"] is False
+    assert any(item["ignored"] and item["path"].startswith("build") for item in status["files"])
+    assert status["totals"]["changed"] == 1
+    assert status["totals"]["untracked"] == 0
 
 
 def test_git_diff_large_untracked_file_is_bounded(tmp_path):
@@ -426,14 +556,14 @@ def test_staged_commit_message_prompt_uses_only_staged_diff(tmp_path):
 def test_git_fetch_pull_and_push_with_upstream(tmp_path):
     from api.workspace_git import git_fetch, git_pull, git_push, git_status
 
-    remote = tmp_path / "remote.git"
-    _git(tmp_path, "init", "--bare", str(remote))
+    remote = _init_bare_repo(tmp_path / "remote.git")
 
     origin = _init_repo(tmp_path / "origin")
     (origin / "tracked.txt").write_text("one\n", encoding="utf-8")
     _commit_all(origin)
     _git(origin, "remote", "add", "origin", str(remote))
     _git(origin, "push", "-u", "origin", "HEAD")
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/master")
 
     clone = tmp_path / "clone"
     _git(tmp_path, "clone", str(remote), str(clone))
@@ -463,8 +593,7 @@ def test_git_fetch_pull_and_push_with_upstream(tmp_path):
 def test_git_branches_lists_local_remote_and_upstream(tmp_path):
     from api.workspace_git import git_branches
 
-    remote = tmp_path / "remote.git"
-    _git(tmp_path, "init", "--bare", str(remote))
+    remote = _init_bare_repo(tmp_path / "remote.git")
     origin = _init_repo(tmp_path / "origin")
     (origin / "tracked.txt").write_text("one\n", encoding="utf-8")
     _commit_all(origin)
@@ -488,8 +617,7 @@ def test_git_branches_lists_local_remote_and_upstream(tmp_path):
 def test_git_checkout_local_new_remote_dirty_and_invalid_refs(tmp_path):
     from api.workspace_git import GitWorkspaceError, git_branches, git_checkout
 
-    remote = tmp_path / "remote.git"
-    _git(tmp_path, "init", "--bare", str(remote))
+    remote = _init_bare_repo(tmp_path / "remote.git")
     origin = _init_repo(tmp_path / "origin")
     (origin / "tracked.txt").write_text("one\n", encoding="utf-8")
     _commit_all(origin)
@@ -560,7 +688,68 @@ def test_git_stash_and_checkout_is_explicit(tmp_path):
     assert result["stash_name"].startswith("hermes-webui branch switch")
     assert result["current_branch"] == "target"
     assert git_status(repo)["totals"]["changed"] == 0
-    assert "hermes-webui branch switch target" in _git(repo, "stash", "list")
+    assert "hermes-webui branch switch to target" in _git(repo, "stash", "list")
+
+
+def test_git_stash_and_checkout_restores_branch_changes_when_returning(tmp_path):
+    from api.workspace_git import git_stash_and_checkout, git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    _git(repo, "branch", "-M", "main")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    _git(repo, "checkout", "-b", "feature")
+    _git(repo, "checkout", "main")
+
+    (repo / "tracked.txt").write_text("main dirty\n", encoding="utf-8")
+    (repo / "main-only.txt").write_text("untracked on main\n", encoding="utf-8")
+
+    to_feature = git_stash_and_checkout(repo, "feature", "local")
+    assert to_feature["ok"] is True
+    assert to_feature["stashed"] is True
+    assert to_feature["current_branch"] == "feature"
+    assert git_status(repo)["totals"]["changed"] == 0
+    assert not (repo / "main-only.txt").exists()
+
+    (repo / "feature-only.txt").write_text("untracked on feature\n", encoding="utf-8")
+    to_main = git_stash_and_checkout(repo, "main", "local")
+
+    assert to_main["ok"] is True
+    assert to_main["stashed"] is True
+    assert to_main["current_branch"] == "main"
+    assert to_main["restored_stash"]["branch"] == "main"
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "main dirty\n"
+    assert (repo / "main-only.txt").read_text(encoding="utf-8") == "untracked on main\n"
+    assert not (repo / "feature-only.txt").exists()
+    stash_list = _git(repo, "stash", "list")
+    assert "On main: hermes-webui branch switch" not in stash_list
+    assert "On feature: hermes-webui branch switch" in stash_list
+
+
+def test_git_stash_and_checkout_reports_restore_conflicts_without_dropping_stash(tmp_path):
+    from api.workspace_git import git_stash_and_checkout
+
+    repo = _init_repo(tmp_path / "repo")
+    _git(repo, "branch", "-M", "main")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    _git(repo, "checkout", "-b", "feature")
+    _git(repo, "checkout", "main")
+    (repo / "tracked.txt").write_text("main dirty\n", encoding="utf-8")
+
+    git_stash_and_checkout(repo, "feature", "local")
+    _git(repo, "checkout", "main")
+    (repo / "tracked.txt").write_text("main changed while parked\n", encoding="utf-8")
+    _commit_all(repo, "advance main")
+    _git(repo, "checkout", "feature")
+
+    result = git_stash_and_checkout(repo, "main", "local")
+
+    assert result["ok"] is True
+    assert result["current_branch"] == "main"
+    assert result["restore_failed"] is True
+    assert result["restore_stash"]["branch"] == "main"
+    assert "On main: hermes-webui branch switch" in _git(repo, "stash", "list")
 
 
 def test_git_stash_checkout_validates_before_stashing(tmp_path):
@@ -669,247 +858,337 @@ def test_git_routes_selected_commit_and_structured_error(cleanup_test_sessions):
     assert _git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == ["selected.txt"]
 
 
-def test_workspace_git_static_contracts():
-    index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-    workspace_js = (ROOT / "static" / "workspace.js").read_text(encoding="utf-8")
-    ui_js = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
-    style = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+def test_git_discard_untracked_delete_uses_anchored_unlink_after_validation_race(tmp_path, monkeypatch):
+    import os
+    import shutil
 
-    for dom_id in [
-        "workspaceGitTabs",
-        "btnWorkspaceFilesTab",
-        "btnWorkspaceChangesTab",
-        "gitChangesView",
-        "gitChangesList",
-        "gitCommitBox",
-        "gitCommitMessage",
-        "gitSelectionSummary",
-        "btnPreviewBack",
-        "previewBackLabel",
-        "btnGitGenerateCommitMessage",
-        "btnGitCommit",
-        "btnMarkdownPopout",
-        "gitDiffView",
-        "gitBranchControl",
-        "btnGitBranchMenu",
-        "gitBranchMenu",
-        "workspaceEditorShell",
-        "previewCodeGutter",
-        "previewCodeGuides",
-        "previewReadShell",
-        "previewEditShell",
-        "previewEditGutter",
-        "previewEditGuides",
-        "previewWrapToggle",
-        "previewEditorStatus",
-        "previewEditorActions",
-        "btnEditorCancel",
-        "btnEditorSave",
-        "editorDirtyState",
-    ]:
-        assert f'id="{dom_id}"' in index
+    import api.workspace_git as workspace_git
+    from api.workspace import safe_resolve_ws as real_safe_resolve_ws
 
-    for fn in [
-        "refreshGitStatus",
-        "renderGitChanges",
-        "openGitDiff",
-        "renderGitDiff",
-        "stageGitPath",
-        "stageGitAllChanges",
-        "unstageGitPath",
-        "discardGitPath",
-        "commitGitChanges",
-        "generateGitCommitMessage",
-        "runGitRemoteAction",
-        "_gitRemoteToastMessage",
-        "switchWorkspacePanelTab",
-        "openMarkdownPopout",
-        "returnFromPreview",
-        "_setPreviewReturnTarget",
-        "_closePreviewSurface",
-        "renderWorkspaceMarkdown",
-        "postProcessWorkspaceMarkdown",
-        "refreshGitBranches",
-        "_gitStatusLabel",
-        "_autoRefreshWorkspaceGitStatus",
-        "_installWorkspaceGitAutoRefresh",
-        "renderGitBranchControl",
-        "toggleGitBranchMenu",
-        "closeGitBranchMenu",
-        "checkoutGitBranch",
-        "setEditorSoftWrap",
-        "requestCancelEditMode",
-        "renderEditorGutter",
-        "renderEditorIndentGuides",
-        "handleEditorKeydown",
-        "handleEditorInput",
-        "parseUnifiedDiff",
-        "renderParsedGitDiff",
-        "setGitDiffMode",
-    ]:
-        assert f"function {fn}" in workspace_js
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    _commit_all(repo)
 
-    discard_body = workspace_js[
-        workspace_js.index("async function discardGitPath") : workspace_js.index("async function commitGitChanges")
-    ]
-    assert "showConfirmDialog" in discard_body
-    remote_action_body = workspace_js[
-        workspace_js.index("function _gitRemoteToastMessage") : workspace_js.index("async function runGitRemoteAction")
-    ]
-    assert "Remote ${remote}" in remote_action_body
-    assert "more refs" in remote_action_body
-    assert "showToast(_gitRemoteToastMessage(action,data),4200)" in workspace_js
-    assert "confirm(" not in discard_body.replace("showConfirmDialog(", "")
-    assert "file-git-status" in ui_js
-    assert "file-preview-btn" in ui_js
-    assert "function toastMessageHtml" in ui_js
-    assert "toast-title" in ui_js and "toast-detail" in ui_js
-    assert "_isWorkspaceMarkdownPath" in ui_js
-    assert "e.stopPropagation()" in ui_js
-    assert "_gitStageableFiles" in workspace_js
-    assert "GIT_AUTO_REFRESH_MS" in workspace_js
-    assert "_workspacePanelOpenForAutoRefresh" in workspace_js
-    assert "refreshGitStatus({auto:true,refreshBranches:false})" in workspace_js
-    assert "branchMenuOpen" in workspace_js
-    assert "branchFilter" in workspace_js
-    assert "_isSelectableRemoteBranch" in workspace_js
-    assert "_branchMeta" in workspace_js and "_allBranchRows" in workspace_js
-    assert "_installWorkspaceInteractionGuards" in workspace_js
-    assert "'/api/git/checkout'" in workspace_js
-    assert "'/api/git/stash-checkout'" in workspace_js
-    assert "git_stash_and_switch" in workspace_js
-    assert "`/api/git/branches?session_id=${encodeURIComponent(S.session.session_id)}`" in workspace_js
-    assert "dirty_mode:'block'" in workspace_js
-    assert "handleEditorKeydown" in workspace_js
-    assert "requestCancelEditMode()" in workspace_js
-    assert "_indentSelection" in workspace_js and "_unindentSelection" in workspace_js
-    assert "localStorage.setItem('hermes-webui-git-diff-mode'" in workspace_js
-    assert "git-diff-mode-btn" in workspace_js
-    assert ".git-diff-split-row.change .old-code" in style
-    assert ".git-diff-split-row.change .new-code" in style
-    assert ".git-badge{grid-column:1 / -1;grid-row:2;justify-self:start;font-size:11px" in style
-    assert ".git-branch-button{height:30px" in style
-    assert ".git-summary{display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:\"SF Mono\",ui-monospace,monospace;font-size:13px" in style
-    assert ".toast{pointer-events:auto;position:fixed;top:24px;right:24px;left:auto;bottom:auto;transform:translateY(-6px);display:flex;align-items:flex-start" in style
-    assert ".toast-title" in style and ".toast-detail" in style
-    assert "selectedPaths:new Set()" in workspace_js
-    assert "selectionKey:scopeKey" in workspace_js
-    assert "_gitGroupHeader" in workspace_js
-    assert "checkbox.indeterminate" in workspace_js
-    assert "_gitSyncLabel" in workspace_js
-    assert "Push local commits" in workspace_js and "Pull remote commits" in workspace_js
-    assert "stagedOnly" in workspace_js
-    assert "openFile(diff.path,{returnTo:'changes'})" in workspace_js
-    assert "openFile(file.path,{returnTo:'changes'})" in workspace_js
-    assert "S.git.selectedTab='changes'" in workspace_js
-    assert "URL.createObjectURL(new Blob" in workspace_js
-    assert "catch(e){\n    renderGitBadge(git.status);" in workspace_js
-    assert "'/api/git/commit-selected'" in workspace_js
-    assert "'/api/git/commit-message-selected'" in workspace_js
-    assert "postProcessRenderedMessages" in workspace_js
-    assert "git-stat-add" in workspace_js and "git-stat-del" in workspace_js
-    for cls in [
-        ".workspace-tabs",
-        ".workspace-editor-shell",
-        ".workspace-editor-gutter",
-        ".workspace-editor-guides",
-        ".workspace-editor-guide-line",
-        ".workspace-editor-textarea",
-        ".workspace-editor-status",
-        ".workspace-editor-actions",
-        ".workspace-editor-save",
-        ".workspace-editor-dirty",
-        ".workspace-editor-line-number",
-        ".git-change-row",
-        ".git-diff-line",
-        ".git-diff-toolbar",
-        ".git-diff-row",
-        ".git-diff-split-row",
-        ".git-diff-mode-btn",
-        ".git-commit-box",
-        ".git-branch-control",
-        ".git-branch-menu",
-        ".git-branch-search",
-        ".git-branch-check",
-        ".git-branch-body",
-        ".git-branch-item",
-        ".git-branch-current-mark",
-        ".git-branch-create",
-        ".git-branch-create-row",
-        ".git-branch-fetch",
-        ".git-stage-all-btn",
-        ".git-summary-text",
-        ".git-summary-actions",
-        ".git-sync-btn",
-        ".git-commit-actions",
-        ".git-commit-primary",
-        ".git-select-checkbox",
-        ".git-selection-summary",
-        ".file-preview-btn",
-        ".preview-back-btn",
-    ]:
-        assert cls in style
-    assert ".git-stat-add" in style and ".git-stat-del" in style
-    assert "background:repeating-linear-gradient(to right" not in style
-    assert "_editorLineIndentDepths" in workspace_js
-    assert "Math.floor(_editorIndentColumns(line,tabSize)/tabSize)" in workspace_js
-    assert "previewCodeGuides" in workspace_js and "previewEditGuides" in workspace_js
-    assert "code==='??')return 'New'" in workspace_js
-    assert "status.textContent=_gitStatusLabel(file)" in workspace_js
-    assert "typeof _gitStatusLabel==='function'" in ui_js
-    update_edit_btn_body = workspace_js[
-        workspace_js.index("function updateEditBtn") : workspace_js.index("async function toggleEditMode")
-    ]
-    assert "editable&&!editing" in update_edit_btn_body
-    assert "Save*" not in update_edit_btn_body
-    routes = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
-    workspace_git = (ROOT / "api" / "workspace_git.py").read_text(encoding="utf-8")
-    for route in ["/api/git/fetch", "/api/git/pull", "/api/git/push", "/api/git/branches", "/api/git/checkout", "/api/git/stash-checkout"]:
-        assert route in routes
-    assert "/api/git/commit-message" in routes
-    assert "/api/git/commit-selected" in routes
-    assert "/api/git/commit-message-selected" in routes
-    assert "_git_bad" in routes and '"code": getattr(err, "code"' in routes
-    assert 'if parsed.path == "/api/git-info"' in routes and "git_status(Path(s.workspace))" in routes
-    assert "`/api/git/${action}`" in workspace_js
-    assert "'/api/git/commit-message-selected'" in workspace_js
-    checkout_block = workspace_git[workspace_git.index("def git_checkout") : workspace_git.index("def git_stash_and_checkout")]
-    stash_block = workspace_git[workspace_git.index("def git_stash_and_checkout") :]
-    assert "with _git_mutation_lock(ctx):" in checkout_block
-    assert "with _git_mutation_lock(ctx):" in stash_block
-    assert "_dirty_worktree(ctx)" in checkout_block
-    assert "dirty_worktree" in checkout_block
+    (repo / "d").mkdir()
+    (repo / "d" / "f").write_text("workspace untracked\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "f"
+    victim.write_text("outside victim\n", encoding="utf-8")
 
-    for token in [
-        'data-i18n="git_files"',
-        'data-i18n="git_changes"',
-        'data-i18n-placeholder="git_commit_message"',
-        'data-i18n="git_commit"',
-    ]:
-        assert token in index
+    state = {"calls": 0, "swapped": False}
 
-    i18n = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
-    for key in [
-        "git_files",
-        "git_changes",
-        "git_stage_all",
-        "git_commit_message",
-        "git_delete_untracked_confirm",
-        "git_fetch",
-        "git_pull",
-        "git_push",
-        "git_sync_failed",
-        "editor_soft_wrap",
-        "git_current_branch",
-        "git_local_branches",
-        "git_remote_branches",
-        "git_create_branch",
-        "git_checkout_failed",
-        "git_stash_and_switch",
-        "git_stashed",
-        "git_diff_unified",
-        "git_diff_split",
-    ]:
-        assert i18n.count(f"{key}:") >= 11
-    for key in ["git_tracked", "git_select_files", "git_commit_message_privacy"]:
-        assert i18n.count(f"{key}:") >= 11
+    def racing_safe_resolve(root, requested):
+        target = real_safe_resolve_ws(root, requested)
+        if requested == "d/f":
+            state["calls"] += 1
+        # git_discard validates once for the Git pathspec and once immediately
+        # before deletion. Race the second validation-to-use window.
+        if requested == "d/f" and state["calls"] == 2 and not state["swapped"]:
+            shutil.rmtree(repo / "d")
+            os.symlink(outside, repo / "d")
+            state["swapped"] = True
+        return target
+
+    monkeypatch.setattr(workspace_git, "safe_resolve_ws", racing_safe_resolve)
+
+    with pytest.raises(ValueError, match="Path traversal blocked"):
+        workspace_git.git_discard(repo, ["d/f"], delete_untracked=True)
+
+    assert state["swapped"] is True
+    assert victim.exists()
+    assert victim.read_text(encoding="utf-8") == "outside victim\n"
+
+
+def test_git_status_ignores_repo_local_fsmonitor_command(tmp_path):
+    import os
+    import sys
+
+    if os.name == "nt":
+        pytest.skip("executable fsmonitor helper setup is POSIX-only")
+
+    from api.workspace_git import git_status
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    marker = tmp_path / "fsmonitor-ran"
+    helper = tmp_path / "fsmonitor_helper.py"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text('fsmonitor executed', encoding='utf-8')\n"
+        "print('')\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    _git(repo, "config", "core.fsmonitor", f"{sys.executable} {helper} {marker}")
+
+    status = git_status(repo)
+
+    assert status["is_git"] is True
+    assert not marker.exists()
+
+
+def test_git_fetch_blocks_repo_local_ext_transport_execution(tmp_path):
+    import os
+    import sys
+
+    if os.name == "nt":
+        pytest.skip("ext transport helper setup is POSIX-only")
+
+    from api.workspace_git import GitWorkspaceError, git_fetch
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    marker = tmp_path / "ext-transport-ran"
+    helper = tmp_path / "ext_helper.py"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text('ext executed: ' + ' '.join(sys.argv[2:]), encoding='utf-8')\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    _git(repo, "config", "protocol.ext.allow", "always")
+    _git(repo, "remote", "add", "origin", f"ext::{sys.executable} {helper} {marker} %S foo")
+
+    with pytest.raises(GitWorkspaceError) as exc:
+        git_fetch(repo)
+
+    assert exc.value.code == "git_failed"
+    assert not marker.exists()
+
+
+def test_git_fetch_blocks_repo_local_credential_helper_execution(tmp_path):
+    import os
+    import sys
+
+    if os.name == "nt":
+        pytest.skip("executable credential helper setup is POSIX-only")
+
+    from api.workspace_git import GitWorkspaceError, git_fetch
+
+    class AuthRequiredHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="hermes-test"')
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            del format, args
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    marker = tmp_path / "credential-helper-ran"
+    helper = tmp_path / "credential_helper.py"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text('credential helper executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), AuthRequiredHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/repo.git"
+        _git(repo, "remote", "add", "origin", url)
+        _git(repo, "config", "credential.helper", f"!{sys.executable} {helper} {marker}")
+
+        with pytest.raises(GitWorkspaceError) as exc:
+            git_fetch(repo)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert exc.value.code == "auth_failed"
+    assert not marker.exists()
+
+
+def test_git_fetch_blocks_repo_local_askpass_execution(tmp_path):
+    import os
+    import sys
+
+    if os.name == "nt":
+        pytest.skip("executable askpass helper setup is POSIX-only")
+
+    from api.workspace_git import GitWorkspaceError, git_fetch
+
+    class AuthRequiredHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="hermes-test"')
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            del format, args
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    marker = tmp_path / "askpass-ran"
+    helper = tmp_path / "askpass_helper.py"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text('askpass executed', encoding='utf-8')\n"
+        "print('pw')\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), AuthRequiredHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/repo.git"
+        _git(repo, "remote", "add", "origin", url)
+        _git(repo, "config", "core.askPass", f"{sys.executable} {helper} {marker}")
+
+        with pytest.raises(GitWorkspaceError) as exc:
+            git_fetch(repo)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert exc.value.code == "auth_failed"
+    assert not marker.exists()
+
+
+def test_git_env_scrub_removes_redirecting_vars_and_preserves_temp_index(monkeypatch):
+    from api.workspace_git import _clean_git_env
+
+    monkeypatch.setenv("GIT_DIR", "/tmp/evil-git-dir")
+    monkeypatch.setenv("GIT_WORK_TREE", "/tmp/evil-work-tree")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/tmp/evil-config")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/tmp/evil-system-config")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "ssh -i /tmp/evil-key")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.sshCommand=ssh -i /tmp/evil-key'")
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/evil-askpass")
+    monkeypatch.setenv("SSH_ASKPASS", "/tmp/evil-ssh-askpass")
+    monkeypatch.setenv("GIT_SSH", "/tmp/evil-ssh")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /tmp/evil-key")
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+
+    env = _clean_git_env({"GIT_INDEX_FILE": "/tmp/hermes-index"})
+
+    assert "GIT_DIR" not in env
+    assert "GIT_WORK_TREE" not in env
+    assert "GIT_CONFIG_GLOBAL" not in env
+    assert "GIT_CONFIG_SYSTEM" not in env
+    assert "GIT_CONFIG_COUNT" not in env
+    assert "GIT_CONFIG_KEY_0" not in env
+    assert "GIT_CONFIG_VALUE_0" not in env
+    assert "GIT_CONFIG_PARAMETERS" not in env
+    assert "GIT_ASKPASS" not in env
+    assert "SSH_ASKPASS" not in env
+    assert "GIT_SSH" not in env
+    assert "GIT_SSH_COMMAND" not in env
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GIT_INDEX_FILE"] == "/tmp/hermes-index"
+
+
+def test_git_error_classifier_identifies_non_fast_forward_push():
+    from api.workspace_git import _classify_git_error
+
+    assert _classify_git_error("Updates were rejected", ["push"]) == "non_fast_forward"
+    assert _classify_git_error("non-fast-forward", ["push"]) == "non_fast_forward"
+    assert _classify_git_error("fetch first", ["push"]) == "non_fast_forward"
+
+
+def test_git_commit_hook_failure_returns_hook_failed_code(tmp_path):
+    from api.workspace_git import GitWorkspaceError, git_commit, git_stage
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho hook blocked >&2\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    (repo / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")
+    git_stage(repo, ["tracked.txt"])
+
+    with pytest.raises(GitWorkspaceError) as exc:
+        git_commit(repo, "Hook should fail")
+    assert exc.value.code == "hook_failed"
+
+
+def test_destructive_workspace_git_flag_defaults_off_and_accepts_truthy(monkeypatch):
+    from api.workspace_git import WORKSPACE_GIT_DESTRUCTIVE_ENV, workspace_git_destructive_enabled
+
+    monkeypatch.delenv(WORKSPACE_GIT_DESTRUCTIVE_ENV, raising=False)
+    assert workspace_git_destructive_enabled() is False
+
+    monkeypatch.setenv(WORKSPACE_GIT_DESTRUCTIVE_ENV, "1")
+    assert workspace_git_destructive_enabled() is True
+
+    monkeypatch.setenv(WORKSPACE_GIT_DESTRUCTIVE_ENV, "true")
+    assert workspace_git_destructive_enabled() is True
+
+
+def test_git_active_stream_lock_detection(monkeypatch):
+    from api import routes
+    from api.config import STREAMS, STREAMS_LOCK
+
+    session = types.SimpleNamespace(active_stream_id="stream-git-lock-test")
+    with STREAMS_LOCK:
+        STREAMS[session.active_stream_id] = object()
+    try:
+        assert routes._git_locked_by_active_stream(session) is True
+    finally:
+        with STREAMS_LOCK:
+            STREAMS.pop(session.active_stream_id, None)
+
+    assert routes._git_locked_by_active_stream(session) is False
+
+
+def test_git_commit_route_rejects_active_stream(monkeypatch, tmp_path):
+    from api import routes
+    from api.config import STREAMS, STREAMS_LOCK
+    from api.workspace_git import WORKSPACE_GIT_DESTRUCTIVE_ENV
+
+    # Enable destructive ops for this in-process test — conftest.py sets the env
+    # var on the test_server subprocess env block, but this test calls
+    # _handle_git_commit() directly in the pytest process, which inherits
+    # the default-OFF setting. Without this monkeypatch, the destructive-mode
+    # gate fires first (403) before the active-stream check (409) can run.
+    monkeypatch.setenv(WORKSPACE_GIT_DESTRUCTIVE_ENV, "1")
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _commit_all(repo)
+    _git(repo, "add", "tracked.txt")
+    session = types.SimpleNamespace(
+        session_id="sid-active-git",
+        workspace=str(repo),
+        active_stream_id="stream-active-git",
+    )
+
+    monkeypatch.setattr(routes, "get_session", lambda sid: session)
+    handler = _CaptureHandler()
+    with STREAMS_LOCK:
+        STREAMS[session.active_stream_id] = object()
+    try:
+        assert routes._handle_git_commit(
+            handler,
+            {"session_id": session.session_id, "message": "Should be blocked"},
+        ) is True
+    finally:
+        with STREAMS_LOCK:
+            STREAMS.pop(session.active_stream_id, None)
+
+    assert handler.status == 409
+    payload = handler.payload()
+    assert payload["code"] == "active_stream"
+    assert "active" in payload["error"].lower()

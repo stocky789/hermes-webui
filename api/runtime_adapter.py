@@ -1,11 +1,13 @@
 """RuntimeAdapter seam for WebUI-owned run execution.
 
-This is the #1925 Slice 2 seam only.  The default WebUI chat path remains the
+This is the #1925 RuntimeAdapter seam.  The default WebUI chat path remains the
 legacy direct route; enabling ``HERMES_WEBUI_RUNTIME_ADAPTER=legacy-journal``
 routes through this protocol-translator facade over the same legacy execution
-path plus the Slice 1 run journal.  This module intentionally does not own
-AIAgent instances, cancellation flags, approval callbacks, clarify callbacks, or
-new long-lived queues.
+path plus the Slice 1 run journal.  Slice 4 adds a default-off runner-local
+selection point for tests and future runner backends, but live chat routes still
+stay on the legacy path until a separate route-wiring slice is reviewed.  This
+module intentionally does not own AIAgent instances, cancellation flags,
+approval callbacks, clarify callbacks, or new long-lived queues.
 """
 from __future__ import annotations
 
@@ -17,7 +19,12 @@ from typing import Any, Callable, Iterable, Literal, Protocol
 _RUNTIME_ADAPTER_ENV = "HERMES_WEBUI_RUNTIME_ADAPTER"
 _RUNTIME_ADAPTER_DIRECT = "legacy-direct"
 _RUNTIME_ADAPTER_JOURNAL = "legacy-journal"
-_VALID_RUNTIME_ADAPTER_MODES = {_RUNTIME_ADAPTER_DIRECT, _RUNTIME_ADAPTER_JOURNAL}
+_RUNTIME_ADAPTER_RUNNER_LOCAL = "runner-local"
+_VALID_RUNTIME_ADAPTER_MODES = {
+    _RUNTIME_ADAPTER_DIRECT,
+    _RUNTIME_ADAPTER_JOURNAL,
+    _RUNTIME_ADAPTER_RUNNER_LOCAL,
+}
 
 
 @dataclass(frozen=True)
@@ -106,6 +113,36 @@ def runtime_adapter_enabled(environ: dict[str, str] | None = None) -> bool:
     return runtime_adapter_mode(environ) == _RUNTIME_ADAPTER_JOURNAL
 
 
+def runtime_adapter_runner_enabled(environ: dict[str, str] | None = None) -> bool:
+    return runtime_adapter_mode(environ) == _RUNTIME_ADAPTER_RUNNER_LOCAL
+
+
+def build_runtime_adapter(
+    *,
+    environ: dict[str, str] | None = None,
+    legacy_adapter_factory: Callable[[], RuntimeAdapter] | None = None,
+    runner_client_factory: Callable[[], Any] | None = None,
+) -> RuntimeAdapter | None:
+    """Build the configured RuntimeAdapter without changing route behavior.
+
+    ``None`` means the safe default ``legacy-direct`` path should keep using the
+    existing direct route.  ``legacy-journal`` is opt-in and delegates to the
+    supplied legacy factory.  ``runner-local`` is also opt-in and only constructs
+    a ``RunnerRuntimeAdapter`` around an injected client; this function does not
+    create process-global runner state or wire live chat to the runner backend.
+    """
+    mode = runtime_adapter_mode(environ)
+    if mode == _RUNTIME_ADAPTER_DIRECT:
+        return None
+    if mode == _RUNTIME_ADAPTER_JOURNAL:
+        if legacy_adapter_factory is None:
+            raise NotImplementedError("legacy-journal mode requires a legacy adapter factory")
+        return legacy_adapter_factory()
+    if runner_client_factory is None:
+        raise NotImplementedError("runner-local mode requires a runner client factory")
+    return RunnerRuntimeAdapter(client=runner_client_factory())
+
+
 def _cursor_to_after_seq(cursor: str | None) -> int | None:
     if cursor in (None, ""):
         return None
@@ -142,6 +179,129 @@ def _active_control_result(value: Any) -> ControlResult:
         status="accepted" if accepted else "not-active",
         safe_message=None if accepted else "Legacy control did not accept the request.",
     )
+
+
+def _runner_unsupported_control(name: str) -> ControlResult:
+    return ControlResult(
+        False,
+        status="unsupported",
+        safe_message=f"{name} is not supported by this runner backend.",
+    )
+
+
+class RunnerRuntimeAdapter:
+    """Protocol-translator facade for a future runner/sidecar backend.
+
+    Slice 4 moves runtime ownership behind a runner boundary, but the WebUI
+    adapter must remain a translator.  This class deliberately delegates to an
+    injected client instead of owning process-local streams, cancellation flags,
+    approval queues, clarify queues, or cached agent instances itself.
+    """
+
+    def __init__(self, *, client: Any):
+        self._client = client
+
+    def start_run(self, request: StartRunRequest) -> RunStartResult:
+        start_run = getattr(self._client, "start_run", None)
+        if start_run is None:
+            raise NotImplementedError("RunnerRuntimeAdapter.start_run requires a runner client")
+        payload = start_run(request)
+        if isinstance(payload, RunStartResult):
+            return payload
+        payload = dict(payload or {})
+        run_id = str(payload.get("run_id") or payload.get("stream_id") or "")
+        stream_id = str(payload.get("stream_id") or run_id)
+        session_id = str(payload.get("session_id") or request.session_id)
+        active_controls = payload.get("active_controls")
+        if not isinstance(active_controls, list):
+            active_controls = []
+        return RunStartResult(
+            run_id=run_id,
+            session_id=session_id,
+            stream_id=stream_id,
+            status=str(payload.get("status") or "started"),
+            started_at=payload.get("started_at"),
+            cursor=payload.get("cursor"),
+            active_controls=active_controls,
+            payload=payload,
+        )
+
+    def observe_run(self, run_id: str, *, cursor: str | None = None) -> RunEventStream:
+        observe_run = getattr(self._client, "observe_run", None)
+        if observe_run is None:
+            return RunEventStream(run_id=run_id, events=[], cursor=cursor, last_event_id=None)
+        result = observe_run(run_id, cursor=cursor)
+        if isinstance(result, RunEventStream):
+            return result
+        payload = dict(result or {})
+        events = list(payload.get("events") or [])
+        last_event_id = payload.get("last_event_id") or (events[-1].get("event_id") if events else None)
+        next_cursor = payload.get("cursor")
+        if next_cursor is None and events:
+            next_cursor = str(events[-1].get("seq") or "")
+        return RunEventStream(
+            run_id=str(payload.get("run_id") or run_id),
+            events=events,
+            cursor=str(next_cursor) if next_cursor is not None else cursor,
+            last_event_id=last_event_id,
+        )
+
+    def get_run(self, run_id: str) -> RunStatus:
+        get_run = getattr(self._client, "get_run", None)
+        if get_run is None:
+            return RunStatus(run_id=run_id)
+        result = get_run(run_id)
+        if isinstance(result, RunStatus):
+            return result
+        payload = dict(result or {})
+        active_controls = payload.get("active_controls")
+        if not isinstance(active_controls, list):
+            active_controls = []
+        return RunStatus(
+            run_id=str(payload.get("run_id") or run_id),
+            session_id=str(payload.get("session_id") or "") or None,
+            status=str(payload.get("status") or "unknown"),
+            last_event_id=payload.get("last_event_id"),
+            terminal_state=payload.get("terminal_state"),
+            active_controls=active_controls,
+            pending_approval_id=payload.get("pending_approval_id"),
+            pending_clarify_id=payload.get("pending_clarify_id"),
+        )
+
+    def cancel_run(self, run_id: str) -> ControlResult:
+        cancel_run = getattr(self._client, "cancel_run", None)
+        if cancel_run is None:
+            return _runner_unsupported_control("Cancel")
+        return _active_control_result(cancel_run(run_id))
+
+    def respond_approval(self, run_id: str, approval_id: str, choice: str) -> ControlResult:
+        respond_approval = getattr(self._client, "respond_approval", None)
+        if respond_approval is None:
+            return _runner_unsupported_control("Approval")
+        return _active_control_result(respond_approval(run_id, approval_id, choice))
+
+    def respond_clarify(self, run_id: str, clarify_id: str, response: str) -> ControlResult:
+        respond_clarify = getattr(self._client, "respond_clarify", None)
+        if respond_clarify is None:
+            return _runner_unsupported_control("Clarify")
+        return _active_control_result(respond_clarify(run_id, clarify_id, response))
+
+    def queue_message(self, run_id: str, message: str, *, mode: str = "queue") -> ControlResult:
+        queue_message = getattr(self._client, "queue_message", None)
+        if queue_message is None:
+            return _runner_unsupported_control("Queue")
+        return _active_control_result(queue_message(run_id, message, mode=mode))
+
+    def update_goal(
+        self,
+        session_id: str,
+        action: Literal["set", "pause", "resume", "clear", "status", "edit"],
+        text: str = "",
+    ) -> ControlResult:
+        update_goal = getattr(self._client, "update_goal", None)
+        if update_goal is None:
+            return _runner_unsupported_control("Goal")
+        return _active_control_result(update_goal(session_id, action, text))
 
 
 class LegacyJournalRuntimeAdapter:

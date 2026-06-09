@@ -619,6 +619,54 @@ def test_new_conversation_shortcut_works_while_busy():
     )
 
 
+def test_mobile_titlebar_has_new_conversation_button():
+    """Mobile titlebar shows the New Conversation action and keeps it next to reload."""
+    header_match = re.search(
+        r'<header class="app-titlebar"[^>]*>(?P<body>.*?)</header>',
+        HTML,
+        re.S,
+    )
+    assert header_match, "app-titlebar header block missing"
+    header_html = header_match.group("body")
+
+    idx_btn = header_html.find('id="btnTitlebarNewChat"')
+    idx_reload = header_html.find('id="btnReload"')
+    idx_spacer = header_html.find('class="app-titlebar-spacer"')
+
+    assert idx_btn != -1, "titlebar mobile new chat button should exist"
+    assert idx_reload != -1, "titlebar reload button should remain present"
+    assert idx_spacer != -1, "titlebar spacer should remain present"
+    assert idx_spacer < idx_btn < idx_reload, (
+        "titlebar new chat button must sit left of the reload button on mobile"
+    )
+    assert "btnTitlebarNewChat" in header_html
+    assert "data-i18n-title=\"new_conversation\"" in header_html
+    assert "data-i18n-aria-label=\"new_conversation\"" in header_html
+    assert "aria-label=\"New conversation\"" in header_html
+    assert "title=\"New conversation\"" in header_html
+    assert "$('btnNewChat').click()" in header_html
+
+
+def test_titlebar_new_chat_button_mobile_visibility_css():
+    """Keep the titlebar new-chat control mobile-only and reuse reload button styling."""
+    base_rule = _declarations(_rule_body(CSS, ".app-titlebar-new-chat"))
+    assert base_rule.get("display") == "none", "app-titlebar new chat button must be hidden by default"
+    mobile_blocks = "".join(_max_width_media_blocks(640))
+    mobile_rule = _declarations(_rule_body(mobile_blocks, ".app-titlebar-new-chat"))
+    assert mobile_rule.get("display") == "inline-flex", (
+        "app-titlebar new chat button must be visible in mobile layout rules"
+    )
+    desktop_css = re.sub(
+        r"@media\(max-width:640px\).*",
+        "",
+        CSS,
+        flags=re.S,
+    )
+    assert ".app-titlebar-new-chat{display:inline-flex;}" not in desktop_css, (
+        "titlebar new chat button must not be exposed by desktop PWA/fullscreen rules"
+    )
+
+
 # ── Viewport and scroll safety ────────────────────────────────────────────────
 
 def test_body_overflow_hidden():
@@ -665,6 +713,11 @@ def test_100dvh_viewport_height():
         "style.css must use 100dvh for correct mobile viewport height (100vh hides content under address bar)"
 
 
+def test_viewport_disables_page_zoom_for_native_pwa_shell():
+    """Installed PWA launches should not rubber-band into browser-style page zoom."""
+    assert 'name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"' in HTML
+
+
 def test_pwa_safe_area_top_stays_scoped_to_installed_modes():
     """The PWA shell should not opt into cover-mode geometry for every browser surface."""
     assert 'viewport-fit=cover' not in HTML
@@ -676,7 +729,11 @@ def test_pwa_safe_area_top_stays_scoped_to_installed_modes():
 
 def test_titlebar_safe_area_top_uses_scoped_variable():
     """The titlebar must use the safe-area variable instead of direct env()."""
-    m = re.search(r'\.app-titlebar\{(?P<body>[^}]*)\}', CSS)
+    # Match the GLOBAL `.app-titlebar{...}` rule, not skin-scoped variants like
+    # `:root.dark[data-skin="neon"] .app-titlebar{...}` (#3164) which can appear
+    # earlier in the file. Require the selector to start the line (optionally
+    # indented) with no `[data-skin=` scope prefix.
+    m = re.search(r'(?m)^\s*\.app-titlebar\{(?P<body>[^}]*)\}', CSS)
     assert m, ".app-titlebar rule missing from style.css"
     rule = m.group("body")
     assert "padding-top:var(--app-titlebar-safe-top)" in rule, (
@@ -699,6 +756,20 @@ def test_safe_area_variables_available_for_pwa_shell():
     assert "padding:8px 10px 12px!important" in CSS, (
         "Phone composer should keep the proven pre-cover-mode padding contract"
     )
+
+
+def test_pwa_startup_classes_have_native_shell_affordances():
+    """The JS-startup fallback classes should mirror browser display-mode CSS.
+
+    iOS and embedded webviews do not always evaluate display-mode media queries
+    the same way as Chromium. pwa-startup.js adds classes early, so CSS should
+    provide the same native-feel affordances through those classes.
+    """
+    assert ".pwa-standalone" in CSS
+    assert ".pwa-standalone .app-titlebar-reload" in CSS
+    assert "overscroll-behavior:none" in CSS
+    assert ".pwa-offline .app-titlebar::after" in CSS
+    assert "pwa-title-resume" in CSS
 
 
 def test_composer_touch_target_size():
@@ -1091,13 +1162,21 @@ def test_mobile_composer_primary_controls_keep_touch_friendly_sizing():
     assert ctx_wrap.get("display") == "none!important", \
         "context indicator must not add a late-appearing composer-right slot on phones"
 
-    ctx_badge = _declarations(_rule_body(CSS, ".composer-mobile-ctx-badge"))
-    assert ctx_badge.get("position") == "absolute", \
-        "mobile context usage should be shown as a badge on the config button, not a separate slot"
-    assert ctx_badge.get("pointer-events") == "none", \
-        "mobile context badge must not shrink or steal the config button touch target"
-    assert 'id="composerMobileCtxBadge"' in HTML, \
-        "mobile context badge element must exist in the composer config button"
+    # #3062 replaced the old text badge (composerMobileCtxBadge / .composer-mobile-ctx-badge)
+    # with an SVG context-usage ring overlaid on the config button. The invariant is the
+    # same: the ring is a visual indicator hosted ON the 44px config button (whose sizing is
+    # asserted above), and it must not steal/shrink that touch target. The ring SVG is
+    # aria-hidden and uses currentColor; it carries no pointer events of its own.
+    assert 'id="composerMobileCtxRing"' in HTML, \
+        "mobile context-usage ring element must exist in the composer config button"
+    assert 'id="composerMobileCtxBadge"' not in HTML, \
+        "old text badge should be fully replaced by the ring, not left dangling"
+    # Locate the ring's markup and confirm it does not become an interactive/sized control
+    # that would compete with the config button's 44px target.
+    _ring_idx = HTML.find('id="composerMobileCtxRing"')
+    _ring_tag = HTML[HTML.rfind("<", 0, _ring_idx):HTML.find(">", _ring_idx) + 1]
+    assert "aria-hidden" in _ring_tag, \
+        "the context ring is decorative overlay — it must be aria-hidden so it doesn't steal the config button's role/touch target"
 
     icon_btn = _declarations(_rule_body(mobile_css, ".icon-btn"))
     assert icon_btn.get("min-width") == "44px", \
@@ -1186,6 +1265,24 @@ def test_mobile_enter_newline_uses_match_media():
     boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
     assert "matchMedia('(pointer:coarse)')" in boot_js or 'matchMedia("(pointer:coarse)")' in boot_js, \
         "boot.js must use matchMedia('(pointer:coarse)') for mobile detection"
+
+
+def test_mobile_enter_newline_checks_virtual_keyboard_viewport():
+    """Touch devices should only force newline while the software keyboard is likely open."""
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    assert "function _isVirtualKeyboardLikelyOpen()" in boot_js, \
+        "boot.js must isolate the software-keyboard viewport heuristic"
+    assert "window.visualViewport" in boot_js and "window.innerHeight-vv.height>120" in boot_js, \
+        "software-keyboard detection must compare visualViewport height against window.innerHeight"
+    assert "&&_isVirtualKeyboardLikelyOpen()" in boot_js, \
+        "mobile Enter newline override must not apply when a hardware keyboard leaves the viewport unshrunk"
+
+
+def test_mobile_enter_newline_preserves_legacy_fallback_without_visual_viewport():
+    """Browsers without visualViewport should keep the previous touch Enter=newline behavior."""
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    assert "if(!vv||!window.innerHeight)return true;" in boot_js, \
+        "missing visualViewport support must preserve the legacy touch-primary newline fallback"
 
 
 def test_mobile_enter_newline_only_overrides_enter_default():

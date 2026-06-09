@@ -98,6 +98,7 @@ class TestClarifyCardHTML:
         assert 'id="clarifyChoices"' in html, "clarify choices container missing"
         assert 'id="clarifyInput"' in html, "clarify input missing"
         assert 'id="clarifySubmit"' in html, "clarify submit button missing"
+        assert 'id="clarifyCollapse"' in html, "clarify collapse button missing"
 
     def test_clarify_card_has_data_i18n(self):
         html = read(REPO / "static/index.html")
@@ -167,7 +168,9 @@ class TestClarifyCardCSS:
             ".clarify-response",
             ".clarify-input",
             ".clarify-submit",
+            ".clarify-collapse",
             ".clarify-hint",
+            ".clarify-card.collapsed",
         ):
             assert cls in css, f"CSS class '{cls}' missing"
 
@@ -316,6 +319,13 @@ class TestClarifyMessagesJS:
         src = read(REPO / "static/messages.js")
         for token in ("startClarifyPolling", "stopClarifyPolling", "hideClarifyCard", "_clarifySessionId"):
             assert token in src, f"{token} missing from messages.js"
+
+    def test_clarify_card_can_collapse_without_hiding_prompt(self):
+        src = read(REPO / "static/messages.js")
+        assert "function toggleClarifyCardCollapsed" in src, "clarify collapse toggle missing"
+        assert "aria-expanded" in src, "clarify collapse button should expose expanded state"
+        assert "card.classList.remove(\"collapsed\")" in src, \
+            "new clarification prompts should reopen rather than stay collapsed"
 
 
 # ── boot.js keyboard shortcut ────────────────────────────────────────────────
@@ -598,6 +608,17 @@ class TestClarifyCardTimerLogic:
         assert '\\n\\n${draft}' in body, \
             'preserved clarify drafts should be separated from existing composer text'
 
+    def test_stash_clarify_draft_skips_while_submit_in_flight(self):
+        src = self._get_js().read_text()
+        m = re.search(r'function _stashClarifyDraft.*?(?=\nfunction |\nasync function |\Z)',
+                      src, re.DOTALL)
+        assert m, '_stashClarifyDraft function not found'
+        body = m.group(0)
+        assert 'classList.contains("loading")' in body, \
+            'must not stash draft while a clarify submit is in flight (#3651)'
+        assert body.index('classList.contains("loading")') < body.index('clarifyInput'), \
+            'loading guard must short-circuit before reading the draft'
+
     def test_cancel_stream_does_not_preserve_clarify_draft(self):
         src = self._get_js().read_text()
         m = re.search(r"source\.addEventListener\('cancel'.*?\n    \}\);",
@@ -617,17 +638,26 @@ class TestClarifyCardTimerLogic:
         assert any(prop in body for prop in ('box-shadow', 'outline', 'border', 'text-decoration')), \
             'urgent countdown styling must include a non-color visual cue'
 
-    def test_respond_clarify_calls_hide_with_force(self):
+    def test_respond_clarify_sends_clarify_id_and_waits_for_ack(self):
         src = self._get_js().read_text()
         import re
         m = re.search(r'async function respondClarify.*?(?=\nasync function|\nfunction |\Z)',
                       src, re.DOTALL)
         assert m, 'respondClarify function not found'
         body = m.group(0)
+        assert 'clarify_id' in body, \
+            'respondClarify must send clarify_id to the backend for stable matching (issue #2639)'
         assert 'hideClarifyCard(true' in body, \
-            'respondClarify must call hideClarifyCard(true) so card hides immediately after user clicks'
+            'respondClarify must still hide the card on successful acknowledgement'
         assert "'sent'" in body, \
             'respondClarify must mark user-submitted hides so drafts are not re-stashed'
+        assert 'result && result.ok' in body, \
+            'respondClarify must check ok before hiding the clarify card (issue #2639)'
+        # The card must NOT be hidden before the API call — it should wait for the response.
+        hide_idx = body.index('hideClarifyCard(true')
+        api_idx = body.index('/api/clarify/respond')
+        assert hide_idx > api_idx, \
+            'respondClarify must wait for the API response before calling hideClarifyCard (issue #2639)'
 
     def test_clarify_poll_loop_uses_no_force(self):
         src = self._get_js().read_text()
@@ -645,3 +675,5 @@ class TestClarifyCardTimerLogic:
         body = m.group(0)
         assert 'JSON.stringify' in body, 'showClarifyCard must compute a signature via JSON.stringify'
         assert '_clarifySignature' in body, 'showClarifyCard must check/set _clarifySignature'
+        assert 'clarify_id: pending.clarify_id || null' in body, \
+            'showClarifyCard signature must include clarify_id so a newly queued identical prompt is not mistaken for the previous one'

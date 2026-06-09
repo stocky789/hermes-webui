@@ -18,6 +18,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -74,6 +75,63 @@ os.environ['HERMES_BASE_HOME'] = str(TEST_STATE_DIR)
 # tests that read/write config.yaml stay inside the isolated test home.
 os.environ['HERMES_CONFIG_PATH'] = str(TEST_STATE_DIR / 'config.yaml')
 
+
+@pytest.fixture(autouse=True)
+def _isolate_hermes_config_path():
+    """Keep profile/.env side effects from leaking the live config path across tests."""
+    isolated_config_path = str(TEST_STATE_DIR / 'config.yaml')
+    os.environ['HERMES_CONFIG_PATH'] = isolated_config_path
+    yield
+    os.environ['HERMES_CONFIG_PATH'] = isolated_config_path
+
+
+@pytest.fixture(autouse=True)
+def _restore_profile_home_globals():
+    """Restore HERMES_HOME / HERMES_BASE_HOME after every test.
+
+    Several tests call ``api.profiles.switch_profile()`` (or set HERMES_HOME
+    directly) which mutates ``os.environ['HERMES_HOME']`` IN PLACE — not via
+    monkeypatch — so the change is not auto-reverted at test teardown. In the
+    normal sequential run the next test usually re-establishes its own profile so
+    the leak is masked, but under pytest-shard (or pytest-randomly) the leaked
+    HERMES_HOME points at a deleted tmpdir and breaks any later test whose
+    config/profile resolution reads it (e.g. test_title_aux_routing's
+    background-worker profile routing, which then falls back to DEFAULT_CONFIG
+    where ``model`` is an empty string). Snapshotting at the conftest level fixes
+    the whole class at once, regardless of which test does the leaking.
+    """
+    saved_home = os.environ.get('HERMES_HOME')
+    saved_base = os.environ.get('HERMES_BASE_HOME')
+    # Re-derive the cached base-home global BEFORE the test runs too: a prior
+    # test's teardown ordering (monkeypatch restoring sys.modules['api.profiles']
+    # after this fixture's teardown) can leave the live module's
+    # _DEFAULT_HERMES_HOME stale. Fixing it at setup time guarantees each test
+    # starts from a base root that matches the current (restored) env.
+    _rederive_default_hermes_home()
+    yield
+    for key, val in (('HERMES_HOME', saved_home), ('HERMES_BASE_HOME', saved_base)):
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+    _rederive_default_hermes_home()
+
+
+def _rederive_default_hermes_home():
+    """Recompute api.profiles._DEFAULT_HERMES_HOME from the current env.
+
+    api.profiles caches the base home at import time. A test that re-imports
+    api.profiles under a temporary HERMES_BASE_HOME (e.g. test_profile_env_isolation)
+    corrupts that global to a now-deleted tmpdir, making get_hermes_home_for_profile
+    resolve later tests' profiles under the dead path. Re-deriving keeps it honest.
+    """
+    prof_mod = sys.modules.get('api.profiles')
+    if prof_mod is not None and hasattr(prof_mod, '_resolve_base_hermes_home'):
+        try:
+            prof_mod._DEFAULT_HERMES_HOME = prof_mod._resolve_base_hermes_home()
+        except Exception:
+            pass
+
 # ── Server script: always relative to repo root ───────────────────────────
 SERVER_SCRIPT = REPO_ROOT / 'server.py'
 if not SERVER_SCRIPT.exists():
@@ -104,12 +162,15 @@ def _discover_python(agent_dir) -> str:
     if os.getenv('HERMES_WEBUI_PYTHON'):
         return os.getenv('HERMES_WEBUI_PYTHON')
     if agent_dir:
-        venv_py = agent_dir / 'venv' / 'bin' / 'python'
-        if venv_py.exists():
-            return str(venv_py)
-    local_venv = REPO_ROOT / '.venv' / 'bin' / 'python'
-    if local_venv.exists():
-        return str(local_venv)
+        for venv_dir in ('venv', '.venv'):
+            for subdir, binary in (('bin', 'python'), ('Scripts', 'python.exe')):
+                venv_py = agent_dir / venv_dir / subdir / binary
+                if venv_py.exists():
+                    return str(venv_py)
+    for subdir, binary in (('bin', 'python'), ('Scripts', 'python.exe')):
+        local_venv = REPO_ROOT / '.venv' / subdir / binary
+        if local_venv.exists():
+            return str(local_venv)
     return shutil.which('python3') or shutil.which('python') or 'python3'
 
 HERMES_AGENT = _discover_agent_dir()
@@ -378,6 +439,11 @@ def pytest_collection_modifyitems(config, items):
         'test_cron_update_unknown_job_404',
         'test_cron_delete_unknown_404',
         'test_crons_output_limit_param',
+        'test_delivery_options_returns_200',
+        'test_delivery_options_has_platforms',
+        'test_delivery_options_structure',
+        'test_delivery_options_includes_common_platforms',
+        'test_delivery_options_local_label',
         # Skills endpoints (need tools.skills_tool module)
         'test_skills_list',
         'test_skills_list_has_required_fields',
@@ -428,16 +494,66 @@ def _post(base, path, body=None):
             return {}
 
 
-def _wait_for_server(base, timeout=20):
+def _wait_for_server(base, timeout=45, proc=None, log_path=None):
+    """Poll ``base/health`` until the server reports ready, or fail fast.
+
+    Returns ``(True, "")`` once ``/health`` returns ``status == "ok"``.
+
+    Returns ``(False, reason)`` when the server does not come up. ``reason`` is a
+    human-readable diagnostic that, crucially, includes WHY when we can tell:
+
+    * If ``proc`` is supplied and the subprocess has already exited, we stop
+      polling immediately (no point waiting out the full timeout for a process
+      that is already dead) and surface its exit code.
+    * If ``log_path`` is supplied, the tail of the captured server stdout/stderr
+      is included so an import error / bind failure / traceback is visible
+      instead of a bare "did not start" message.
+
+    The previous implementation polled for the whole timeout regardless of
+    whether the process had died, and the server's output was discarded to
+    ``DEVNULL`` — so a boot failure produced a generic timeout with no clue as
+    to the cause, and every HTTP-dependent test then cascaded with
+    ConnectionRefused. Capturing output + early-exit detection turns that opaque
+    cascade into a single actionable failure.
+    """
     deadline = time.time() + timeout
+    last_err = "no successful /health response"
     while time.time() < deadline:
+        # Fail fast if the server subprocess has already died — don't wait out
+        # the full timeout polling a port nothing is listening on.
+        if proc is not None and proc.poll() is not None:
+            return False, _server_boot_diagnostic(
+                f"server process exited early with code {proc.returncode}",
+                log_path,
+            )
         try:
             with urllib.request.urlopen(base + "/health", timeout=2) as r:
                 if json.loads(r.read()).get("status") == "ok":
-                    return True
-        except Exception:
+                    return True, ""
+                last_err = "/health responded but status != 'ok'"
+        except Exception as e:  # noqa: BLE001 — diagnostic capture, re-raised as text
+            last_err = f"{type(e).__name__}: {e}"
             time.sleep(0.3)
-    return False
+    return False, _server_boot_diagnostic(
+        f"timed out after {timeout}s waiting for /health (last: {last_err})",
+        log_path,
+    )
+
+
+def _server_boot_diagnostic(headline, log_path):
+    """Build a boot-failure message, appending the captured server log tail."""
+    parts = [headline]
+    if log_path is not None:
+        try:
+            text = pathlib.Path(log_path).read_text(encoding="utf-8", errors="replace")
+            tail = "".join(text.splitlines(keepends=True)[-40:]).strip()
+            if tail:
+                parts.append("---- server output (last 40 lines) ----\n" + tail)
+            else:
+                parts.append("(server produced no output)")
+        except Exception as e:  # noqa: BLE001
+            parts.append(f"(could not read server log {log_path}: {e})")
+    return "\n".join(parts)
 
 
 # ── Session-scoped test server ────────────────────────────────────────────────
@@ -536,6 +652,12 @@ def test_server():
     # pytest-side block can't see.
     env["HERMES_WEBUI_TEST_NETWORK_BLOCK"] = "1"
     env.update({
+        "HERMES_WEBUI_WORKSPACE_GIT_DESTRUCTIVE": "1",
+        # Small archive-extraction cap so the zip-bomb guard is exercisable
+        # against the out-of-process test server (the real 10x-upload default is
+        # ~200MB — impractical to exceed in a test). 5MB is far above any other
+        # test's archive payload, so only the bomb test trips it.
+        "HERMES_WEBUI_MAX_EXTRACTED_MB":  "5",
         "HERMES_WEBUI_PORT":              str(TEST_PORT),
         "HERMES_WEBUI_HOST":              "127.0.0.1",
         "HERMES_WEBUI_STATE_DIR":         str(TEST_STATE_DIR),
@@ -558,22 +680,60 @@ def test_server():
     if HERMES_AGENT:
         env["HERMES_WEBUI_AGENT_DIR"] = str(HERMES_AGENT)
 
-    proc = subprocess.Popen(
-        [VENV_PYTHON, str(SERVER_SCRIPT)],
-        cwd=WORKDIR,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # Capture server stdout/stderr to a temp log instead of DEVNULL so a boot
+    # failure (import error, port-bind race, traceback) is diagnosable. Without
+    # this, _wait_for_server could only report a bare "did not start" timeout
+    # and every HTTP-dependent test then cascaded with ConnectionRefused —
+    # hundreds of opaque failures from a single root cause.
+    import tempfile as _tempfile
+    _server_log = pathlib.Path(_tempfile.gettempdir()) / f"hermes-webui-test-server-{TEST_PORT}.log"
 
-    if not _wait_for_server(TEST_BASE, timeout=20):
-        proc.kill()
+    # Boot the server, retrying once if it dies early or fails to bind. Boot
+    # failures here are most often transient (a port not yet released by a prior
+    # session, a momentary import hiccup under load), so one clean retry with a
+    # fresh port-kill turns an intermittent cascade into a reliable start.
+    proc = None
+    boot_attempts = 2
+    last_reason = ""
+    for _attempt in range(1, boot_attempts + 1):
+        with open(_server_log, "w", encoding="utf-8") as _logf:
+            proc = subprocess.Popen(
+                [VENV_PYTHON, str(SERVER_SCRIPT)],
+                cwd=WORKDIR,
+                env=env,
+                stdout=_logf,
+                stderr=subprocess.STDOUT,
+                **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+            )
+        # 45s (up from 20s): server.py imports the full hermes-agent, which is
+        # import-heavy and can exceed 20s on a loaded runner — the old timeout
+        # turned a slow-but-fine boot into a whole-suite failure.
+        ok, reason = _wait_for_server(TEST_BASE, timeout=45, proc=proc, log_path=_server_log)
+        if ok:
+            break
+        last_reason = reason
+        # Tear down the failed attempt and free the port before retrying.
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        if _attempt < boot_attempts:
+            try:
+                import subprocess as _sp2
+                _sp2.run(['fuser', '-k', f'{TEST_PORT}/tcp'], capture_output=True, timeout=5)
+            except Exception:
+                pass
+            time.sleep(1.0)
+    else:
         pytest.fail(
-            f"Test server on port {TEST_PORT} did not start within 20s.\n"
+            f"Test server on port {TEST_PORT} did not start after {boot_attempts} attempts.\n"
+            f"  reason    : {last_reason}\n"
             f"  server.py : {SERVER_SCRIPT}\n"
             f"  python    : {VENV_PYTHON}\n"
             f"  agent dir : {HERMES_AGENT}\n"
             f"  workdir   : {WORKDIR}\n"
+            f"  log       : {_server_log}\n"
         )
 
     yield proc

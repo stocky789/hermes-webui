@@ -337,7 +337,7 @@ class TestIssue765FollowupHardening:
             "with _agent_lock:\n"
             "                if not ephemeral and not _stream_writeback_is_current(s, stream_id):"
         )
-        save_idx = src.find("s.context_messages = _next_context_messages")
+        save_idx = src.find("_deduplicate_context_messages(_next_context_messages)")
 
         assert stop_idx != -1, "Success path must stop the checkpoint thread"
         assert join_idx != -1, "Success path must join the checkpoint thread"
@@ -360,7 +360,9 @@ class TestIssue765FollowupHardening:
             "with _agent_lock:\n"
             "                if not ephemeral and not _stream_writeback_is_current(s, stream_id):"
         )
-        silent_failure_idx = src.find("if not _assistant_added and not _token_sent:")
+        silent_failure_idx = src.find(
+            "if _terminal_failure or (not _assistant_added and not _token_sent):"
+        )
         inner_lock_idx = src.find("with _agent_lock:", outer_lock_idx + 1)
         compression_idx = src.find("# ── Handle context compression side effects ──")
 
@@ -465,14 +467,17 @@ class TestIssue765FollowupHardening:
         )
         fn_idx = src.find("def _run_background_title_update(")
         assert fn_idx != -1, "_run_background_title_update not found"
-        fn_block = src[fn_idx:fn_idx + 3200]
+        fn_block = src[fn_idx:fn_idx + 4200]
         assert "with LOCK:" in fn_block, (
             "_run_background_title_update must acquire LOCK before rebinding "
             "to canonical cached session instance"
         )
-        assert "s = SESSIONS.get(session_id, s)" in fn_block, (
-            "_run_background_title_update must rebind to canonical cached "
-            "session instance under LOCK"
+        assert "cached_session = SESSIONS.get(session_id)" in fn_block, (
+            "_run_background_title_update must read the cached session under LOCK"
+        )
+        assert "getattr(cached_session, 'session_id', None) == session_id" in fn_block, (
+            "_run_background_title_update must only rebind to a canonical cached "
+            "session instance whose id matches the requested session"
         )
 
     def test_cancel_stream_uses_agent_lock(self):

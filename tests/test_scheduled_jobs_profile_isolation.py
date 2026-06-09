@@ -199,6 +199,17 @@ def test_cron_run_does_not_silently_swallow_profile_resolution_errors():
     )
 
 
+def test_manual_cron_event_profile_uses_job_profile(monkeypatch):
+    from api import routes
+
+    monkeypatch.setattr(routes, "_available_cron_profile_names", lambda: {"default", "research"})
+
+    assert routes._event_profile_for_cron_job({"profile": "research"}) == "research"
+    assert routes._event_profile_for_cron_job({"profile": " default "}) == "default"
+    assert routes._event_profile_for_cron_job({"profile": ""}) is None
+    assert routes._event_profile_for_cron_job({"profile": "deleted"}) is None
+
+
 def test_webui_installs_profile_context_on_in_process_scheduler_run_job(tmp_path, monkeypatch):
     """If WebUI ever runs cron.scheduler.tick in-process, scheduled run_job calls
     must execute under the job's selected profile home, not the process-global
@@ -234,6 +245,7 @@ def test_webui_installs_profile_context_on_in_process_scheduler_run_job(tmp_path
     monkeypatch.setitem(sys.modules, "cron.scheduler", cron_scheduler)
     monkeypatch.setattr(p, "_DEFAULT_HERMES_HOME", default_home)
     monkeypatch.setattr(p, "cron_profile_context_for_home", Ctx)
+    monkeypatch.setattr(p, "publish_session_list_changed", lambda reason: events.append(("publish", reason)))
 
     p.install_cron_scheduler_profile_isolation()
 
@@ -242,6 +254,7 @@ def test_webui_installs_profile_context_on_in_process_scheduler_run_job(tmp_path
         ("enter", str(research_home)),
         ("run", "job1575"),
         ("exit", str(research_home)),
+        ("publish", "cron_complete"),
     ]
 
 
@@ -279,6 +292,7 @@ def test_scheduler_run_job_wrapper_does_not_reenter_manual_cron_context(tmp_path
     monkeypatch.setitem(sys.modules, "cron.scheduler", cron_scheduler)
     monkeypatch.setattr(p, "_DEFAULT_HERMES_HOME", tmp_path / "home")
     monkeypatch.setattr(p, "cron_profile_context_for_home", Ctx)
+    monkeypatch.setattr(p, "publish_session_list_changed", lambda reason: events.append(("unexpected-publish", reason)))
     monkeypatch.setattr(p._tls, "cron_profile_depth", 1, raising=False)
 
     p.install_cron_scheduler_profile_isolation()

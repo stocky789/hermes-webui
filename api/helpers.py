@@ -2,10 +2,26 @@
 Hermes Web UI -- HTTP helper functions.
 """
 import json as _json
+import logging
 import os
 import re as _re
+import ssl
 from pathlib import Path
 from api.config import IMAGE_EXTS, MD_EXTS
+
+logger = logging.getLogger(__name__)
+
+
+# Treat stalled/closed HTTP clients as normal disconnects.  Long-lived SSE
+# connections often end this way when a browser tab sleeps, a phone switches
+# networks, or Tailscale leaves the socket half-closed.
+_CLIENT_DISCONNECT_ERRORS = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    TimeoutError,
+    ssl.SSLError,
+)
 
 
 def require(body: dict, *fields) -> None:
@@ -36,20 +52,81 @@ def safe_resolve(root: Path, requested: str) -> Path:
     return resolved
 
 
+_CSP_CONNECT_BASE = (
+    "'self' http://127.0.0.1:* http://localhost:* "
+    "ws://127.0.0.1:* ws://localhost:*"
+)
+_CSP_EXTRA_CONNECT_RE = _re.compile(
+    r"^(?:https?|wss?)://(?:\*\.)?[A-Za-z0-9._~-]+(?::(?P<port>\d{1,5}|\*))?$"
+)
+_CSP_HEADER_NAME = 'Content-Security-Policy'
+_CSP_SHARED_POLICY_TEMPLATE = (
+    "default-src 'self' https://*.cloudflareaccess.com; "
+    "object-src 'none'; "
+    "frame-ancestors 'none'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com blob:; "
+    "worker-src blob: 'self' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+    "img-src 'self' data: https: blob:; "
+    "font-src 'self' data: https://fonts.gstatic.com; "
+    "media-src 'self' data: blob:; "
+    "connect-src {connect_src}; "
+    "manifest-src 'self' https://*.cloudflareaccess.com; "
+    "base-uri 'self'; form-action 'self'"
+)
+
+
+def _valid_csp_extra_connect_source(source: str) -> bool:
+    match = _CSP_EXTRA_CONNECT_RE.fullmatch(source)
+    if not match:
+        return False
+    port = match.group("port")
+    if not port or port == "*":
+        return True
+    try:
+        return 1 <= int(port) <= 65535
+    except ValueError:
+        return False
+
+
+def _csp_extra_connect_src() -> str:
+    raw = os.getenv("HERMES_WEBUI_CSP_CONNECT_EXTRA", "").strip()
+    if not raw:
+        return ""
+    sources = raw.split()
+    if not sources or any(not _valid_csp_extra_connect_source(src) for src in sources):
+        logger.warning("Ignoring invalid HERMES_WEBUI_CSP_CONNECT_EXTRA value")
+        return ""
+    return " " + " ".join(sources)
+
+
+def _csp_connect_src(extra_connect_src: str = "") -> str:
+    return f"{_CSP_CONNECT_BASE} https://cdn.jsdelivr.net{extra_connect_src}"
+
+
+def _build_csp_enforced_policy(extra_connect_src: str | None = None) -> str:
+    if extra_connect_src is None:
+        extra_connect_src = _csp_extra_connect_src()
+    return _CSP_SHARED_POLICY_TEMPLATE.format(
+        connect_src=_csp_connect_src(extra_connect_src)
+    )
+
+
+def _build_csp_report_only_policy(extra_connect_src: str | None = None) -> str:
+    return (
+        _build_csp_enforced_policy(extra_connect_src)
+        + "; report-uri /api/csp-report; report-to csp-endpoint"
+    )
+
+
 def _security_headers(handler):
     """Add security headers to every response."""
+    extra_connect_src = _csp_extra_connect_src()
+    handler._csp_extra_connect_src = extra_connect_src
     handler.send_header('X-Content-Type-Options', 'nosniff')
     handler.send_header('X-Frame-Options', 'DENY')
     handler.send_header('Referrer-Policy', 'same-origin')
-    handler.send_header(
-        'Content-Security-Policy',
-        "default-src 'self' https://*.cloudflareaccess.com; "
-        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; "
-        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
-        "img-src 'self' data: https: blob:; font-src 'self' data: https://cdn.jsdelivr.net https://fonts.gstatic.com; connect-src 'self' https://cdn.jsdelivr.net; "
-        "manifest-src 'self' https://*.cloudflareaccess.com; "
-        "base-uri 'self'; form-action 'self'"
-    )
+    handler.send_header(_CSP_HEADER_NAME, _build_csp_enforced_policy(extra_connect_src))
     handler.send_header(
         'Permissions-Policy',
         'camera=(), microphone=(self), geolocation=(), clipboard-write=(self)'
@@ -63,6 +140,25 @@ def _accepts_gzip(handler) -> bool:
         return False
     ae = headers.get('Accept-Encoding', '')
     return 'gzip' in ae
+
+
+def _safe_write(handler, body: bytes) -> None:
+    """Write response body, ignoring expected client disconnect errors.
+
+    Logs disconnects at debug level so they are observable without
+    polluting stdout/stderr during normal operation (SSE reconnects,
+    tab closes, mobile network switches, etc.).
+    """
+    try:
+        handler.end_headers()
+        handler.wfile.write(body)
+    except _CLIENT_DISCONNECT_ERRORS as exc:
+        import logging
+        logging.getLogger("hermes.webui").debug(
+            "Client disconnected mid-response (%s): %s",
+            type(exc).__name__,
+            getattr(handler, "path", "?"),
+        )
 
 
 def j(handler, payload, status: int=200, extra_headers: dict=None) -> None:
@@ -89,8 +185,7 @@ def j(handler, payload, status: int=200, extra_headers: dict=None) -> None:
     if extra_headers:
         for k, v in extra_headers.items():
             handler.send_header(k, v)
-    handler.end_headers()
-    handler.wfile.write(body)
+    _safe_write(handler, body)
 
 
 def t(handler, payload, status: int=200, content_type: str='text/plain; charset=utf-8') -> None:
@@ -101,8 +196,7 @@ def t(handler, payload, status: int=200, content_type: str='text/plain; charset=
     handler.send_header('Content-Length', str(len(body)))
     handler.send_header('Cache-Control', 'no-store')
     _security_headers(handler)
-    handler.end_headers()
-    handler.wfile.write(body)
+    _safe_write(handler, body)
 
 
 MAX_BODY_BYTES = 20 * 1024 * 1024  # 20MB limit for non-upload POST bodies
@@ -337,9 +431,9 @@ def _redact_value(v, *, _enabled: bool | None = None):
 
 
 def redact_session_data(session_dict: dict) -> dict:
-    """Redact credentials from message content and tool_call data before API response.
+    """Redact credentials from message content, tool data, and session sidecars.
 
-    Applies to: messages[], tool_calls[], and title.
+    Applies to: messages[], tool_calls[], todo_state, and title.
     The underlying session file is not modified; redaction is response-layer only.
 
     Reads the ``api_redact_enabled`` setting ONCE for the entire response and
@@ -357,13 +451,33 @@ def redact_session_data(session_dict: dict) -> dict:
         result['messages'] = _redact_value(result['messages'], _enabled=_enabled)
     if 'tool_calls' in result:
         result['tool_calls'] = _redact_value(result['tool_calls'], _enabled=_enabled)
+    if 'todo_state' in result:
+        result['todo_state'] = _redact_value(result['todo_state'], _enabled=_enabled)
     return result
 
 
 def read_body(handler) -> dict:
     """Read and JSON-parse a POST request body (capped at 20MB)."""
-    length = int(handler.headers.get('Content-Length', 0))
+    raw_length = handler.headers.get('Content-Length', 0)
+    try:
+        length = int(raw_length)
+    except (TypeError, ValueError):
+        try:
+            handler.close_connection = True
+        except Exception:
+            pass
+        raise ValueError(f'Invalid Content-Length: {raw_length!r}')
+    if length < 0:
+        try:
+            handler.close_connection = True
+        except Exception:
+            pass
+        raise ValueError(f'Invalid Content-Length: {length}')
     if length > MAX_BODY_BYTES:
+        try:
+            handler.close_connection = True
+        except Exception:
+            pass
         raise ValueError(f'Request body too large ({length} bytes, max {MAX_BODY_BYTES})')
     raw = handler.rfile.read(length) if length else b'{}'
     try:

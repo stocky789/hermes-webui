@@ -27,6 +27,26 @@ def test_run_journal_appends_monotonic_seq_and_reads_after_cursor(tmp_path):
     assert [event["event"] for event in journal["events"]] == ["done"]
 
 
+def test_run_journal_reads_bounded_replay_window(tmp_path):
+    writer = RunJournalWriter("session_1", "run_1", session_dir=tmp_path)
+
+    writer.append_sse_event("token", {"text": "one"})
+    writer.append_sse_event("token", {"text": "two"})
+    writer.append_sse_event("token", {"text": "three"})
+    writer.append_sse_event("token", {"text": "four"})
+
+    journal = read_run_events(
+        "session_1",
+        "run_1",
+        after_seq=1,
+        max_seq=3,
+        session_dir=tmp_path,
+    )
+
+    assert [event["seq"] for event in journal["events"]] == [2, 3]
+    assert [event["payload"]["text"] for event in journal["events"]] == ["two", "three"]
+
+
 def test_run_journal_default_fsyncs_terminal_events_only(tmp_path, monkeypatch):
     path = tmp_path / "_run_journal" / "session_1" / "run_1.jsonl"
     path.parent.mkdir(parents=True)
@@ -112,12 +132,16 @@ def test_stale_interrupted_event_reports_non_terminal_journal(tmp_path, monkeypa
 
     monkeypatch.setattr("api.run_journal._default_session_dir", lambda: tmp_path)
     event = stale_interrupted_event("session_1", "run_1")
+    assert event is not None
 
     assert event["event"] == "apperror"
     assert event["seq"] == 2
-    assert event["terminal_state"] == "stale-from-restart"
+    assert event["terminal_state"] == "lost-worker-bookkeeping"
     assert event["payload"]["type"] == "interrupted"
     assert "last journaled event" in event["payload"]["hint"]
+    assert "process restarted" not in event["payload"]["message"]
+    assert "lost the live worker" not in event["payload"]["message"]
+    assert "live worker stopped" in event["payload"]["message"]
 
 
 def test_stale_interrupted_event_skips_terminal_journal(tmp_path, monkeypatch):

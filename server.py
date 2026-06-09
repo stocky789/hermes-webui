@@ -5,11 +5,34 @@ All business logic lives in api/*.
 """
 import logging
 import os
+import re
+import signal
 import socket
 import sys
+import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ── SIGPIPE handling ────────────────────────────────────────────────────────
+# Ignore SIGPIPE so a client closing the connection mid-response (browser tab
+# close, network drop, mobile backgrounding, a dropped long-poll, an
+# `/api/updates/check` timeout, etc.) does not terminate the whole server
+# process. Python's default action for SIGPIPE is `Term`, so a single dropped
+# `socket.send()` in any request thread could kill the entire WebUI silently —
+# no exception, no log, no `/health` response. With SIG_IGN the kernel still
+# returns EPIPE to the offending write (surfaced as `BrokenPipeError`); the
+# per-request handler unwinds and the connection just closes, while the server
+# keeps serving. Set at import time so it is in effect before any
+# ThreadingHTTPServer worker thread writes its first response. (Salvaged from
+# #3407 @PatrickNoFilter — reproduced in production 2026-06-02.)
+#
+# SIGPIPE is POSIX-only; it does not exist on Windows (where there is no
+# broken-pipe signal and writes to a dead socket raise an OSError directly), so
+# guard with getattr to keep native-Windows support (#1952) working.
+_SIGPIPE = getattr(signal, "SIGPIPE", None)
+if _SIGPIPE is not None:
+    signal.signal(_SIGPIPE, signal.SIG_IGN)
 
 # ── Test-mode network isolation ─────────────────────────────────────────────
 # When `HERMES_WEBUI_TEST_NETWORK_BLOCK=1` is set in the environment, refuse
@@ -113,9 +136,14 @@ logger = logging.getLogger(__name__)
 
 from api.auth import check_auth
 from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE
-from api.helpers import j, get_profile_cookie
+from api.helpers import (
+    j,
+    get_profile_cookie,
+    _build_csp_report_only_policy,
+    _CLIENT_DISCONNECT_ERRORS,
+)
 from api.profiles import set_request_profile, clear_request_profile
-from api.routes import handle_delete, handle_get, handle_patch, handle_post
+from api.routes import handle_delete, handle_get, handle_patch, handle_post, handle_put
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 
@@ -132,6 +160,30 @@ class QuietHTTPServer(ThreadingHTTPServer):
         super().__init__(*args, **kwargs)
         self.accept_loop_requests_total = 0
         self.accept_loop_last_request_at = 0.0
+
+    def server_bind(self):
+        if sys.platform == 'win32':
+            self.allow_reuse_address = False
+            SO_EXCLUSIVEADDRUSE = getattr(socket, 'SO_EXCLUSIVEADDRUSE', -5)
+            self.socket.setsockopt(socket.SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)
+            # Retry bind on Windows to handle the case where a previous
+            # process (e.g. during self-update) is still releasing the port.
+            # The old process calls os._exit(0) which starts tearing down
+            # its socket, but with SO_EXCLUSIVEADDRUSE the OS blocks new
+            # binds until the teardown completes.  Retry for up to 10 s.
+            max_retries = 20
+            retry_delay = 0.5
+            for attempt in range(max_retries):
+                try:
+                    super().server_bind()
+                    return
+                except OSError as e:
+                    if e.winerror == 10048 and attempt < max_retries - 1:  # WSAEADDRINUSE
+                        time.sleep(retry_delay)
+                    else:
+                        raise
+        else:
+            super().server_bind()
 
     def _handle_request_noblock(self):
         """Record accept-loop progress before dispatching a request handler.
@@ -170,6 +222,13 @@ class QuietHTTPServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 enables keep-alive connection reuse — major latency win on
+    # high-RTT links where every saved TCP handshake is 2×RTT. Each response
+    # MUST declare framing (Content-Length, Transfer-Encoding: chunked, or
+    # Connection: close) so the client knows where the message ends. Helpers
+    # j()/t() emit Content-Length; SSE/streaming endpoints emit
+    # Connection: close because the body has no terminator. See PR notes.
+    protocol_version = "HTTP/1.1"
     timeout = 30  # seconds — kills idle/incomplete connections to prevent thread exhaustion
     
     def setup(self):
@@ -200,27 +259,15 @@ class Handler(BaseHTTPRequestHandler):
                 pass
     _ver_suffix = WEBUI_VERSION.removeprefix('v')
     server_version = ('HermesWebUI/' + _ver_suffix) if _ver_suffix != 'unknown' else 'HermesWebUI'
-    _CSP_REPORT_ONLY = (
-        "default-src 'self'; "
-        "base-uri 'self'; "
-        "object-src 'none'; "
-        "frame-ancestors 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-        "img-src 'self' data: blob:; "
-        "font-src 'self' data:; "
-        "media-src 'self' data: blob:; "
-        "connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; "
-        "report-uri /api/csp-report; report-to csp-endpoint"
-    )
     _CSP_REPORT_TO = '{"group":"csp-endpoint","max_age":10886400,"endpoints":[{"url":"/api/csp-report"}]}'
 
     @classmethod
-    def csp_report_only_policy(cls) -> str:
-        return cls._CSP_REPORT_ONLY
+    def csp_report_only_policy(cls, extra_connect_src=None) -> str:
+        return _build_csp_report_only_policy(extra_connect_src)
 
     def end_headers(self) -> None:
-        self.send_header("Content-Security-Policy-Report-Only", self.csp_report_only_policy())
+        extra_connect_src = getattr(self, "_csp_extra_connect_src", None)
+        self.send_header("Content-Security-Policy-Report-Only", self.csp_report_only_policy(extra_connect_src))
         self.send_header("Report-To", self._CSP_REPORT_TO)
         super().end_headers()
 
@@ -230,13 +277,28 @@ class Handler(BaseHTTPRequestHandler):
         """Structured JSON logs for each request."""
         import json as _json
         duration_ms = round((time.time() - getattr(self, '_req_t0', time.time())) * 1000, 1)
-        record = _json.dumps({
+        remote = '-'
+        try:
+            if getattr(self, 'client_address', None):
+                remote = str(self.client_address[0])
+        except Exception:
+            remote = '-'
+        forwarded_for = None
+        try:
+            forwarded_for = (self.headers.get('X-Forwarded-For') or '').split(',')[0].strip() or None
+        except Exception:
+            forwarded_for = None
+        record_data = {
             'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-            'method': self.command or '-',
-            'path': self.path or '-',
+            'remote': remote,
+            'method': getattr(self, 'command', None) or '-',
+            'path': getattr(self, 'path', None) or '-',
             'status': int(code) if str(code).isdigit() else code,
             'ms': duration_ms,
-        })
+        }
+        if forwarded_for:
+            record_data['forwarded_for'] = forwarded_for
+        record = _json.dumps(record_data)
         print(f'[webui] {record}', flush=True)
 
     def do_GET(self) -> None:
@@ -251,9 +313,22 @@ class Handler(BaseHTTPRequestHandler):
             result = handle_get(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)
-        except Exception as e:
+        except _CLIENT_DISCONNECT_ERRORS:
+            # The browser/client closed the socket while we were writing the
+            # response. This is expected for probes, tab closes, and SSE
+            # reconnect races; do not convert it into a misleading server 500.
+            return
+        except Exception:
             print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc(), flush=True)
-            return j(self, {'error': 'Internal server error'}, status=500)
+            try:
+                j(self, {'error': 'Internal server error'}, status=500)
+            except _CLIENT_DISCONNECT_ERRORS:
+                # Client disconnected while we were sending the 500 — nothing to do.
+                pass
+            except Exception:
+                # Unexpected failure while sending the error response itself.
+                # Log it so we know something is wrong with our error handler.
+                traceback.print_exc()
         finally:
             clear_request_profile()
 
@@ -277,17 +352,42 @@ class Handler(BaseHTTPRequestHandler):
             result = route_func(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)
-        except Exception as e:
+        except _CLIENT_DISCONNECT_ERRORS:
+            # The browser/client closed the socket while we were writing the
+            # response. This is expected for probes, tab closes, and SSE
+            # reconnect races; do not convert it into a misleading server 500.
+            return
+        except Exception:
             print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc(), flush=True)
-            return j(self, {'error': 'Internal server error'}, status=500)
+            try:
+                j(self, {'error': 'Internal server error'}, status=500)
+            except _CLIENT_DISCONNECT_ERRORS:
+                # Client disconnected while we were sending the 500 — nothing to do.
+                pass
+            except Exception:
+                # Unexpected failure while sending the error response itself.
+                # Log it so we know something is wrong with our error handler.
+                traceback.print_exc()
         finally:
             clear_request_profile()
 
     def do_POST(self) -> None:
         self._handle_write(handle_post)
 
+    def do_PUT(self) -> None:
+        self._handle_write(handle_put)
+
     def do_PATCH(self) -> None:
         self._handle_write(handle_patch)
+
+    def do_OPTIONS(self) -> None:
+        """Handle CORS preflight requests."""
+        self._req_t0 = time.time()
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
 
     def do_DELETE(self) -> None:
         self._handle_write(handle_delete)
@@ -320,6 +420,82 @@ def _raise_fd_soft_limit(target: int = 4096) -> dict:
     except Exception as exc:
         return {"status": "error", "soft": soft, "hard": hard, "error": str(exc)}
     return {"status": "raised", "soft": desired, "hard": hard, "previous_soft": soft}
+
+
+_SHUTDOWN_AUDIT_LOGGED = False
+_SHUTDOWN_LOG_VALUE_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _shutdown_log_value(value, *, default: str = "unknown", max_len: int = 160) -> str:
+    """Return a bounded single-line value safe for shutdown diagnostics."""
+    if value is None:
+        return default
+    try:
+        text = str(value)
+    except Exception:
+        return default
+    text = _SHUTDOWN_LOG_VALUE_RE.sub("?", text).strip()
+    if not text:
+        return default
+    if len(text) > max_len:
+        text = f"{text[:max_len]}…"
+    return text
+
+
+def _log_shutdown_audit(reason: str = "serve_forever_exit") -> None:
+    """Log runtime context when the WebUI server is exiting."""
+    global _SHUTDOWN_AUDIT_LOGGED
+    if _SHUTDOWN_AUDIT_LOGGED:
+        return
+
+    active_sessions = []
+    try:
+        from api.models import LOCK, SESSIONS
+        with LOCK:
+            session_items = list(SESSIONS.items())
+        for sid, session in session_items:
+            stream_id = getattr(session, "active_stream_id", None)
+            if stream_id:
+                pending = bool(getattr(session, "pending_user_message", None))
+                active_sessions.append(
+                    "sid=%s stream=%s pending=%s"
+                    % (
+                        _shutdown_log_value(sid),
+                        _shutdown_log_value(stream_id),
+                        pending,
+                    )
+                )
+    except Exception:
+        logger.debug("Failed to collect active-session shutdown audit state", exc_info=True)
+
+    _SHUTDOWN_AUDIT_LOGGED = True
+    logger.info(
+        "[shutdown-audit] reason=%s pid=%s thread=%s(%s) active_sessions=[%s]",
+        _shutdown_log_value(reason),
+        os.getpid(),
+        _shutdown_log_value(threading.current_thread().name),
+        threading.current_thread().ident,
+        "; ".join(active_sessions) if active_sessions else "none",
+    )
+
+
+def _abort_if_already_serving(host: str, port: int) -> None:
+    """Refuse to start if a live HTTP server is already responding on this port."""
+    probe_host = '127.0.0.1' if host in ('0.0.0.0', '', '::') else host
+    try:
+        with socket.create_connection((probe_host, port), timeout=2) as s:
+            s.sendall(b'GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n')
+            s.settimeout(2)
+            data = s.recv(512)
+            if data:
+                print(
+                    f'[!!] FATAL: Another server is already responding on'
+                    f' {probe_host}:{port}. Stop the existing instance first.',
+                    flush=True,
+                )
+                sys.exit(1)
+    except (ConnectionRefusedError, ConnectionResetError, OSError, socket.timeout):
+        pass
 
 
 def main() -> None:
@@ -410,6 +586,35 @@ def main() -> None:
     except Exception as e:
         print(f'[!!] WARNING: Gateway watcher failed to start: {e}', flush=True)
 
+    # Start the bg_task_complete drain thread for terminal(notify_on_complete=true)
+    # agent wakeup. Reads tools.process_registry.completion_queue and emits SSE
+    # bg_task_complete events (canonical name; legacy process_complete alias is
+    # still emitted for back-compat) to the matching session's stream.
+    try:
+        from api.background_process import start_drain_thread
+        if start_drain_thread():
+            print('[ok] bg_task_complete drain thread started', flush=True)
+    except Exception as e:
+        print(f'[!!] WARNING: bg_task_complete drain failed to start: {e}', flush=True)
+
+    # Start the SessionChannel reaper for the persistent per-session SSE
+    # endpoint (/api/session/stream). Runs every 60s, collects channels with
+    # no subscribers past the grace period or past the idle TTL cap.
+    try:
+        from api.background_process import start_session_channel_reaper
+        if start_session_channel_reaper():
+            print('[ok] SessionChannel reaper thread started', flush=True)
+    except Exception as e:
+        print(f'[!!] WARNING: SessionChannel reaper failed to start: {e}', flush=True)
+
+    # Load WebUI dashboard plugins
+    try:
+        from api.plugins import load_plugins
+        load_plugins()
+    except Exception as e:
+        print(f'[!!] WARNING: Plugin loading failed: {e}', flush=True)
+
+    _abort_if_already_serving(HOST, PORT)
     httpd = QuietHTTPServer((HOST, PORT), Handler)
 
     # ── TLS/HTTPS setup (optional) ─────────────────────────────────────────
@@ -435,6 +640,8 @@ def main() -> None:
     try:
         httpd.serve_forever()
     finally:
+        httpd.server_close()
+        _log_shutdown_audit()
         # Stop the gateway watcher on shutdown
         try:
             from api.gateway_watcher import stop_watcher
@@ -447,6 +654,20 @@ def main() -> None:
             drain_all_on_shutdown()
         except Exception:
             logger.debug("Failed to drain lifecycle on shutdown", exc_info=True)
+        # Stop bg_task_complete drain + SessionChannel reaper (ours-original).
+        # The drain thread emits the canonical ``bg_task_complete`` event
+        # (with ``process_complete`` kept as a temporary backward-compat
+        # alias for older clients — see start_drain_thread comment above).
+        try:
+            from api.background_process import stop_drain_thread
+            stop_drain_thread()
+        except Exception:
+            logger.debug("Failed to stop bg_task_complete drain thread during shutdown", exc_info=True)
+        try:
+            from api.background_process import stop_session_channel_reaper
+            stop_session_channel_reaper()
+        except Exception:
+            logger.debug("Failed to stop SessionChannel reaper during shutdown", exc_info=True)
 
 if __name__ == '__main__':
     main()

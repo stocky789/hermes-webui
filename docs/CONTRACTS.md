@@ -27,14 +27,33 @@ does not change runtime behavior, maintainer policy, bot behavior, or CI gates.
   model-context reconstruction, compression, UI scene/cache, and sidebar metadata
   repairs. Start here for narrow fixes that keep the existing WebUI execution
   path.
+- [`docs/rfcs/live-to-final-assistant-replies.md`](rfcs/live-to-final-assistant-replies.md):
+  proposed product model for long-running assistant replies, live process text,
+  tool activity, recovery, terminal outcomes, and final-answer boundaries. Start
+  here for UI/UX changes to running-session assistant reply rendering.
+- [`docs/rfcs/canonical-session-resolution.md`](rfcs/canonical-session-resolution.md):
+  proposed contract for resolving URL routes, query parameters, localStorage,
+  sidebar rows, and compression-lineage IDs to one canonical visible session
+  target. Start here for session routing, boot restore, stale parent, or
+  compression-tip selection changes.
 - [`docs/rfcs/hermes-run-adapter-contract.md`](rfcs/hermes-run-adapter-contract.md):
   proposed event/control contract, runtime-state ownership matrix,
   acceptance-test catalog, and reversible migration gates for moving WebUI
   execution behind an adapter boundary. Use this for adapter-seam, control-plane,
   runner, sidecar, or execution-ownership work; do not treat it as authorization
   to implement those slices.
+- [`docs/architecture/agent-api-contract.md`](architecture/agent-api-contract.md):
+  current audit of WebUI dependencies on the hermes-agent source checkout and
+  the replacement API/client surfaces needed before source mounts can be removed.
+  Start here for issue #2491 and Docker/source-boundary migration slices.
 - [`docs/rfcs/turn-journal.md`](rfcs/turn-journal.md): proposed crash-safe
   write-ahead journal for browser-originated chat turns.
+- [`docs/rfcs/webui-pending-intent-controls.md`](rfcs/webui-pending-intent-controls.md):
+  proposed control-surface companion to the long-running-session reply model for
+  Queue, Steer, Stop-and-send, Interrupt, and leftover-steer inputs submitted
+  while an agent run is active. Start here for busy-composer behavior, pending
+  queued messages, interrupt replacement, steer visibility, or leftover-steer
+  recovery changes.
 - [`docs/rfcs/README.md`](rfcs/README.md): RFC conventions and current RFC index.
 
 When a change touches streaming, recovery, replay, compression, context
@@ -64,8 +83,8 @@ that slice.
 
 Current appearance has a theme axis (`light`, `dark`, `system`) and a separate
 skin axis (`default`, `ares`, `mono`, `slate`, `poseidon`, `sisyphus`,
-`charizard`, `sienna`, `catppuccin`, `nous`) in `static/boot.js` and
-`static/style.css`. Do not follow stale `data-theme`-only theme guidance unless
+`charizard`, `sienna`, `catppuccin`, `nous`, `geist-contrast`) in
+`static/boot.js` and `static/style.css`. Do not follow stale `data-theme`-only theme guidance unless
 the current code and tests prove that model still applies.
 
 For UI or UX work, include before/after evidence, verify relevant responsive
@@ -97,6 +116,33 @@ Evidence needed before claiming done:
 For small, obvious fixes, keep this short. The goal is to avoid routing mistakes,
 not to create process overhead.
 
+## Contract changes
+
+Changing contract documents, RFC guidance, or contract tests changes review
+expectations for future contributors. A PR that intentionally changes an
+existing contract should include a `Contract Change` section in its PR body with:
+
+- the previous contract,
+- the new contract,
+- the affected docs and tests,
+- the compatibility or migration reason.
+
+Contract tests and corresponding docs must move together. Tests that encode
+product semantics must not silently redefine the contract by asserting the
+opposite behavior without updating the public docs and naming the change in the
+PR body.
+
+The static tests for this guidance are advisory coverage. They pin contributor
+wording so the rule stays visible. This advisory coverage is not an automated
+policy gate; static coverage is not an automated policy gate and does not enforce
+PR-body content on GitHub. A future release-time or CI check could
+surface contract-affecting diffs whose PR body lacks `Contract Routing`, but this
+document only defines the review expectation.
+
+Release batches should list included contract-affecting PRs explicitly so
+reviewers can distinguish ordinary green-CI fixes from changes that update the
+project's product or runtime guardrails.
+
 ## PR preparation checklist
 
 Before opening or updating a PR, verify `CONTRIBUTING.md` against the actual PR
@@ -113,6 +159,8 @@ Required checks:
 - UI/UX changes include before/after evidence and responsive-state coverage.
 - Runtime/streaming changes name the state layer or invariant being changed and
   list the regression or manual invariant check.
+- Contract-affecting PRs include `Contract Routing`; intentional contract
+  changes also include `Contract Change`.
 - Onboarding/setup validation used isolated `HERMES_HOME` and
   `HERMES_WEBUI_STATE_DIR`, unless the human operator explicitly requested real
   state.

@@ -21,7 +21,7 @@ def test_cli_tool_result_diff_snippet_is_not_cut_to_200_chars():
         "if(_cliLooksLikePatchDiff(fullText))return_clipCliToolSnippet(fullText);"
         in COMPACT_UI
     )
-    assert "returnString(fullText||'').slice(0,200);" in COMPACT_UI
+    assert "returnString(fullText||'').slice(0,4000);" in COMPACT_UI
 
 
 def test_cli_tool_fallback_promotes_apply_patch_args_to_tool_card_snippet():
@@ -109,6 +109,17 @@ def test_rendered_apply_patch_tool_card_html_contains_diff_lines():
         "_cliPatchSnippetFromArgs",
         "_cliToolCardSnippet",
         "_cliToolCardHasDiffSnippet",
+        "_toolArgPreviewValue",
+        "_toolArgPreviewKeyIsHidden",
+        "_formatToolArgPreview",
+        "_toolCardPreviewText",
+        # #3336: buildToolCard now wraps diff snippets via these helpers.
+        "_snippetLooksLikeDiff",
+        "_colorDiffLines",
+        # #3544: buildToolCard stamps durable memory/skill-save flags via these.
+        "_tcAction",
+        "_isMemorySave",
+        "_isSkillUpdate",
         "buildToolCard",
     ]
     functions = "\n".join(_function_source(UI_JS, name) for name in function_names)
@@ -118,8 +129,12 @@ def test_rendered_apply_patch_tool_card_html_contains_diff_lines():
         function li(){{return '';}}
         function toolIcon(){{return '';}}
         function _toolDisplayName(tc){{return tc.name||'tool';}}
+        // #3544: const Sets the _isMemorySave/_isSkillUpdate predicates close over
+        // (extracted helpers reference these module-level constants).
+        const _MEMORY_SAVE_ACTIONS=new Set(['add','replace']);
+        const _SKILL_UPDATE_ACTIONS=new Set(['create','patch','edit','write_file']);
         const document={{
-          createElement(){{return {{className:'', innerHTML:''}};}}
+          createElement(){{return {{className:'', innerHTML:'', setAttribute(){{}}, removeAttribute(){{}}}};}}
         }};
         {functions}
 

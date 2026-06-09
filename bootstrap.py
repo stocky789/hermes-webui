@@ -28,8 +28,8 @@ def _load_repo_dotenv() -> None:
     ``python3 bootstrap.py`` directly behaves identically to ``./start.sh``.
     Variables are set unconditionally (matching shell source semantics), so a
     value in .env overrides one already present in the shell environment.
-    To keep a CLI-supplied value, unset it from .env or launch via start.sh
-    and override there.
+    ``ctl.sh`` sets HERMES_WEBUI_PRESERVE_ENV=1 when it has already resolved
+    launcher-specific values such as HERMES_HOME or HERMES_WEBUI_STATE_DIR.
 
     Only loads the webui repo .env — not ~/.hermes/.env, which the server
     loads independently at startup for provider credentials.
@@ -41,6 +41,12 @@ def _load_repo_dotenv() -> None:
     if not env_path.exists():
         return
     try:
+        preserve_existing = os.getenv("HERMES_WEBUI_PRESERVE_ENV", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         for raw_line in env_path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -52,6 +58,8 @@ def _load_repo_dotenv() -> None:
                 k = k[7:].strip()
             v = v.strip().strip('"').strip("'")
             if k:
+                if preserve_existing and k in os.environ:
+                    continue
                 os.environ[k] = v
     except Exception as exc:
         import sys as _sys
@@ -84,9 +92,9 @@ def is_wsl() -> bool:
 
 def ensure_supported_platform() -> None:
     if platform.system() == "Windows" and not is_wsl():
-        raise RuntimeError(
-            "Native Windows is not supported for this bootstrap yet. "
-            "Please run it from Linux, macOS, or inside WSL2."
+        info(
+            "Warning: Native Windows bootstrap is experimental. "
+            "Embedded terminal and auto-install are not supported."
         )
 
 
@@ -262,6 +270,11 @@ def hermes_command_exists() -> bool:
 
 
 def install_hermes_agent() -> None:
+    if platform.system() == "Windows" and not is_wsl():
+        raise RuntimeError(
+            "Auto-install is not supported on native Windows. "
+            "Install hermes-agent manually first."
+        )
     info(f"Hermes Agent not found. Attempting install via {INSTALLER_URL}")
     subprocess.run(
         ["/bin/bash", "-lc", f"curl -fsSL {INSTALLER_URL} | bash"], check=True
@@ -308,8 +321,10 @@ def parse_args() -> argparse.Namespace:
         "--foreground",
         action="store_true",
         help=(
-            "Run server.py in this process (via os.execv) instead of spawning a "
-            "child. Use this under launchd / systemd / supervisord so the "
+            "Run server.py in this process (via os.execv on POSIX; via a "
+            "Popen child + exit on Windows, where execv can't replace the "
+            "process image) instead of spawning a detached child. Use this "
+            "under launchd / systemd / supervisord so the "
             "supervisor sees the long-lived server as the original child. "
             "Implies --no-browser. Skips the post-launch health probe — the "
             "supervisor's own KeepAlive / Restart=on-failure handles liveness."
@@ -436,8 +451,19 @@ def main() -> int:
                 f"Set HERMES_WEBUI_PYTHON to a working interpreter or fix "
                 f"the agent venv at {agent_dir}."
             )
-        # os.execv replaces the current process image. Anything after this line
-        # only runs if execv itself fails (it raises OSError on failure).
+        # os.execv replaces the current process image. On Windows, execv
+        # spawns a new process instead of replacing (Python calls CreateProcess),
+        # orphaning it from any supervisor. Use Popen + exit there instead.
+        if sys.platform == "win32":
+            # CREATE_NEW_PROCESS_GROUP only exists in the subprocess module on
+            # Windows; resolve it defensively (0 = no extra flags) so this line
+            # can't AttributeError if reached on a non-Windows interpreter
+            # (e.g. a win32-simulating test) — mirrors the getattr() guard used
+            # for SO_EXCLUSIVEADDRUSE.
+            _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen([python_exe, server_path],
+                             creationflags=_CREATE_NEW_PROCESS_GROUP)
+            sys.exit(0)
         os.execv(python_exe, [python_exe, server_path])
         # Unreachable — execv either replaces the process or raises.
         raise RuntimeError("os.execv returned unexpectedly")

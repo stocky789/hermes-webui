@@ -270,6 +270,24 @@ def test_recover_all_sessions_on_startup_restores_orphan_bak(temp_session_dir):
     assert len(restored["messages"]) == 293
 
 
+def test_recover_all_sessions_on_startup_rebuilds_missing_index_without_restores(temp_session_dir, monkeypatch):
+    """Startup recovery must rebuild a missing index even when no .bak restore runs."""
+    import api.models as _m
+
+    sid = _make_session_on_disk(temp_session_dir, n_msgs=42)
+    missing_index = temp_session_dir / "_index.json"
+    monkeypatch.setattr(_m, "SESSION_INDEX_FILE", missing_index)
+    assert not missing_index.exists()
+
+    from api.session_recovery import recover_all_sessions_on_startup
+    result = recover_all_sessions_on_startup(temp_session_dir, rebuild_index=True)
+
+    assert result["restored"] == 0
+    index = json.loads(missing_index.read_text(encoding="utf-8"))
+    assert [entry["session_id"] for entry in index] == [sid]
+    assert index[0]["message_count"] == 42
+
+
 def test_recover_all_sessions_on_startup_rebuilds_index_after_orphan_restore(temp_session_dir, monkeypatch):
     """A restored orphan must be visible through the WebUI session index immediately."""
     import api.models as _m
@@ -328,6 +346,37 @@ def test_recover_all_sessions_on_startup_is_idempotent_no_op_on_clean_state(temp
 
     live_after = (temp_session_dir / f"{sid}.json").read_text(encoding="utf-8")
     assert live_before == live_after
+
+
+def test_recover_all_sessions_on_startup_does_not_read_live_files_without_backup(temp_session_dir, monkeypatch):
+    """Clean live sidecars without .bak are not recovery candidates at startup."""
+    clean_sid = _make_session_on_disk(temp_session_dir, sid="clean_no_bak", n_msgs=500)
+    backed_sid = _make_session_on_disk(temp_session_dir, sid="backed_candidate", n_msgs=4)
+    clean_path = temp_session_dir / f"{clean_sid}.json"
+    backed_path = temp_session_dir / f"{backed_sid}.json"
+    backed_path.with_suffix('.json.bak').write_text(
+        backed_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    import api.session_recovery as sr
+
+    real_msg_count = sr._msg_count
+    msg_count_paths = []
+
+    def tracking_msg_count(path):
+        msg_count_paths.append(path)
+        return real_msg_count(path)
+
+    monkeypatch.setattr(sr, "_msg_count", tracking_msg_count)
+
+    result = sr.recover_all_sessions_on_startup(temp_session_dir)
+
+    assert result["restored"] == 0
+    assert result["scanned"] == 2
+    assert clean_path not in msg_count_paths
+    assert backed_path in msg_count_paths
+    assert backed_path.with_suffix('.json.bak') in msg_count_paths
 
 
 def test_recover_all_sessions_on_startup_skips_non_session_index_json(temp_session_dir):
