@@ -237,6 +237,74 @@ def _resolve_custom_provider_runtime_overrides(
     return resolved_provider, resolved_api_key, resolved_base_url
 
 
+def _same_base_url_endpoint(url_a: str, url_b: str) -> bool:
+    """True if two base URLs point at the same scheme+host+port endpoint.
+
+    Used to decide whether a runtime base_url is just a normalized form of the
+    configured one (e.g. OpenCode-Go's ``/v1`` de-duplication on the same host)
+    versus a genuinely different endpoint (an explicit ``providers.<id>.base_url``
+    override at a different host/port that must be preserved). Path/query are
+    intentionally ignored — the normalization #3895 fixes is path-only.
+    """
+    from urllib.parse import urlsplit
+    try:
+        a = urlsplit((url_a or "").strip())
+        b = urlsplit((url_b or "").strip())
+    except Exception:
+        return False
+    _default_port = {"http": 80, "https": 443}
+    a_host = (a.hostname or "").lower()
+    b_host = (b.hostname or "").lower()
+    a_scheme = (a.scheme or "").lower()
+    b_scheme = (b.scheme or "").lower()
+    a_port = a.port or _default_port.get(a_scheme)
+    b_port = b.port or _default_port.get(b_scheme)
+    return bool(a_host) and a_host == b_host and a_scheme == b_scheme and a_port == b_port
+
+
+def _runtime_preferred_base_url(
+    runtime_provider: dict | None,
+    resolved_provider: str | None,
+    configured_base_url: str | None,
+) -> str | None:
+    """Prefer the runtime-normalized base_url, but never override an explicit
+    configured endpoint that points somewhere genuinely different.
+
+    The #3895 bug was that WebUI used the *configured* base_url (which can carry a
+    duplicated ``/v1``) instead of the runtime provider's per-model-normalized
+    base_url, 404ing OpenCode-Go. But blindly preferring the runtime URL would
+    clobber a legitimate ``providers.<id>.base_url`` override (e.g. LM Studio at a
+    LAN IP, an OpenRouter mirror). So:
+      - no runtime URL            -> keep configured
+      - no configured URL         -> use runtime (all we have)
+      - named ``custom:`` endpoint -> configured wins (then runtime as fallback)
+      - same scheme+host+port     -> runtime wins (it's the normalized/corrected
+                                      form of the same endpoint — the #3895 case)
+      - different endpoint        -> configured override wins (no regression)
+    """
+    runtime_base_url = None
+    if isinstance(runtime_provider, dict):
+        runtime_base_url = runtime_provider.get("base_url")
+    if not runtime_base_url:
+        return configured_base_url
+    if not configured_base_url:
+        return runtime_base_url
+
+    provider_id = str(
+        resolved_provider
+        or (runtime_provider or {}).get("provider")
+        or ""
+    ).strip().lower()
+    if provider_id.startswith("custom:"):
+        return configured_base_url or runtime_base_url
+
+    # An explicit configured override at a DIFFERENT endpoint must be preserved;
+    # only prefer the runtime URL when it's the same endpoint (path-normalized).
+    if _same_base_url_endpoint(configured_base_url, runtime_base_url):
+        return runtime_base_url
+    return configured_base_url
+
+
 def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
     """Return True if an agent lifecycle status should surface as a fallback warning."""
     k = str(kind or '').strip().lower()
@@ -950,6 +1018,86 @@ def _provider_error_payload(message: str, err_type: str, hint: str = '') -> dict
         if _details:
             payload['details'] = _details
     return payload
+
+
+_MAX_ITERATION_SUMMARY_REQUEST = (
+    "You've reached the maximum number of tool-calling iterations allowed. "
+    "Please provide a final response summarizing what you've found and accomplished "
+    "so far, without calling any more tools."
+)
+
+
+def _is_synthetic_max_iteration_summary_request(message) -> bool:
+    """Return True for Hermes Agent's internal max-iteration summary prompt."""
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    text = " ".join(_message_text(message.get('content', '')).split())
+    expected = " ".join(_MAX_ITERATION_SUMMARY_REQUEST.split())
+    return text == expected
+
+
+def _drop_synthetic_max_iteration_summary_requests(messages, *, enabled: bool = True):
+    """Remove Agent-internal max-iteration summary prompts from WebUI state."""
+    if not enabled:
+        return list(messages or [])
+    return [
+        msg
+        for msg in list(messages or [])
+        if not _is_synthetic_max_iteration_summary_request(msg)
+    ]
+
+
+def _agent_result_tool_limit_reached(result) -> bool:
+    """Return True when current-turn metadata says the tool iteration cap fired."""
+    if not isinstance(result, dict):
+        return False
+    fields = [
+        result.get('turn_exit_reason'),
+        result.get('terminal_reason'),
+        result.get('status'),
+        result.get('state'),
+        result.get('error'),
+    ]
+    haystack = " ".join(str(value or '') for value in fields).lower()
+    if (
+        'max_iterations_reached' in haystack
+        or 'maximum number of tool-calling iterations' in haystack
+        or ('tool-calling iterations' in haystack and 'maximum' in haystack)
+    ):
+        return True
+    return False
+
+
+def _mark_latest_assistant_tool_limit_status(messages) -> bool:
+    """Annotate the latest usable assistant final answer as limit-stopped."""
+    for msg in reversed(list(messages or [])):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get('_error') or msg.get('role') != 'assistant':
+            continue
+        content = msg.get('content')
+        if isinstance(content, list):
+            text = '\n'.join(
+                str(part.get('text') or part.get('content') or '')
+                for part in content
+                if isinstance(part, dict)
+            )
+        else:
+            text = str(content or '')
+        if msg.get('tool_calls') or not text.strip():
+            continue
+        msg['_terminal_state'] = 'tool_limit_reached'
+        msg['_terminal_reason'] = 'max_iterations'
+        msg.setdefault('_statusCard', {
+            'title': 'Tool iteration limit reached',
+            'subtitle': 'Stopped because the tool iteration limit was reached.',
+            'rows': [
+                {'label': 'State', 'value': 'Limit reached'},
+                {'label': 'Next step', 'value': 'Start a new turn to continue.'},
+            ],
+        })
+        return True
+    return False
 
 
 def _session_has_cancel_marker(session) -> bool:
@@ -2265,6 +2413,48 @@ def _is_minimax_route(provider: str = '', model: str = '', base_url: str = '') -
     return 'minimax' in text or 'minimaxi.com' in text
 
 
+def _route_rejects_reasoning_extra(provider: str = '', model: str = '', base_url: str = '') -> bool:
+    """Routes known to reject an ``extra_body`` ``reasoning`` parameter with HTTP 400.
+
+    Title generation injects ``extra_body={"reasoning": {"enabled": False}}`` to
+    suppress thinking on reasoning-capable models (#2083). But OpenAI Chat
+    Completions (and Azure OpenAI) reject unknown top-level params with a 400, so
+    that inject silently fails the title call and falls back to a low-quality
+    heuristic title (#4161). Skip the inject for those routes.
+
+    OpenRouter Anthropic mandatory-reasoning models (Claude Sonnet 4.6 / Opus 4.8)
+    are reasoning-capable but reject a reasoning *disable* — title gen only needs
+    reasoning off, so skip the inject for them too rather than risk the same 400.
+    """
+    provider_lower = str(provider or '').strip().lower()
+    model_lower = str(model or '').strip().lower()
+    # Hostname-based match (not substring) so a proxy URL that merely *contains*
+    # one of these strings in a path segment isn't mis-classified.
+    host = ''
+    try:
+        from urllib.parse import urlsplit
+        host = (urlsplit(str(base_url or '').strip()).hostname or '').lower()
+    except Exception:
+        host = ''
+    if host == 'api.openai.com' or host.endswith('.openai.azure.com'):
+        return True
+    # Azure AI Foundry chat-completions hosts (also reject the reasoning param).
+    if host.endswith('.services.ai.azure.com') or host.endswith('.cognitiveservices.azure.com'):
+        return True
+    if provider_lower in ('openai', 'openai-api', 'openai-codex'):
+        return True
+    if (
+        provider_lower in ('azure', 'azure-foundry', 'azure-ai-foundry', 'azure-ai')
+        or provider_lower.startswith('azure/')
+        or provider_lower.startswith('azure-')
+    ):
+        return True
+    if (host == 'openrouter.ai' or host.endswith('.openrouter.ai')) and model_lower.startswith('anthropic/'):
+        # Anthropic on OpenRouter: mandatory-reasoning families reject a disable.
+        return True
+    return False
+
+
 def _get_aux_title_config() -> dict:
     """Return title_generation auxiliary config, or an empty dict on errors."""
     try:
@@ -2446,7 +2636,9 @@ def generate_title_raw_via_aux(
     if not caller_supplied_route:
         api_key = str(configured.get('api_key', '') or '').strip()
     base_max_tokens = _title_completion_budget(provider, model, base_url)
-    reasoning_extra = {"reasoning": {"enabled": False}}
+    reasoning_extra = {}
+    if not _route_rejects_reasoning_extra(provider, model, base_url):
+        reasoning_extra["reasoning"] = {"enabled": False}
     if _is_minimax_route(provider, model, base_url):
         reasoning_extra["reasoning_split"] = True
     try:
@@ -2471,7 +2663,7 @@ def generate_title_raw_via_aux(
                         max_tokens=max_tokens,
                         temperature=0.2,
                         timeout=_timeout,
-                        extra_body=reasoning_extra,
+                        extra_body=reasoning_extra or None,
                     )
                     raw, empty_status = _extract_title_response(resp, aux=True)
                     if raw:
@@ -2559,10 +2751,22 @@ def generate_title_raw_via_agent(agent, user_text: str, assistant_text: str) -> 
                         api_kwargs.pop('tools', None)
                         api_kwargs['temperature'] = 0.1
                         api_kwargs['timeout'] = 15.0
+                        # Reasoning suppression for title gen is already handled
+                        # route-correctly by `_build_api_kwargs()` from the
+                        # `agent.reasoning_config = {"enabled": False}` set above —
+                        # each provider profile applies (or deliberately omits) the
+                        # disable in the form its endpoint accepts (OpenAI/Nous omit
+                        # the field; LM Studio uses top-level reasoning_effort;
+                        # OpenRouter Anthropic mandatory-reasoning is omitted). Do NOT
+                        # re-inject a generic `reasoning:{enabled:False}` here — that
+                        # re-adds a 400-rejected param on top of the profile output
+                        # (#4161). MiniMax still needs reasoning_split, which the
+                        # profile path does not add.
+                        _tg_extra = dict(api_kwargs.get('extra_body') or {})
                         if _is_minimax_route(getattr(agent, 'provider', ''), getattr(agent, 'model', ''), getattr(agent, 'base_url', '')):
-                            extra_body = dict(api_kwargs.get('extra_body') or {})
-                            extra_body['reasoning_split'] = True
-                            api_kwargs['extra_body'] = extra_body
+                            _tg_extra['reasoning_split'] = True
+                        if _tg_extra:
+                            api_kwargs['extra_body'] = _tg_extra
                         if 'max_completion_tokens' in api_kwargs:
                             api_kwargs['max_completion_tokens'] = max_tokens
                         else:
@@ -3817,6 +4021,23 @@ def _stream_writeback_can_supersede_recovery_marker(session, msg_text):
     return False
 
 
+def _retire_truncation_watermark_after_commit(session) -> None:
+    """Clear a positive truncation watermark once a new user turn is committed
+    to ``session.messages`` (#3831).
+
+    retry/undo/Edit set a positive watermark to suppress the *replaced* tail from
+    the append-only state.db merge; Session.save() deliberately never auto-clears
+    it (#2914). But nothing retired it when the user then sent a NEW turn, so it
+    froze at the old edit boundary and later dropped those post-edit turns on an
+    empty-sidecar reconcile. Once the new turn is durably in messages the merge's
+    max-sidecar guard suppresses the replaced tail without the watermark, so it is
+    safe — and necessary — to retire it here. Cleared to None, never 0.0 (the
+    truncate-to-empty sentinel that must keep blocking replay, #2914).
+    """
+    if getattr(session, 'truncation_watermark', None):
+        session.truncation_watermark = None
+
+
 def _merge_display_messages_after_agent_result(previous_display, previous_context, result_messages, msg_text):
     """Keep UI transcript durable while allowing model context to compact.
 
@@ -4412,7 +4633,105 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     if pending_attachments:
         recovered['attachments'] = list(pending_attachments)
     session.messages.append(recovered)
+    # The new user turn is now committed to messages (#3831): retire a positive
+    # truncation watermark left over from a prior retry/undo/edit so it cannot
+    # freeze at the old edit boundary and later drop these post-edit turns on an
+    # empty-sidecar reconcile. Cleared to None — never 0.0 (the truncate-to-empty
+    # sentinel, #2914). Safe here because the row is durably in messages, so the
+    # merge's max-sidecar guard suppresses the replaced tail without the watermark.
+    if getattr(session, 'truncation_watermark', None):
+        session.truncation_watermark = None
     return True
+
+
+def _build_partial_message(content_text, reasoning_text, tool_calls) -> dict | None:
+    """Build a _partial assistant message from raw streaming buffers.
+
+    Shared by cancel_stream() and _snapshot_and_append_partial_on_error().
+    Strips thinking/reasoning markup, builds the dict, returns None when
+    there is nothing meaningful to preserve.
+    """
+    import re as _re
+    partial_text = (content_text or '').strip()
+    _stripped = ''
+    if partial_text:
+        # First pass: remove complete <thinking>...</thinking> blocks.
+        _stripped = _re.sub(r'<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>',
+                            '', partial_text,
+                            flags=_re.DOTALL | _re.IGNORECASE).strip()
+        # Second pass: strip trailing UNCLOSED think/thinking block (the common
+        # cancel/error case — user stops mid-reasoning before the close tag appears).
+        _stripped = _re.sub(r'<think(?:ing)?\b[^>]*>.*',
+                            '', _stripped,
+                            flags=_re.DOTALL | _re.IGNORECASE).strip()
+    _has_reasoning = bool(reasoning_text and reasoning_text.strip())
+    _has_tools = bool(tool_calls)
+    if not (_stripped or _has_reasoning or _has_tools):
+        return None
+    _msg: dict = {
+        'role': 'assistant',
+        'content': _stripped,  # may be empty for reasoning/tool-only turns
+        '_partial': True,
+        'timestamp': int(time.time()),
+    }
+    if _has_reasoning:
+        _msg['reasoning'] = reasoning_text.strip()
+    if _has_tools:
+        _msg['_partial_tool_calls'] = list(tool_calls)
+    return _msg
+
+
+def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
+    """Snapshot streaming buffers under STREAMS_LOCK and append a _partial message.
+
+    Uses _build_partial_message() for the shared thinking-strip + dict-build logic.
+    """
+    from api import config as _live_config
+
+    streams_lock = STREAMS_LOCK
+    partial_texts = STREAM_PARTIAL_TEXT
+    reasoning_texts = STREAM_REASONING_TEXT
+    live_tool_calls = STREAM_LIVE_TOOL_CALLS
+
+    # Defensive check for live config (similar to cancel_stream)
+    if getattr(_live_config, 'STREAMS_LOCK', streams_lock) is not streams_lock:
+        streams_lock = _live_config.STREAMS_LOCK
+        partial_texts = getattr(_live_config, 'STREAM_PARTIAL_TEXT', partial_texts)
+        reasoning_texts = getattr(_live_config, 'STREAM_REASONING_TEXT', reasoning_texts)
+        live_tool_calls = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', live_tool_calls)
+
+    _snap_partial_text = None
+    _snap_reasoning = None
+    _snap_tool_calls = None
+
+    with streams_lock:
+        _snap_partial_text = partial_texts.get(stream_id, '')
+        if not _snap_partial_text:
+            _live_partials = getattr(_live_config, 'STREAM_PARTIAL_TEXT', partial_texts)
+            if _live_partials is not partial_texts:
+                _snap_partial_text = _live_partials.get(stream_id, '')
+
+        _snap_reasoning = reasoning_texts.get(stream_id, '')
+        if not _snap_reasoning:
+            _live_reasoning = getattr(_live_config, 'STREAM_REASONING_TEXT', reasoning_texts)
+            if _live_reasoning is not reasoning_texts:
+                _snap_reasoning = _live_reasoning.get(stream_id, '')
+
+        _snap_tool_calls = list(live_tool_calls.get(stream_id, []) or [])
+        if not _snap_tool_calls:
+            _live_tools = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', live_tool_calls)
+            if _live_tools is not live_tool_calls:
+                _snap_tool_calls = list(_live_tools.get(stream_id, []) or [])
+
+    _partial_msg = _build_partial_message(_snap_partial_text, _snap_reasoning, _snap_tool_calls)
+    if _partial_msg is None:
+        return None
+    if not isinstance(session.messages, list):
+        session.messages = []
+    if not _partial_marker_already_present(session.messages, _partial_msg):
+        session.messages.append(_partial_msg)
+        return _partial_msg
+    return None
 
 
 def _last_resort_sync_from_core(session, stream_id, agent_lock):
@@ -4477,7 +4796,7 @@ def _replace_session_db_in_kwargs(agent_kwargs, state_db_path):
 
 
 def _attempt_credential_self_heal(
-    provider_id, session_id, _agent_lock_ref,
+    provider_id, session_id, _agent_lock_ref, *, target_model=None,
 ):
     """Try to silently refresh credentials after a 401/auth error (#1401).
 
@@ -4525,6 +4844,7 @@ def _attempt_credential_self_heal(
         _new_rt = resolve_runtime_provider_with_anthropic_env_lock(
             resolve_runtime_provider,
             requested=provider_id,
+            target_model=target_model,
         )
 
         logger.info(
@@ -5764,6 +6084,7 @@ def _run_agent_streaming(
             resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
                 model_with_provider_context(model, provider_context)
             )
+            configured_base_url = resolved_base_url
 
             # Resolve API key via Hermes runtime provider (matches gateway behaviour).
             # Pass the resolved provider so non-default providers get their own credentials.
@@ -5774,12 +6095,14 @@ def _run_agent_streaming(
                 _rt = resolve_runtime_provider_with_anthropic_env_lock(
                     resolve_runtime_provider,
                     requested=resolved_provider,
+                    target_model=resolved_model,
                 )
                 resolved_api_key = _rt.get("api_key")
                 if not resolved_provider:
                     resolved_provider = _rt.get("provider")
-                if not resolved_base_url:
-                    resolved_base_url = _rt.get("base_url")
+                resolved_base_url = _runtime_preferred_base_url(
+                    _rt, resolved_provider, configured_base_url
+                )
             except Exception as _e:
                 print(f"[webui] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
 
@@ -6412,7 +6735,12 @@ def _run_agent_streaming(
                             getattr(s, 'active_stream_id', None),
                         )
                         return
+                _tool_limit_reached = _agent_result_tool_limit_reached(result)
                 _result_messages = result.get('messages') or _previous_context_messages
+                _result_messages = _drop_synthetic_max_iteration_summary_requests(
+                    _result_messages,
+                    enabled=_tool_limit_reached,
+                )
                 if cancel_event.is_set():
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
@@ -6444,6 +6772,7 @@ def _run_agent_streaming(
                     _restore_display_reasoning_metadata(_previous_messages, _result_messages),
                     msg_text,
                 )
+                _retire_truncation_watermark_after_commit(s)  # #3831
                 # Strip XML tool-call blocks from assistant message content.
                 # DeepSeek and some other providers emit <function_calls>...</function_calls>
                 # in the raw response text; this must be removed before the content is
@@ -6459,7 +6788,6 @@ def _run_agent_streaming(
                             for _part in _raw_content:
                                 if isinstance(_part, dict) and isinstance(_part.get('text'), str):
                                     _part['text'] = _strip_xml_tool_calls(_part['text'])
-
                 # ── Handle context compression side effects ──
                 # If compression fired inside run_conversation, the agent may have
                 # rotated its session_id. Detect and fix the mismatch before any
@@ -6603,12 +6931,18 @@ def _run_agent_streaming(
                 _terminal_failure = (
                     _agent_result_terminal_failure(result)
                     or (
+                        _tool_limit_reached
+                        and _session_lacks_final_assistant_answer(_all_result_messages)
+                    )
+                    or (
                         not _token_sent
                         and _session_lacks_final_assistant_answer(_all_result_messages)
                     )
                 )
                 if _terminal_failure:
                     _assistant_added = False
+                elif _tool_limit_reached and not _session_lacks_final_assistant_answer(s.messages):
+                    _mark_latest_assistant_tool_limit_status(s.messages)
                 # _token_sent tracks whether on_token() was called (any streamed text)
                 if _terminal_failure or (not _assistant_added and not _token_sent):
                     if cancel_event.is_set():
@@ -6648,6 +6982,7 @@ def _run_agent_streaming(
                         _heal_result = None
                         _heal_rt = _attempt_credential_self_heal(
                             resolved_provider or '', session_id, _agent_lock,
+                            target_model=resolved_model,
                         )
                         if _heal_rt is not None:
                             logger.info('[webui] self-heal: retrying stream after credential refresh')
@@ -6656,8 +6991,9 @@ def _run_agent_streaming(
                             resolved_api_key = _heal_rt.get('api_key')
                             if not resolved_provider:
                                 resolved_provider = _heal_rt.get('provider')
-                            if not resolved_base_url:
-                                resolved_base_url = _heal_rt.get('base_url')
+                            resolved_base_url = _runtime_preferred_base_url(
+                                _heal_rt, resolved_provider, configured_base_url
+                            )
                             resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
                                 resolved_provider, resolved_api_key, resolved_base_url
                             )
@@ -6708,6 +7044,10 @@ def _run_agent_streaming(
                                 # Since we're in a flat block, directly run the
                                 # post-result merge logic here.
                                 _result_messages = result.get('messages') or _previous_context_messages
+                                _result_messages = _drop_synthetic_max_iteration_summary_requests(
+                                    _result_messages,
+                                    enabled=_agent_result_tool_limit_reached(result),
+                                )
                                 _next_context_messages = _restore_reasoning_metadata(
                                     _previous_context_messages,
                                     _result_messages,
@@ -6723,6 +7063,7 @@ def _run_agent_streaming(
                                     _restore_reasoning_metadata(_previous_messages, _result_messages),
                                     msg_text,
                                 )
+                                _retire_truncation_watermark_after_commit(s)  # #3831
                                 # Skip the error block — jump directly to the
                                 # normal post-result persistence path by
                                 # leaving _assistant_added truthy (set below).
@@ -6744,6 +7085,17 @@ def _run_agent_streaming(
                             'your API key is invalid. Run `hermes model` in your terminal to '
                             'update credentials, then restart the WebUI.'
                         )
+                    elif _tool_limit_reached:
+                        _err_label = 'Tool iteration limit reached'
+                        _err_type = 'tool_limit_reached'
+                        _err_hint = (
+                            'The agent reached its configured tool iteration limit before producing '
+                            'a final answer. Start a narrower follow-up or increase agent.max_turns.'
+                        )
+                        _err_str = (
+                            'The agent reached its configured tool iteration limit before producing '
+                            'a final answer.'
+                        )
                     else:
                         _err_label = _classification['label']
                         _err_type = _classification['type']
@@ -6760,16 +7112,15 @@ def _run_agent_streaming(
                             _err_type,
                             _err_hint,
                         )
-                        # Clear stream/pending state so the session does not appear
-                        # "agent_running" on reload after a silent failure.
-                        # Persist the error so it survives page reload.
-                        # _error=True ensures _sanitize_messages_for_api excludes it from
-                        # subsequent API calls so the LLM never sees its own error as prior context.
                         _materialize_pending_user_turn_before_error(s)
                         s.active_stream_id = None
                         s.pending_user_message = None
                         s.pending_attachments = []
                         s.pending_started_at = None
+                        try:
+                            _snapshot_and_append_partial_on_error(s, stream_id)
+                        except Exception:
+                            logger.debug("Failed to snapshot partials on error for %s", stream_id, exc_info=True)
                         _error_message = {
                             'role': 'assistant',
                             'content': f'**{_err_label}:** {_error_payload.get("message") or _err_label}\n\n*{_err_hint}*',
@@ -6782,6 +7133,8 @@ def _run_agent_streaming(
                             _error_message['provider_details_label'] = 'Cancellation details'
                         elif _err_type == 'interrupted':
                             _error_message['provider_details_label'] = 'Interruption details'
+                        elif _err_type == 'tool_limit_reached':
+                            _error_message['provider_details_label'] = 'Terminal state details'
                         s.messages.append(_error_message)
                         try:
                             s.save()
@@ -6795,6 +7148,9 @@ def _run_agent_streaming(
                         if _compression_continuation_session_id is not None:
                             _error_payload['new_session_id'] = _compression_continuation_session_id
                             _error_payload['continuation_session_id'] = _compression_continuation_session_id
+                        if _err_type == 'tool_limit_reached':
+                            _error_payload['terminal_state'] = 'tool_limit_reached'
+                            _error_payload['terminal_reason'] = 'max_iterations'
                         put('apperror', _error_payload)
                         # Legacy #373 source tests and clients look for the
                         # no_response type; #1765 keeps that type but improves
@@ -7104,11 +7460,13 @@ def _run_agent_streaming(
                         )
                         _cfg_ctx_len = _ctx_lookup.config_context_length
                         _cfg_custom_providers = _ctx_lookup.custom_providers
+                        _cfg_api_key = _ctx_lookup.api_key or getattr(agent, 'api_key', '') or resolved_api_key or ''
                         _cfg_base_url = _ctx_lookup.base_url or _cfg_base_url
                         _cfg_provider = _ctx_lookup.provider or resolved_provider or ''
                         _resolved_cl = get_model_context_length(
                             getattr(agent, 'model', resolved_model or '') or '',
                             _cfg_base_url,
+                            api_key=_cfg_api_key,
                             config_context_length=_cfg_ctx_len,
                             provider=_cfg_provider,
                             custom_providers=_cfg_custom_providers,
@@ -7362,12 +7720,14 @@ def _run_agent_streaming(
                     )
                     _cfg_ctx_len = _ctx_lookup.config_context_length
                     _cfg_custom_providers = _ctx_lookup.custom_providers
+                    _cfg_api_key = _ctx_lookup.api_key or getattr(agent, 'api_key', '') or resolved_api_key or ''
                     _cfg_base_url = _ctx_lookup.base_url
                     _cfg_provider = _ctx_lookup.provider or resolved_provider or ''
                     try:
                         _fb_cl = _get_cl(
                             getattr(agent, 'model', resolved_model or '') or '',
                             _cfg_base_url,
+                            api_key=_cfg_api_key,
                             config_context_length=_cfg_ctx_len,
                             provider=_cfg_provider,
                             custom_providers=_cfg_custom_providers,
@@ -7485,7 +7845,11 @@ def _run_agent_streaming(
             except Exception as _goal_exc:
                 logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
             raw_session = s.compact() | {'messages': s.messages, 'tool_calls': tool_calls}
-            put('done', {'session': redact_session_data(raw_session), 'usage': usage})
+            _done_payload = {'session': redact_session_data(raw_session), 'usage': usage}
+            if _tool_limit_reached:
+                _done_payload['terminal_state'] = 'tool_limit_reached'
+                _done_payload['terminal_reason'] = 'max_iterations'
+            put('done', _done_payload)
             # Emit one last metering packet for the live message-header TPS label.
             meter_stats = meter().get_stats()
             meter_stats['session_id'] = session_id
@@ -7600,6 +7964,7 @@ def _run_agent_streaming(
                 # ── Credential self-heal on 401 (#1401) ──
                 _heal_rt = _attempt_credential_self_heal(
                     resolved_provider or '', session_id, _agent_lock,
+                    target_model=resolved_model,
                 )
                 if _heal_rt is not None:
                     logger.info('[webui] self-heal (except path): retrying stream after credential refresh')
@@ -7609,8 +7974,9 @@ def _run_agent_streaming(
                     resolved_api_key = _heal_rt.get('api_key')
                     if not resolved_provider:
                         resolved_provider = _heal_rt.get('provider')
-                    if not resolved_base_url:
-                        resolved_base_url = _heal_rt.get('base_url')
+                    resolved_base_url = _runtime_preferred_base_url(
+                        _heal_rt, resolved_provider, configured_base_url
+                    )
                     resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
                         resolved_provider, resolved_api_key, resolved_base_url
                     )
@@ -7671,6 +8037,7 @@ def _run_agent_streaming(
                                     _restore_reasoning_metadata(_previous_messages, _result_messages),
                                     msg_text,
                                 )
+                                _retire_truncation_watermark_after_commit(s)  # #3831
                                 s.save()
                         logger.info('[webui] self-heal (except path): retry succeeded')
                         return  # skip error emission
@@ -7713,11 +8080,16 @@ def _run_agent_streaming(
                         getattr(s, 'active_stream_id', None),
                     )
                     return
+
                 _materialize_pending_user_turn_before_error(s)
                 s.active_stream_id = None
                 s.pending_user_message = None
                 s.pending_attachments = []
                 s.pending_started_at = None
+                try:
+                    _snapshot_and_append_partial_on_error(s, stream_id)
+                except Exception:
+                    logger.debug("Failed to snapshot partials on error for %s", stream_id, exc_info=True)
                 _error_message = {
                     'role': 'assistant',
                     'content': f'**{_exc_label}:** {_error_payload.get("message") or err_str}' + (f'\n\n*{_exc_hint}*' if _exc_hint else ''),
@@ -8205,26 +8577,17 @@ def cancel_stream(stream_id: str) -> bool:
                 # accumulated in thread-local variables but invisible to the cancel path.
                 # This prevents paid-token data loss when cancelling mid-reasoning or
                 # mid-tool-execution.
-                partial_text = _cancel_partial_text.strip() if _cancel_partial_text else ''
-                _stripped = ''
-                if partial_text:
-                    import re as _re
-                    # Strip thinking/reasoning markup from partial content before saving.
-                    # First pass: remove complete <thinking>...</thinking> blocks.
-                    _stripped = _re.sub(r'<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>',
-                                        '', partial_text,
-                                        flags=_re.DOTALL | _re.IGNORECASE).strip()
-                    # Second pass: strip trailing UNCLOSED think/thinking block (the common
-                    # cancel case — user stops mid-reasoning before the close tag appears).
-                    _stripped = _re.sub(r'<think(?:ing)?\b[^>]*>.*',
-                                        '', _stripped,
-                                        flags=_re.DOTALL | _re.IGNORECASE).strip()
-                # Determine whether there is anything to preserve beyond just the
-                # cancel marker.  Content text, reasoning trace, or tool calls all
-                # count (#1361 §C — previously only _stripped was checked, so a
-                # reasoning-only or tool-only stream produced NO partial message).
-                _has_reasoning = bool(_cancel_reasoning and _cancel_reasoning.strip())
-                _has_tools = bool(_cancel_tool_calls)
+                # NOTE on _partial_tool_calls: the captured entries use the WebUI
+                # internal shape {name, args, done, duration, is_error} — they do
+                # NOT carry the OpenAI/Anthropic API id + function: {name, arguments}
+                # envelope. Storing under 'tool_calls' would cause
+                # _sanitize_messages_for_api to forward them to the next-turn LLM
+                # call and strict providers would 400 on the malformed entries.
+                # The underscore-prefixed key is not in the whitelist, so sanitize
+                # strips it. The UI reads it via static/messages.js. (v0.50.251.)
+                _partial_msg = _build_partial_message(
+                    _cancel_partial_text, _cancel_reasoning, _cancel_tool_calls,
+                )
                 _cancel_marker_exists = _session_has_cancel_marker(_cs)
                 _cancel_marker_idx = len(_cs.messages)
                 if _cancel_marker_exists:
@@ -8236,33 +8599,7 @@ def cancel_stream(stream_id: str) -> bool:
                         if any(pattern in _content for pattern in _CANCEL_MARKER_PATTERNS):
                             _cancel_marker_idx = _idx
                             break
-                if _stripped or _has_reasoning or _has_tools:
-                    _partial_msg: dict = {
-                        'role': 'assistant',
-                        'content': _stripped,  # may be empty for reasoning/tool-only turns
-                        '_partial': True,
-                        'timestamp': int(time.time()),
-                    }
-                    if _has_reasoning:
-                        _partial_msg['reasoning'] = _cancel_reasoning.strip()
-                    if _has_tools:
-                        # NOTE: store under the private '_partial_tool_calls' key
-                        # (NOT 'tool_calls'). The captured entries use the WebUI
-                        # internal shape {name, args, done, duration, is_error}
-                        # — they do NOT carry the OpenAI/Anthropic API id +
-                        # function: {name, arguments} envelope. If we put them
-                        # under 'tool_calls', `_sanitize_messages_for_api`
-                        # (which whitelists 'tool_calls' via _API_SAFE_MSG_KEYS)
-                        # would forward them to the next-turn LLM call and
-                        # strict providers (OpenAI, Anthropic, Z.AI/GLM) would
-                        # 400 on the malformed entries — turning a "data lost
-                        # on cancel" bug into a "next message returns 400"
-                        # bug, which is worse. The underscore-prefixed key is
-                        # not in the whitelist, so sanitize strips it. The UI
-                        # reads it via static/messages.js and renders it
-                        # alongside the regular tool_calls path.
-                        # (Opus pre-release review pass 2 of v0.50.251.)
-                        _partial_msg['_partial_tool_calls'] = list(_cancel_tool_calls)
+                if _partial_msg is not None:
                     # Deduplicate against the full partial payload, not just
                     # non-empty content. Tool-only/reasoning-only partials have
                     # empty content, so a content-gated check can append the same

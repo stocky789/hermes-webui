@@ -730,7 +730,6 @@
             <div class="reasoning-option" data-effort="medium">Medium</div>
             <div class="reasoning-option" data-effort="high">High</div>
             <div class="reasoning-option" data-effort="xhigh">Extra High</div>
-            <div class="reasoning-option" data-effort="max">Max</div>
           </div>
           <div class="composer-toolsets-dropdown" id="composerToolsetsDropdown">
             <div class="toolsets-dropdown-desc" id="toolsetsDropdownDesc"></div>
@@ -1005,11 +1004,34 @@
               <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_session_endless_scroll">When enabled, older messages load automatically as you scroll upward. When disabled, use the older-messages button.</div>
             </div>
             <div class="settings-field" style="margin-top:8px">
+              <label id="settingsChatActivityDisplayModeLabel" for="settingsChatActivityDisplayMode" data-i18n="settings_label_chat_activity_display_mode">Activity display</label>
+              <div class="chat-activity-mode-toggle" role="group" aria-labelledby="settingsChatActivityDisplayModeLabel">
+                <button type="button" class="chat-activity-mode-btn active" data-chat-activity-mode="compact_worklog" onclick="_pickChatActivityDisplayMode('compact_worklog')">
+                  <span data-i18n="settings_option_compact_worklog">Compact Worklog</span>
+                </button>
+                <button type="button" class="chat-activity-mode-btn" data-chat-activity-mode="transparent_stream" onclick="_pickChatActivityDisplayMode('transparent_stream')">
+                  <span data-i18n="settings_option_transparent_stream">Transparent Stream</span>
+                </button>
+              </div>
+              <select id="settingsChatActivityDisplayMode" style="display:none">
+                <option value="compact_worklog" data-i18n="settings_option_compact_worklog">Compact Worklog</option>
+                <option value="transparent_stream" data-i18n="settings_option_transparent_stream">Transparent Stream</option>
+              </select>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_chat_activity_display_mode">Compact Worklog groups supporting activity into a quiet summary. Transparent Stream keeps each thinking/tool event as its own chronological expandable row.</div>
+            </div>
+            <div class="settings-field" style="margin-top:8px">
               <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-                <input type="checkbox" id="settingsActivityFeedExpandedDefault" style="width:15px;height:15px;accent-color:var(--accent)">
-                <span data-i18n="settings_label_activity_feed_expanded_default">Expand activity feed by default</span>
+                <input type="checkbox" id="settingsAutoScrollFollow" style="width:15px;height:15px;accent-color:var(--accent)">
+                <span data-i18n="settings_label_auto_scroll_follow">Auto-follow new content</span>
               </label>
-              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_activity_feed_expanded_default">Open new Activity disclosures automatically so tool and model progress is visible without an extra click. Per-turn manual collapse/expand choices still win.</div>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_auto_scroll_follow">When enabled, the view scrolls to the bottom as new tokens stream in. When disabled, you control the scroll position manually.</div>
+            </div>
+            <div class="settings-field" style="margin-top:8px">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="settingsWorklogDetailsExpandedDefault" style="width:15px;height:15px;accent-color:var(--accent)">
+                <span data-i18n="settings_label_worklog_details_expanded_default">Open Worklog details automatically</span>
+              </label>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_worklog_details_expanded_default">When enabled, new Worklog details start expanded so tool, thinking, and progress cards are visible without an extra click. When off, Worklog details stay folded by default; per-turn manual collapse/expand choices still win.</div>
             </div>
             <div class="settings-field">
               <label id="tabVisibilityLabel" data-i18n="settings_label_tab_visibility">Sidebar tabs</label>
@@ -1125,7 +1147,12 @@
                 <input type="checkbox" id="settingsNotificationsEnabled" style="width:15px;height:15px;accent-color:var(--accent)">
                 <span data-i18n="settings_label_notifications">Browser notifications</span>
               </label>
-              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_notifications">Show a system notification when a response completes while the tab is in the background.</div>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_notifications">Show a system notification when a response completes while the app is in the background.</div>
+              <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+                <button type="button" class="sm-btn" onclick="requestNotificationPermission()" style="padding:5px 10px;font-size:12px" data-i18n="notifications_enable_btn">Enable notifications</button>
+                <button type="button" class="sm-btn" onclick="sendBrowserNotification('Hermes test','Notifications are ready.',{force:true});" style="padding:5px 10px;font-size:12px" data-i18n="notifications_test_btn">Send test</button>
+                <span id="notificationPermissionStatus" style="font-size:11px;color:var(--muted)"></span>
+              </div>
             </div>
             <div class="settings-field">
               <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
@@ -1143,6 +1170,13 @@
             </div>
             <div class="settings-field">
               <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="settingsShowConversationOutline" style="width:15px;height:15px;accent-color:var(--accent)">
+                <span data-i18n="settings_label_conversation_outline">Show conversation outline</span>
+              </label>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_conversation_outline">Show a desktop-only jump list for user questions in the current conversation. Off by default.</div>
+            </div>
+            <div class="settings-field">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
                 <input type="checkbox" id="settingsShowTps" style="width:15px;height:15px;accent-color:var(--accent)">
                 <span data-i18n="settings_label_token_speed">Show token speed (TPS)</span>
               </label>
@@ -1154,13 +1188,6 @@
                 <span data-i18n="settings_label_fade_text_effect">Fade text effect</span>
               </label>
               <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_fade_text_effect">Fade newly streamed words in while the assistant is responding. Similar to OpenWebUI; off by default for maximum performance.</div>
-            </div>
-            <div class="settings-field">
-              <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-                <input type="checkbox" id="settingsSimplifiedToolCalling" style="width:15px;height:15px;accent-color:var(--accent)">
-                <span>Compact tool activity</span>
-              </label>
-              <div style="font-size:11px;color:var(--muted);margin-top:4px">Show thinking and tool calls as compact inline activity while preserving the agent timeline.</div>
             </div>
             <div class="settings-field">
               <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
@@ -1316,7 +1343,7 @@
             <button class="sm-btn" id="btnSignOut" onclick="signOut()" style="margin-top:6px;width:100%;padding:8px;font-weight:600;color:var(--accent);border-color:rgba(233,69,96,.3);display:none" data-i18n="sign_out">Sign Out</button>
             <div class="settings-field" id="shutdownServerBlock" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
               <label data-i18n="settings_label_shutdown">Stop the Hermes WebUI server</label>
-              <div style="font-size:11px;color:var(--muted);margin-bottom:8px" data-i18n="settings_desc_shutdown">Gracefully stops the local WebUI server. Useful if you launched via <code>./ctl.sh start</code> and want to stop without switching to a terminal. You'll need to relaunch the server (<code>./ctl.sh start</code> or the native app) before the WebUI is reachable again.</div>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:8px"><span data-i18n="settings_desc_shutdown_before_cmd">Gracefully stops the local WebUI server. Useful if you launched via </span><code>./ctl.sh start</code><span data-i18n="settings_desc_shutdown_between_cmds"> and want to stop without switching to a terminal. You'll need to relaunch the server (</span><code>./ctl.sh start</code><span data-i18n="settings_desc_shutdown_after_cmd"> or the native app) before the WebUI is reachable again.</span></div>
               <button class="sm-btn" id="btnShutdownServer" onclick="shutdownServer()" style="width:100%;padding:8px;font-weight:600;color:#e74c3c;border-color:rgba(231,76,60,.3)" data-i18n="settings_btn_shutdown">Stop server</button>
             </div>
             <div class="settings-field" id="passkeysSettingsBlock" style="display:none;margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
@@ -1422,7 +1449,7 @@
         <button class="panel-icon-btn has-tooltip has-tooltip--bottom" id="btnUpDir" data-tooltip="Parent directory" onclick="navigateUp()" style="display:none"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg></button>
         <button class="panel-icon-btn has-tooltip has-tooltip--bottom" id="btnNewFile" data-tooltip="New file" onclick="promptNewFile()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
         <button class="panel-icon-btn has-tooltip has-tooltip--bottom" id="btnNewFolder" data-tooltip="New folder" onclick="promptNewFolder()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
-        <button class="panel-icon-btn has-tooltip has-tooltip--bottom" id="btnRefreshPanel" data-tooltip="Refresh" onclick="if(S.session)loadDir(S.currentDir)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg></button>
+        <button class="panel-icon-btn has-tooltip has-tooltip--bottom" id="btnRefreshPanel" data-tooltip="Refresh" onclick="if(S.session)refreshWorkspacePanel()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></svg></button>
         <button class="panel-icon-btn has-tooltip has-tooltip--bottom" id="btnUploadWorkspace" data-tooltip="Upload file" onclick="triggerWorkspaceUpload()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></button>
         <button class="panel-icon-btn has-tooltip has-tooltip--bottom" id="btnWorkspacePrefs" data-tooltip="Workspace options" data-i18n-title="workspace_options" aria-haspopup="true" aria-expanded="false" onclick="toggleWorkspacePrefsMenu(event)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg><span class="workspace-prefs-dot" id="workspacePrefsDot" hidden></span></button>
         <button class="panel-icon-btn close-preview has-tooltip has-tooltip--bottom" id="btnClearPreview" data-tooltip="Close preview"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
@@ -1536,6 +1563,7 @@
 <div class="toast" id="toast"></div>
 <script src="static/i18n.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/icons.js?v=__WEBUI_VERSION__" defer></script>
+<script src="static/assistant_turn_anchors.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/ui.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/workspace.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/terminal.js?v=__WEBUI_VERSION__" defer></script>
@@ -1545,6 +1573,7 @@
 <script src="static/panels.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/onboarding.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/boot.js?v=__WEBUI_VERSION__" defer></script>
+<script src="static/outline.js?v=__WEBUI_VERSION__" defer></script>
 
 <!-- Kanban: create/rename board modal — used for both flows. -->
 <div class="kanban-modal-overlay" id="kanbanBoardModal" hidden onclick="if(event.target===this)closeKanbanBoardModal()">
@@ -1626,6 +1655,22 @@
       <button type="button" class="btn primary" id="kanbanTaskModalSubmit" onclick="submitKanbanTaskModal()" data-i18n="create">Create</button>
     </div>
   </div>
+</div>
+<!-- Conversation Outline Panel (#2124): floating jump-to-question panel -->
+<button id="outlineToggleBtn" type="button" hidden
+  onclick="toggleOutlinePanel()"
+  title="Conversation outline"
+  aria-label="Toggle conversation outline"
+  aria-controls="outlinePanelWrapper">&#9776;</button>
+<div id="outlinePanelWrapper" hidden
+  role="navigation" aria-label="Conversation outline">
+  <div class="outline-header">
+    <span data-i18n="outline_title">Outline</span>
+    <button class="outline-close-btn" type="button"
+      onclick="toggleOutlinePanel()"
+      aria-label="Close outline">&#215;</button>
+  </div>
+  <div id="outlinePanel"></div>
 </div>
 </body>
 </html>

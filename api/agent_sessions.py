@@ -396,6 +396,7 @@ def read_importable_agent_session_rows(
     limit: int | None = 200,
     log=None,
     exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
+    include_sources: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Return agent sessions projected as importable conversations.
 
@@ -409,7 +410,9 @@ def read_importable_agent_session_rows(
     sidebar. This mirrors Hermes Agent CLI's session-list behaviour: interactive
     views should stay focused on user-facing conversations, while callers that
     need a source-specific diagnostic view can opt out by passing
-    ``exclude_sources=None``.
+    ``exclude_sources=None``. ``include_sources`` is an additional narrowing
+    filter; callers that want an include-only query should explicitly pass
+    ``exclude_sources=None`` so the default exclusions do not also apply.
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -462,6 +465,28 @@ def read_importable_agent_session_rows(
         use_messages_join = messages_has_session_id
         count_col = 'id' if 'id' in message_cols else 'session_id'
 
+        # Defensive index prime (#3887). The candidate-ordering query below sorts
+        # sessions by a correlated ``MAX(mx.timestamp)`` subquery over ``messages``.
+        # That is fast only when the agent's standard
+        # ``idx_messages_session ON messages(session_id, timestamp)`` index exists.
+        # A normally-migrated hermes-agent state.db has it, but a db that lost its
+        # migrations (older hermes-agent, or a hand-rebuilt/reimported db) does
+        # not — and the subquery then degrades to a full ``messages`` scan per
+        # candidate session, stalling ``/api/sessions`` for seconds on every
+        # refresh (the 5s-TTL cache never settles). Priming the index is a no-op
+        # (~free) when it already exists, and self-heals an affected db in
+        # milliseconds. Best-effort: degrade silently on a read-only db or any
+        # error so the listing never fails because of the prime.
+        if messages_has_session_id and messages_has_timestamp:
+            try:
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                    "ON messages(session_id, timestamp)"
+                )
+                conn.commit()
+            except sqlite3.Error:
+                pass  # read-only db / locked / older schema — degrade gracefully
+
         if use_messages_join:
             actual_count_expr = f"COUNT(m.{count_col})"
             if 'role' in message_cols:
@@ -495,6 +520,12 @@ def read_importable_agent_session_rows(
 
         where_clauses = ["s.source IS NOT NULL"]
         params: list[object] = []
+        if include_sources:
+            included = tuple(str(source) for source in include_sources if source)
+            if included:
+                placeholders = ", ".join("?" for _ in included)
+                where_clauses.append(f"s.source IN ({placeholders})")
+                params.extend(included)
         if exclude_sources:
             excluded = tuple(str(source) for source in exclude_sources if source)
             if excluded:
