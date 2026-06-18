@@ -4,10 +4,14 @@ async function api(path,opts={}){
   const url=new URL(rel,document.baseURI||location.href);
   const timeoutMs=Object.prototype.hasOwnProperty.call(opts,'timeoutMs')?opts.timeoutMs:30000;
   const timeoutToast=opts.timeoutToast!==false;
+  const maxAttempts=Object.prototype.hasOwnProperty.call(opts,'retries')?Math.max(0,Number(opts.retries)||0)+1:3;
+  const retryTimeouts=opts.retryTimeouts===true;
+  const retryStatuses=Array.isArray(opts.retryStatuses)?opts.retryStatuses.map(Number).filter(Number.isFinite):[];
+  const retryDelayMs=Object.prototype.hasOwnProperty.call(opts,'retryDelayMs')?Math.max(0,Number(opts.retryDelayMs)||0):350;
   // Retry up to 2 times on network errors (e.g. stale keep-alive after long idle).
-  // Server errors (4xx/5xx) and client-side timeouts are NOT retried.
+  // Callers may opt into retrying timeouts / transient server statuses for idempotent GETs.
   let lastErr;
-  for(let attempt=0;attempt<3;attempt++){
+  for(let attempt=0;attempt<maxAttempts;attempt++){
     let controller=null;
     let timeoutId=null;
     let didTimeout=false;
@@ -17,6 +21,10 @@ async function api(path,opts={}){
       const fetchOpts={...opts};
       delete fetchOpts.timeoutMs;
       delete fetchOpts.timeoutToast;
+      delete fetchOpts.retries;
+      delete fetchOpts.retryTimeouts;
+      delete fetchOpts.retryStatuses;
+      delete fetchOpts.retryDelayMs;
 
       const useTimeout=Number.isFinite(Number(timeoutMs))&&Number(timeoutMs)>0;
       if(useTimeout&&typeof AbortController!=='undefined'){
@@ -69,6 +77,10 @@ async function api(path,opts={}){
       lastErr=e;
       const isTimeout=didTimeout||(e&&(e.timeout===true||e.name==='TimeoutError'));
       if(isTimeout){
+        if(retryTimeouts&&attempt<2&&attempt<maxAttempts-1){
+          if(retryDelayMs) await new Promise(resolve=>setTimeout(resolve,retryDelayMs*Math.pow(2,attempt)));
+          continue;
+        }
         const err=(e&&e.name==='TimeoutError')?e:new Error('Request timed out. Please try again.');
         err.name='TimeoutError';
         err.timeout=true;
@@ -78,7 +90,10 @@ async function api(path,opts={}){
       // Only retry on network errors (TypeError from fetch), not on HTTP errors
       // that were already thrown above. Re-throw 401 redirects immediately.
       if(e.message&&/401/.test(e.message)) throw e;
-      if(attempt<2 && e instanceof TypeError) continue;
+      if(attempt<2&&attempt<maxAttempts-1 && (e instanceof TypeError || retryStatuses.includes(Number(e.status)))){
+        if(retryDelayMs) await new Promise(resolve=>setTimeout(resolve,retryDelayMs*Math.pow(2,attempt)));
+        continue;
+      }
       throw e;
     }finally{
       if(timeoutId) clearTimeout(timeoutId);
@@ -142,6 +157,45 @@ function scheduleRenderSessionArtifacts(){
 if(typeof document !== 'undefined'){
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _setWorkspacePanelTabDataset, {once:true});
   else _setWorkspacePanelTabDataset();
+}
+
+function _loadWorkspacePanelTodos(){
+  const panel = $('workspaceTodosPanel');
+  if(!panel) return;
+  let todos = [];
+  try{
+    if(S && Array.isArray(S.todos)){
+      todos = S.todos;
+    } else if(S && S.session && S.session.todo_state && Array.isArray(S.session.todo_state.todos)){
+      todos = S.session.todo_state.todos;
+    } else if(typeof _legacyTodosFromMessages === 'function'){
+      todos = _legacyTodosFromMessages() || [];
+    }
+  }catch(e){ todos = []; }
+  if(!todos.length){
+    panel.innerHTML = '<div style="padding:24px 12px;text-align:center;color:var(--muted);font-size:12px">No active tasks</div>';
+    return;
+  }
+  const statusIcon = (s) => {
+    if(s === 'completed') return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
+    if(s === 'in_progress') return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--blue)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
+    if(s === 'cancelled') return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    // pending
+    return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/></svg>';
+  };
+  const items = todos.map(t => {
+    const s = t.status || 'pending';
+    const isDone = s === 'completed' || s === 'cancelled';
+    return `<div style="display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">`+
+      `<span style="flex-shrink:0;margin-top:2px">${statusIcon(s)}</span>`+
+      `<span style="font-size:12px;color:${isDone?'var(--muted)':'var(--text)'};text-decoration:${s==='cancelled'?'line-through':'none'}">${_escHtml(t.content||t.text||'')}</span>`+
+      `</div>`;
+  }).join('');
+  panel.innerHTML = `<div style="padding:4px 0">${items}</div>`;
+}
+
+function _escHtml(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 const ARTIFACT_IGNORE_RE = /(^|\/)(?:\.git|\.hg|\.svn|node_modules|\.venv|venv|__pycache__|dist|build|\.next|\.cache)(?:\/|$)/;
@@ -916,13 +970,14 @@ function renderWorkspacePanelTabState(){
   const git=_ensureGitState();
   const hasGit=!!(git.status&&git.status.is_git);
   if(_workspacePanelActiveTab==='changes'&&!hasGit)_workspacePanelActiveTab='files';
-  const active=_workspacePanelActiveTab==='artifacts'?'artifacts':(_workspacePanelActiveTab==='changes'?'changes':'files');
+  const active=_workspacePanelActiveTab==='artifacts'?'artifacts':(_workspacePanelActiveTab==='todos'?'todos':(_workspacePanelActiveTab==='changes'?'changes':'files'));
   git.selectedTab=active==='changes'?'changes':'files';
   _setWorkspacePanelTabDataset();
   const filesTab=$('btnWorkspaceFilesTab')||$('workspaceFilesTab');
   const changesTab=$('btnWorkspaceChangesTab');
   const artifactsTab=$('workspaceArtifactsTab');
-  const changesView=$('gitChangesView'), fileTree=$('fileTree'), emptyEl=$('wsEmptyState'), artifacts=$('workspaceArtifacts');
+  const todosTab=$('workspaceTodosTab');
+  const changesView=$('gitChangesView'), fileTree=$('fileTree'), emptyEl=$('wsEmptyState'), artifacts=$('workspaceArtifacts'), todosPanel=$('workspaceTodosPanel');
   const previewArea=$('previewArea');
   const previewVisible=previewArea&&previewArea.classList.contains('visible');
   if(changesTab)changesTab.hidden=!hasGit;
@@ -934,13 +989,21 @@ function renderWorkspacePanelTabState(){
   setTab(filesTab,active==='files');
   setTab(changesTab,active==='changes');
   setTab(artifactsTab,active==='artifacts');
+  setTab(todosTab,active==='todos');
   if(artifacts)artifacts.hidden=active!=='artifacts';
+  if(todosPanel)todosPanel.hidden=active!=='todos';
   if(active==='artifacts'){
     if(fileTree)fileTree.style.display='none';
     if(emptyEl)emptyEl.style.display='none';
     if(changesView)changesView.style.display='none';
     if(previewArea)previewArea.classList.remove('visible');
     renderSessionArtifacts();
+  }else if(active==='todos'){
+    if(fileTree)fileTree.style.display='none';
+    if(emptyEl)emptyEl.style.display='none';
+    if(changesView)changesView.style.display='none';
+    if(previewArea)previewArea.classList.remove('visible');
+    _loadWorkspacePanelTodos();
   }else if(active==='changes'){
     if(fileTree)fileTree.style.display='none';
     if(emptyEl)emptyEl.style.display='none';
@@ -953,7 +1016,7 @@ function renderWorkspacePanelTabState(){
 
 function switchWorkspacePanelTab(tab){
   const git=_ensureGitState();
-  const next=tab==='artifacts'?'artifacts':(tab==='changes'?'changes':'files');
+  const next=tab==='artifacts'?'artifacts':(tab==='todos'?'todos':(tab==='changes'?'changes':'files'));
   if(next==='changes'&&!(git.status&&git.status.is_git)){
     _workspacePanelActiveTab='files';
   }else{
@@ -969,6 +1032,11 @@ function switchWorkspacePanelTab(tab){
     if($('previewArea'))$('previewArea').classList.remove('visible');
     git.selectedDiff=null;
     renderSessionArtifacts();
+  }
+  if(_workspacePanelActiveTab==='todos'){
+    if($('previewArea'))$('previewArea').classList.remove('visible');
+    git.selectedDiff=null;
+    _loadWorkspacePanelTodos();
   }
   renderWorkspacePanelTabState();
 }
@@ -1357,8 +1425,9 @@ function setLargeMarkdownForceRenderVisible(visible){
 }
 
 function renderMarkdownPreviewContent(data){
-  showPreview('md');
-  $('previewMd').innerHTML=renderMd(data.content);
+  const target=data&&data.el?data.el:$('previewMd');
+  if(!data||!data.el) showPreview('md');
+  target.innerHTML=renderMd(data.content);
   requestAnimationFrame(()=>{if(typeof renderKatexBlocks==='function')renderKatexBlocks();});
 }
 
@@ -2151,7 +2220,7 @@ if (typeof document !== 'undefined') {
       if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files')) {
         e.preventDefault();
         e.stopPropagation();
-        if (e.target.closest('.file-item[data-ws-type="dir"],.breadcrumb-seg')) return;
+        if (e.target.closest('.file-item[data-ws-type="dir"],.file-item[data-ws-is-dir="true"],.breadcrumb-seg')) return;
         e.dataTransfer.dropEffect = 'copy';
         tree.classList.add('drag-over-upload');
       }
@@ -2163,7 +2232,7 @@ if (typeof document !== 'undefined') {
     tree.addEventListener('drop', async (e) => {
       tree.classList.remove('drag-over-upload');
       if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes('Files')) return;
-      if (e.target.closest('.file-item[data-ws-type="dir"],.breadcrumb-seg')) return;
+      if (e.target.closest('.file-item[data-ws-type="dir"],.file-item[data-ws-is-dir="true"],.breadcrumb-seg')) return;
       e.preventDefault();
       e.stopPropagation();
       await uploadOsDropToWorkspace(e.dataTransfer, S.currentDir || '.');
