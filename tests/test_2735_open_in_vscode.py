@@ -226,19 +226,21 @@ class TestOpenInVsCodeI18n:
     ]
 
     def test_open_in_vscode_key_count(self):
-        """open_in_vscode key must appear exactly once per locale (11 total)."""
+        """open_in_vscode key must appear exactly once per locale."""
         src = I18N.read_text(encoding="utf-8")
+        expected = src.count("_lang:")
         count = src.count("open_in_vscode:")
-        assert count == 12, (
-            f"Expected 11 open_in_vscode: entries (one per locale), found {count}"
+        assert count == expected, (
+            f"Expected {expected} open_in_vscode: entries (one per locale), found {count}"
         )
 
     def test_open_in_vscode_failed_key_count(self):
-        """open_in_vscode_failed key must appear exactly once per locale (11 total)."""
+        """open_in_vscode_failed key must appear exactly once per locale."""
         src = I18N.read_text(encoding="utf-8")
+        expected = src.count("_lang:")
         count = src.count("open_in_vscode_failed:")
-        assert count == 12, (
-            f"Expected 11 open_in_vscode_failed: entries (one per locale), found {count}"
+        assert count == expected, (
+            f"Expected {expected} open_in_vscode_failed: entries (one per locale), found {count}"
         )
 
     def test_english_translation_not_a_placeholder(self):

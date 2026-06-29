@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import threading
 import urllib.error
 from unittest.mock import MagicMock, patch
@@ -15,7 +16,9 @@ from unittest.mock import MagicMock, patch
 def test_gateway_capability_detection():
     """get_gateway_caps / gateway_supports_approval correctly parse /v1/capabilities."""
     from api.config import (
+        gateway_approval_unavailable_reason,
         gateway_supports_approval,
+        get_gateway_caps,
         invalidate_gateway_caps,
     )
 
@@ -38,6 +41,10 @@ def test_gateway_capability_detection():
         return resp
 
     with patch("urllib.request.urlopen", side_effect=_fake_urlopen_capable):
+        caps = get_gateway_caps("http://fake:1234", "secret")
+        assert caps["capabilities_reachable"] is True
+        assert caps["probe_error"] is None
+        assert gateway_approval_unavailable_reason("http://fake:1234", "secret") is None
         assert gateway_supports_approval("http://fake:1234", "secret") is True
 
     invalidate_gateway_caps()
@@ -52,7 +59,86 @@ def test_gateway_capability_detection():
         return resp
 
     with patch("urllib.request.urlopen", side_effect=_fake_urlopen_incapable):
+        caps = get_gateway_caps("http://fake:5678")
+        assert caps["capabilities_reachable"] is True
+        assert caps["probe_error"] is None
+        assert gateway_approval_unavailable_reason("http://fake:5678") == "unsupported"
         assert gateway_supports_approval("http://fake:5678") is False
+
+    invalidate_gateway_caps()
+
+
+def test_gateway_capability_detection_marks_probe_failures_unreachable():
+    """Probe failures stay non-fatal but remain distinguishable from unsupported gateways."""
+    from api.config import (
+        gateway_approval_unavailable_reason,
+        gateway_supports_approval,
+        get_gateway_caps,
+        invalidate_gateway_caps,
+    )
+
+    invalidate_gateway_caps()
+
+    def _fake_urlopen_fail(req, *, timeout=None):
+        assert req.full_url == "http://fake:9999/v1/capabilities"
+        raise urllib.error.URLError(ConnectionRefusedError("connection refused"))
+
+    with patch("urllib.request.urlopen", side_effect=_fake_urlopen_fail):
+        caps = get_gateway_caps("http://fake:9999", "secret")
+        assert caps["capabilities_reachable"] is False
+        assert caps["probe_error"]
+        assert gateway_approval_unavailable_reason("http://fake:9999", "secret") == "unreachable"
+        assert gateway_supports_approval("http://fake:9999", "secret") is False
+
+    invalidate_gateway_caps()
+
+
+def test_gateway_capability_detection_treats_timeout_probe_as_reachable_unsupported():
+    """Slow probes should preserve the reachable-but-unsupported warning contract."""
+    from api.config import (
+        gateway_approval_unavailable_reason,
+        gateway_supports_approval,
+        get_gateway_caps,
+        invalidate_gateway_caps,
+    )
+
+    invalidate_gateway_caps()
+
+    def _fake_urlopen_timeout(req, *, timeout=None):
+        assert req.full_url == "http://fake:8888/v1/capabilities"
+        raise socket.timeout("timed out")
+
+    with patch("urllib.request.urlopen", side_effect=_fake_urlopen_timeout):
+        caps = get_gateway_caps("http://fake:8888", "secret")
+        assert caps["capabilities_reachable"] is True
+        assert caps["probe_error"]
+        assert gateway_approval_unavailable_reason("http://fake:8888", "secret") == "unsupported"
+        assert gateway_supports_approval("http://fake:8888", "secret") is False
+
+    invalidate_gateway_caps()
+
+
+def test_gateway_capability_detection_treats_404_probe_as_reachable_unsupported():
+    """Older reachable gateways can 404 /v1/capabilities without becoming "offline"."""
+    from api.config import (
+        gateway_approval_unavailable_reason,
+        gateway_supports_approval,
+        get_gateway_caps,
+        invalidate_gateway_caps,
+    )
+
+    invalidate_gateway_caps()
+
+    def _fake_urlopen_404(req, *, timeout=None):
+        assert req.full_url == "http://fake:7777/v1/capabilities"
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", hdrs=None, fp=io.BytesIO(b""))
+
+    with patch("urllib.request.urlopen", side_effect=_fake_urlopen_404):
+        caps = get_gateway_caps("http://fake:7777", "secret")
+        assert caps["capabilities_reachable"] is True
+        assert caps["probe_error"]
+        assert gateway_approval_unavailable_reason("http://fake:7777", "secret") == "unsupported"
+        assert gateway_supports_approval("http://fake:7777", "secret") is False
 
     invalidate_gateway_caps()
 
@@ -132,10 +218,23 @@ def test_gateway_runs_api_submission():
         STREAMS[stream_id] = q
 
     runs_called = {"called": False}
+    captured = {}
     original_text = "hello from runs"
 
-    def fake_runs_streaming(*args, **kwargs):
+    def fake_runs_streaming(
+        session_id,
+        msg_text,
+        model,
+        workspace,
+        stream_id,
+        base_url,
+        api_key,
+        prefill_messages,
+        body_extras,
+        **kwargs,
+    ):
         runs_called["called"] = True
+        captured["body_extras"] = body_extras
         return (original_text, {"input_tokens": 10, "output_tokens": 5})
 
     mock_session = MagicMock()
@@ -154,6 +253,7 @@ def test_gateway_runs_api_submission():
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway", "HERMES_WEBUI_GATEWAY_USE_RUNS_API": "1"}):
             with patch("api.gateway_chat.gateway_supports_approval", lambda *_args, **_kwargs: True), \
                  patch("api.gateway_chat._run_gateway_runs_api_streaming", fake_runs_streaming), \
+                 patch("api.gateway_chat._gateway_reasoning_effort_for_request", return_value="high"), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
                  patch("api.gateway_chat.merge_session_messages_append_only", return_value=[]):
@@ -169,6 +269,7 @@ def test_gateway_runs_api_submission():
             STREAMS.pop(stream_id, None)
 
     assert runs_called["called"], "The runs-API streaming path should have been invoked"
+    assert captured["body_extras"]["reasoning_effort"] == "high"
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +401,7 @@ def test_gateway_runs_api_streaming_parses_real_run_events():
     assert run_body["instructions"] == "system prompt"
     assert run_body["conversation_history"] == [{"role": "assistant", "content": "earlier reply"}]
     assert run_body["provider"] == "anthropic"
+    assert run_body["session_id"] == "sess1"
     assert "messages" not in run_body
 
     assert final_text == "Hello"
@@ -470,8 +572,8 @@ def test_gateway_approval_response_relay():
         from api.routes import _handle_approval_respond
         _handle_approval_respond(handler, body)
 
-    assert captured.get("url", "") == "http://gw:8642/v1/runs/run%20abc%2F1/approvals/appr%20x%2Fy/respond"
-    assert captured["body"] == {"choice": "once"}
+    assert captured.get("url", "") == "http://gw:8642/v1/runs/run%20abc%2F1/approval"
+    assert captured["body"] == {"choice": "once", "approval_id": "appr x/y"}
     handler.send_response.assert_called_with(200)
 
     # Cleanup.

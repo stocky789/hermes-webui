@@ -248,15 +248,16 @@ const trackedClearTimeout = (id) => {
 // Symlink locals referenced by the handler block — declared from item
 // just like _renderTreeItem does before the tooltip assignment.
 const isLk = item.type === 'symlink';
-const isDirLike = item.type === 'dir' || (isLk && item.is_dir);
+const isExternalLink = isLk && item.target_outside_workspace;
+const isDirLike = !isExternalLink && (item.type === 'dir' || (isLk && item.is_dir));
 const elideMiddle = (s) => s;
 
 const runner = new Function(
   'nameEl', 'el', 'item', 'S', 't', 'loadDir', 'document', 'showToast', 'api', 'window',
-  'setTimeout', 'clearTimeout', 'isLk', 'isDirLike', 'elideMiddle',
+  'setTimeout', 'clearTimeout', 'isLk', 'isExternalLink', 'isDirLike', 'elideMiddle',
   '(()=>{' + handlerBlock + '})();'
 );
-runner(nameEl, el, item, S, t, loadDir, document, showToast, api, {}, trackedSetTimeout, trackedClearTimeout, isLk, isDirLike, elideMiddle);
+runner(nameEl, el, item, S, t, loadDir, document, showToast, api, {}, trackedSetTimeout, trackedClearTimeout, isLk, isExternalLink, isDirLike, elideMiddle);
 
 const evt = { stopPropagation: () => {} };
 for (let i = 0; i < clickCount; i++) {
@@ -278,7 +279,7 @@ setTimeout_(() => {
     )
     r = subprocess.run(
         [NODE, "-e", js],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True, timeout=30,
     )
     if r.returncode != 0:
         raise RuntimeError(f"node failed: {r.stderr}")

@@ -81,13 +81,20 @@ async function cancelSessionStream(session){
 }
 
 async function _savedSessionShouldStaySidebarOnly(sid){
+  const state = await _savedSessionSidebarOnlyState(sid);
+  return !!(state&&state.sidebarOnly);
+}
+
+async function _savedSessionSidebarOnlyState(sid){
   if(!sid) return false;
   try{
     const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
     const session = data&&data.session;
-    return !!(session&&(session.active_stream_id||session.pending_user_message));
+    const archived = !!(session&&session.archived);
+    const running = !!(session&&(session.active_stream_id||session.pending_user_message));
+    return {sidebarOnly:archived||running, archived};
   }catch(e){
-    return false;
+    return null;
   }
 }
 
@@ -96,6 +103,29 @@ let _workspacePanelMode='closed'; // 'closed' | 'browse' | 'preview'
 
 function _isCompactWorkspaceViewport(){
   return window.matchMedia('(max-width: 900px)').matches;
+}
+
+function _isPhoneWidthViewport(){
+  return window.matchMedia('(max-width: 640px)').matches;
+}
+
+// Mobile PWA viewport reflow guard. When the on-screen keyboard / browser
+// chrome shows or hides, visualViewport (or a plain resize on browsers without
+// it) changes height without a layout invalidation, leaving the phone layout
+// painted against stale geometry. Toggling a one-frame `viewport-reflow` class
+// (which applies a cheap GPU-promotion transform under the @media(max-width:640px)
+// rule) forces a repaint, then we resync the workspace panel + sidebar aria.
+function _forceMobileViewportReflow(){
+  if(!_isPhoneWidthViewport()) return;
+  const layout=document.querySelector('.layout');
+  if(!layout) return;
+  document.documentElement.classList.add('viewport-reflow');
+  void layout.offsetWidth;
+  requestAnimationFrame(()=>{
+    document.documentElement.classList.remove('viewport-reflow');
+    try{ syncWorkspacePanelState(); }catch(_){ }
+    try{ if(typeof _syncSidebarAria==='function') _syncSidebarAria(); }catch(_){ }
+  });
 }
 
 function _syncWorkspacePanelInlineWidth(){
@@ -194,6 +224,19 @@ function handleWorkspaceClose(){
   closeWorkspacePanel();
 }
 
+async function _maybeBindFreshDefaultWorkspaceSession(){
+  if(S.session) return false;
+  if(_workspacePanelMode!=='browse') return false;
+  if(!S._profileDefaultWorkspace) return false;
+  try{
+    await newSession(false, {awaitWorkspaceLoad: true});
+    return true;
+  }catch(e){
+    console.warn('[hermes] failed to bind fresh default workspace session', e);
+    return false;
+  }
+}
+
 /**
  * Set a tooltip on a button, preferring the custom CSS tooltip (`data-tooltip`)
  * when the element opts in via the `has-tooltip` class. Falls back to the
@@ -253,22 +296,25 @@ function syncWorkspacePanelUI(){
 
 function toggleMobileSidebar(){
   const sidebar=document.querySelector('.sidebar');
-  const overlay=$('mobileOverlay');
   if(!sidebar)return;
   const isOpen=sidebar.classList.contains('mobile-open');
   if(isOpen){closeMobileSidebar();}
-  else{sidebar.classList.add('mobile-open');if(overlay)overlay.classList.add('visible');}
+  else{
+    try{if(typeof _syncMobileSidebarPanelFromMainView==='function')_syncMobileSidebarPanelFromMainView();}catch(_){}
+    sidebar.classList.remove('mobile-session-page');sidebar.classList.add('mobile-panel-drawer','mobile-open');
+  }
 }
 function closeMobileSidebar(){
   const sidebar=document.querySelector('.sidebar');
   const overlay=$('mobileOverlay');
-  if(sidebar)sidebar.classList.remove('mobile-open');
+  if(sidebar)sidebar.classList.remove('mobile-open','mobile-session-page','mobile-panel-drawer');
   if(overlay)overlay.classList.remove('visible');
 }
 
-const _PWA_SIDEBAR_SWIPE_EDGE=28;
-const _PWA_SIDEBAR_SWIPE_TRIGGER=72;
-const _PWA_SIDEBAR_SWIPE_MAX_VERTICAL=48;
+const _PWA_SIDEBAR_SWIPE_EDGE=80;
+const _PWA_SIDEBAR_SWIPE_CLAIM=10;
+const _PWA_SIDEBAR_SWIPE_TRIGGER=64;
+const _PWA_SIDEBAR_SWIPE_MAX_VERTICAL=56;
 let _pwaSidebarSwipe=null;
 
 function _isPwaStandalone(){
@@ -284,35 +330,55 @@ function _isInteractiveSwipeTarget(target){
   catch(_){return false;}
 }
 
+function _pwaSidebarSwipePoint(e){
+  const touch=e&&e.touches&&e.touches[0]||e&&e.changedTouches&&e.changedTouches[0];
+  const src=touch||e;
+  if(!src)return null;
+  return {clientX:Number(src.clientX)||0,clientY:Number(src.clientY)||0};
+}
+
+function _isTouchPointerEvent(e){
+  return !!(e&&e.pointerType==='touch');
+}
+
 function _openMobileSidebarFromGesture(){
   if(_isDesktopWidth())return;
   const sidebar=document.querySelector('.sidebar');
-  const overlay=$('mobileOverlay');
   if(!sidebar)return;
+  try{if(typeof _syncMobileSidebarPanelFromMainView==='function')_syncMobileSidebarPanelFromMainView();}catch(_){}
   const layout=document.querySelector('.layout');
   if(layout)layout.classList.remove('sidebar-collapsed');
   sidebar.classList.remove('sidebar-collapsed');
   try{document.documentElement.removeAttribute('data-sidebar-collapsed');}catch(_){}
+  sidebar.classList.remove('mobile-session-page');
+  sidebar.classList.add('mobile-panel-drawer');
   sidebar.classList.add('mobile-open');
-  if(overlay)overlay.classList.add('visible');
 }
 
 function _onPwaSidebarSwipeStart(e){
-  if(!_isPwaStandalone()||_isDesktopWidth())return;
+  if(_isDesktopWidth())return;
+  if(_isTouchPointerEvent(e))return;
   if(e.pointerType==='mouse'||(e.pointerType&&e.pointerType!=='touch'&&e.pointerType!=='pen'))return;
   if(document.querySelector('.sidebar')?.classList.contains('mobile-open'))return;
-  const clientX=Number(e.clientX)||0;
-  if(clientX>_PWA_SIDEBAR_SWIPE_EDGE)return;
+  const point=_pwaSidebarSwipePoint(e);
+  if(!point)return;
+  if(point.clientX>_PWA_SIDEBAR_SWIPE_EDGE)return;
   if(_isInteractiveSwipeTarget(e.target))return;
-  _pwaSidebarSwipe={startX:clientX,startY:Number(e.clientY)||0,active:true,opened:false};
+  _pwaSidebarSwipe={startX:point.clientX,startY:point.clientY,active:true,opened:false};
 }
 
 function _onPwaSidebarSwipeMove(e){
+  if(_isTouchPointerEvent(e))return;
   const swipe=_pwaSidebarSwipe;
   if(!swipe||!swipe.active||swipe.opened)return;
-  const dx=(Number(e.clientX)||0)-swipe.startX;
-  const dy=(Number(e.clientY)||0)-swipe.startY;
+  const point=_pwaSidebarSwipePoint(e);
+  if(!point)return;
+  const dx=point.clientX-swipe.startX;
+  const dy=point.clientY-swipe.startY;
   if(dx<0||Math.abs(dy)>_PWA_SIDEBAR_SWIPE_MAX_VERTICAL*1.5){_pwaSidebarSwipe=null;return;}
+  if(dx>=_PWA_SIDEBAR_SWIPE_CLAIM&&dx>Math.abs(dy)*1.2){
+    if(e.cancelable)e.preventDefault();
+  }
   if(dx>=_PWA_SIDEBAR_SWIPE_TRIGGER&&Math.abs(dy)<=_PWA_SIDEBAR_SWIPE_MAX_VERTICAL&&dx>Math.abs(dy)*1.5){
     if(e.cancelable)e.preventDefault();
     swipe.opened=true;
@@ -320,10 +386,21 @@ function _onPwaSidebarSwipeMove(e){
   }
 }
 
-function _onPwaSidebarSwipeEnd(){_pwaSidebarSwipe=null;}
-function _onPwaSidebarSwipeCancel(){_pwaSidebarSwipe=null;}
+function _onPwaSidebarSwipeEnd(e){if(_isTouchPointerEvent(e))return;_pwaSidebarSwipe=null;}
+function _onPwaSidebarSwipeCancel(e){if(_isTouchPointerEvent(e))return;_pwaSidebarSwipe=null;}
 
 function _installPwaSidebarSwipeGesture(){
+  // #4660 review (Codex CORE): the #pwaSidebarEdgeGuard element is now
+  // pointer-events:none (CSS), so it can no longer intercept hit-testing for
+  // taps / vertical scrolls that merely start in the left edge strip — those
+  // pass through to the underlying .messages scroller. The edge-swipe-to-open
+  // gesture is handled entirely by the window-level CAPTURE touch/pointer
+  // listeners below (which see the event regardless of the guard), so no
+  // dedicated guard-element listener is needed.
+  window.addEventListener('touchstart', _onPwaSidebarSwipeStart, {capture:true,passive:true});
+  window.addEventListener('touchmove', _onPwaSidebarSwipeMove, {capture:true,passive:false});
+  window.addEventListener('touchend', _onPwaSidebarSwipeEnd, {capture:true,passive:true});
+  window.addEventListener('touchcancel', _onPwaSidebarSwipeCancel, {capture:true,passive:true});
   window.addEventListener('pointerdown', _onPwaSidebarSwipeStart, {passive:true});
   window.addEventListener('pointermove', _onPwaSidebarSwipeMove, {passive:false});
   window.addEventListener('pointerup', _onPwaSidebarSwipeEnd, {passive:true});
@@ -436,10 +513,9 @@ function mobileSwitchPanel(name){
     closeMobileSidebar();
   } else {
     const sidebar=document.querySelector('.sidebar');
-    const overlay=$('mobileOverlay');
     if(sidebar){
-      sidebar.classList.add('mobile-open');
-      if(overlay)overlay.classList.add('visible');
+      sidebar.classList.remove('mobile-session-page');
+      sidebar.classList.add('mobile-panel-drawer','mobile-open');
     }
   }
 }
@@ -463,6 +539,36 @@ $('mainChat')?.addEventListener('pointerdown', closeMobileWorkspacePanelFromChat
 $('btnAttach').onclick=e=>{if(e&&e.preventDefault)e.preventDefault();$('fileInput').value='';$('fileInput').click();};
 
 // ── Voice input (Web Speech API + MediaRecorder fallback) ───────────────────
+function _micIsLocalhostOrLoopback(hostname){
+  const host=String(hostname||'').toLowerCase().replace(/^\[|\]$/g,'');
+  return host==='localhost'
+    || host.endsWith('.localhost')
+    || host==='::1'
+    || host==='0:0:0:0:0:0:0:1'
+    || /^127\./.test(host);
+}
+
+function _micOriginNeedsSecureContext(){
+  if(window.isSecureContext===true) return false;
+  const loc=window.location||{};
+  const protocol=loc.protocol||'';
+  return protocol==='http:'&&!_micIsLocalhostOrLoopback(loc.hostname);
+}
+
+function _micToastKeyForRecognitionError(error){
+  if((error==='not-allowed'||error==='service-not-allowed'||error==='audio-capture')
+      && _micOriginNeedsSecureContext()){
+    return 'mic_insecure_origin';
+  }
+  const msgs={
+    'not-allowed':'mic_denied',
+    'service-not-allowed':'mic_denied',
+    'no-speech':'mic_no_speech',
+    'network':'mic_network',
+  };
+  return msgs[error]||null;
+}
+
 (function(){
   const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
   const _canRecordAudio=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&window.MediaRecorder);
@@ -677,12 +783,8 @@ $('btnAttach').onclick=e=>{if(e&&e.preventDefault)e.preventDefault();$('fileInpu
         _forceMediaRecorder=true;
         recognition=null;
       }
-      const msgs={
-        'not-allowed':t('mic_denied'),
-        'no-speech':t('mic_no_speech'),
-        'network':t('mic_network'),
-      };
-      showToast(msgs[event.error]||t('mic_error')+event.error);
+      const messageKey=_micToastKeyForRecognitionError(event.error);
+      showToast(messageKey?t(messageKey):t('mic_error')+event.error);
     };
 
     return sr;
@@ -739,6 +841,12 @@ $('btnAttach').onclick=e=>{if(e&&e.preventDefault)e.preventDefault();$('fileInpu
     _isRecording=true;
     _finalText='';
     _prefix=ta.value;
+    if(_micOriginNeedsSecureContext()){
+      _isRecording=false;
+      window._micPendingSend=false;
+      showToast(t('mic_insecure_origin'));
+      return;
+    }
     if(recognition && !_forceMediaRecorder && !_rawAudioMode){
       _activeCaptureMode='speech';
       recognition.start();
@@ -788,7 +896,7 @@ $('btnAttach').onclick=e=>{if(e&&e.preventDefault)e.preventDefault();$('fileInpu
       _isRecording=false;
       window._micPendingSend=false;
       _stopTracks();
-      showToast(t('mic_denied'));
+      showToast(t(_micToastKeyForRecognitionError('not-allowed')||'mic_denied'));
     }
   };
 
@@ -806,6 +914,68 @@ $('btnAttach').onclick=e=>{if(e&&e.preventDefault)e.preventDefault();$('fileInpu
 })();
 window._micActive=window._micActive||false;
 window._micPendingSend=window._micPendingSend||false;
+
+// ── Extension TTS-engine registry (registerHermesTtsEngine) ──────────────────
+// Defined at MODULE scope (not inside the voice-mode IIFE below) so the public
+// API exists even on browsers without SpeechRecognition / speechSynthesis — an
+// extension can register a TTS engine regardless of STT/browser-TTS support.
+// Lets a trusted local extension contribute a TTS engine that appears in the
+// Settings -> TTS Engine dropdown and is used by BOTH playback paths (voice-mode
+// auto-read and the per-message Listen button). The extension provides an async
+// synthesize(text, opts) that returns audio bytes (ArrayBuffer or Blob); core
+// handles selection, the dropdown option, and playback. Mirrors registerHermesSkin.
+//
+//   window.registerHermesTtsEngine({
+//     id: 'voicevox',            // [a-z0-9_-], not a built-in (browser/edge/elevenlabs)
+//     label: 'VOICEVOX (local)',
+//     synthesize(text, opts) { return Promise<ArrayBuffer|Blob>; }
+//   }) -> true on success, false if rejected
+var _HERMES_TTS_ENGINES = Object.create(null);
+var _HERMES_TTS_RESERVED = { browser:1, edge:1, elevenlabs:1 };
+function _hermesTtsValidId(id){ return typeof id==='string' && /^[a-z0-9][a-z0-9_-]{0,31}$/.test(id); }
+function _hermesAddTtsOption(id, label){
+  var sel=document.getElementById('settingsTtsEngine');
+  if(!sel) return;
+  if(sel.querySelector('option[value="'+id+'"]')) return;
+  var opt=document.createElement('option');
+  opt.value=id;
+  opt.textContent=label;   // textContent — never innerHTML (no injection)
+  sel.appendChild(opt);
+}
+window.registerHermesTtsEngine=function(desc){
+  try{
+    if(!desc||typeof desc!=='object') return false;
+    var id=String(desc.id||'').toLowerCase();
+    if(!_hermesTtsValidId(id)) return false;
+    if(_HERMES_TTS_RESERVED[id]) return false;          // can't shadow a built-in
+    if(typeof desc.synthesize!=='function') return false;
+    var label=(typeof desc.label==='string' && desc.label.trim()) ? desc.label.trim().slice(0,48) : id;
+    _HERMES_TTS_ENGINES[id]={ id:id, label:label, synthesize:desc.synthesize };
+    _hermesAddTtsOption(id, label);
+    return true;
+  }catch(_){ return false; }
+};
+window._hermesTtsIsRegistered=function(id){ return !!_HERMES_TTS_ENGINES[id]; };
+// List registered engines (for the settings panel to re-add options on render).
+window._hermesTtsEngineOptions=function(){
+  return Object.keys(_HERMES_TTS_ENGINES).map(function(k){
+    return { id:_HERMES_TTS_ENGINES[k].id, label:_HERMES_TTS_ENGINES[k].label };
+  });
+};
+// Returns a Promise<ArrayBuffer> or null if the engine isn't registered.
+window._hermesTtsSynth=function(id, text, opts){
+  var eng=_HERMES_TTS_ENGINES[id];
+  if(!eng) return null;
+  return Promise.resolve()
+    .then(function(){ return eng.synthesize(text, opts||{}); })
+    .then(function(out){
+      if(!out) throw new Error('empty TTS result');
+      if(out instanceof ArrayBuffer) return out;
+      if(typeof Blob!=='undefined' && out instanceof Blob) return out.arrayBuffer();
+      if(out.buffer instanceof ArrayBuffer) return out.buffer;   // typed array
+      throw new Error('TTS engine returned an unsupported type');
+    });
+};
 
 // ── Turn-based voice mode (#1333) ────────────────────────────────────────
 // Chained flow: listen → send → (agent processes) → TTS response → listen again
@@ -907,6 +1077,11 @@ window._micPendingSend=window._micPendingSend||false;
 
   function _startListening(){
     if(!_voiceModeActive) return;
+    if(_micOriginNeedsSecureContext()){
+      _deactivate();
+      showToast(t('mic_insecure_origin'));
+      return;
+    }
     _clearBrowserTtsRecovery();
     _setState('listening');
 
@@ -962,7 +1137,8 @@ window._micPendingSend=window._micPendingSend||false;
       }
       if(event.error==='not-allowed'||event.error==='service-not-allowed'||event.error==='audio-capture'){
         _deactivate();
-        showToast(t('mic_denied'));
+        const messageKey=_micToastKeyForRecognitionError(event.error);
+        showToast(messageKey?t(messageKey):t('mic_error')+event.error);
         return;
       }
       // Other errors — try to restart
@@ -1034,6 +1210,46 @@ window._micPendingSend=window._micPendingSend||false;
     }
     if(!clean){ _startListening(); return; }
     const engine=localStorage.getItem("hermes-tts-engine")||"browser";
+    // Extension-registered TTS engine (window.registerHermesTtsEngine): synth
+    // via the extension, then play through the same Audio lifecycle as edge.
+    if(typeof window._hermesTtsIsRegistered==='function' && window._hermesTtsIsRegistered(engine)){
+      _ttsSpeaking=true;
+      const _opts={
+        voice: localStorage.getItem("hermes-tts-voice")||'',
+        rate: parseFloat(localStorage.getItem("hermes-tts-rate")),
+        pitch: parseFloat(localStorage.getItem("hermes-tts-pitch")),
+      };
+      Promise.resolve(window._hermesTtsSynth(engine, clean, _opts))
+        .then(function(buf){
+          const blob=new Blob([buf]);
+          const url=URL.createObjectURL(blob);
+          const audio=new Audio(url);
+          _playingEdgeAudio=audio;
+          audio.onended=function(){
+            _ttsSpeaking=false;
+            if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
+            URL.revokeObjectURL(url);
+            if(_voiceModeActive) setTimeout(function(){_startListening();},500);
+          };
+          audio.onerror=function(){
+            _ttsSpeaking=false;
+            if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
+            URL.revokeObjectURL(url);
+            if(_voiceModeActive) setTimeout(function(){_startListening();},1000);
+          };
+          audio.play().catch(function(){
+            _ttsSpeaking=false;
+            if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
+            URL.revokeObjectURL(url);
+            if(_voiceModeActive) setTimeout(function(){_startListening();},1000);
+          });
+        })
+        .catch(function(){
+          _ttsSpeaking=false;
+          if(_voiceModeActive) setTimeout(function(){_startListening();},1000);
+        });
+      return;
+    }
     if(engine==="elevenlabs"){
       _ttsSpeaking=true;
       fetch(new URL('api/tts', document.baseURI || location.href).href, {
@@ -1197,6 +1413,10 @@ window._micPendingSend=window._micPendingSend||false;
   };
 
   function _activate(){
+    if(_micOriginNeedsSecureContext()){
+      showToast(t('mic_insecure_origin'));
+      return;
+    }
     _voiceModeActive=true;
     modeBtn.classList.add('active');
     _setButtonTooltip(modeBtn, t('voice_mode_toggle_active'));
@@ -1357,6 +1577,7 @@ $('modelSelect').onchange=async()=>{
   if(typeof _writePersistedModelState==='function') _writePersistedModelState(modelState.model,modelState.model_provider);
   else try{localStorage.setItem('hermes-webui-model',modelState.model)}catch{}
   if(!S.session){
+    if(typeof _rememberEmptyComposerModelOverride==='function') _rememberEmptyComposerModelOverride(modelState.model,modelState.model_provider);
     if(typeof syncModelChip==='function') syncModelChip();
     if(typeof syncReasoningChip==='function') syncReasoningChip();
     return;
@@ -1443,11 +1664,6 @@ let _imeComposing=false;
 })();
 function _isImeEnter(e){return e.isComposing||e.keyCode===229||_imeComposing;}
 window._isImeEnter=_isImeEnter;
-function _isVirtualKeyboardLikelyOpen(){
-  const vv=window.visualViewport;
-  if(!vv||!window.innerHeight)return true;
-  return window.innerHeight-vv.height>120;
-}
 // #3076: a touch-primary device (`pointer:coarse`) can still have a
 // physical keyboard attached (Android tablet + Bluetooth keyboard,
 // detachable Surface in tablet mode, iPad + Magic Keyboard). When that
@@ -1480,9 +1696,13 @@ $('msg').addEventListener('keydown',e=>{
     }
   }
   // Send key: respect user preference.
-  // On touch-primary devices with the software keyboard open, default to
-  // Enter = newline since there's no physical Shift key. Hardware keyboards on
-  // tablets keep desktop behavior when the viewport is not keyboard-shrunk.
+  // On touch-primary devices (coarse pointer, no fine pointer co-existing),
+  // default to Enter = newline regardless of whether the visual viewport has
+  // shrunk. The viewport-shrink heuristic (_isVirtualKeyboardLikelyOpen) was
+  // unreliable on iOS Safari and some Android browsers where the keyboard
+  // doesn't consistently reduce vv.height by >120px. The pointer media query
+  // pair is a sufficient and more reliable signal for "software keyboard only".
+  // Hardware keyboards on tablets are covered by _hasFinePointerCoexisting.
   // The 'ctrl+enter' setting also uses this behavior (Enter = newline).
   // Users can override in Settings by explicitly choosing 'enter' mode.
   if(e.key==='Enter'){
@@ -1490,8 +1710,7 @@ $('msg').addEventListener('keydown',e=>{
     const isNumpadEnter=_isNumpadEnter(e);
     const _mobileDefault=matchMedia('(pointer:coarse)').matches
       &&!_hasFinePointerCoexisting()
-      &&window._sendKey==='enter'
-      &&_isVirtualKeyboardLikelyOpen();
+      &&window._sendKey==='enter';
     if(window._sendKey==='ctrl+enter'||_mobileDefault){
       if(isNumpadEnter||e.ctrlKey||e.metaKey){e.preventDefault();send();}
     } else {
@@ -1544,6 +1763,13 @@ document.addEventListener('keydown',async e=>{
     // stream running on its own session; the user just gets a fresh blank one.
     await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
   }
+  // Cmd/Ctrl+, opens/closes Settings (VS Code convention).
+  // Fire globally — like VS Code, don't skip text inputs.
+  if((e.metaKey||e.ctrlKey)&&!e.shiftKey&&!e.altKey&&e.key===','){
+    e.preventDefault();
+    if(typeof toggleSettings==='function') toggleSettings();
+    return;
+  }
   if(e.key==='Escape'){
     // Close onboarding overlay if open (skip/dismiss the wizard)
     const onboardingOverlay=$('onboardingOverlay');
@@ -1575,26 +1801,66 @@ document.addEventListener('keydown',async e=>{
     }
   }
 });
+const LARGE_TEXT_PASTE_CHAR_THRESHOLD=4000;
+const LARGE_TEXT_PASTE_LINE_THRESHOLD=100;
+function _largeTextPasteLineCount(text){
+  const value=String(text||'');
+  const lines=value.split('\n');
+  return value.endsWith('\n')?lines.length-1:lines.length;
+}
+function _shouldAttachLargePastedText(text){
+  const value=String(text||'');
+  if(!value.trim())return false;
+  return value.length>=LARGE_TEXT_PASTE_CHAR_THRESHOLD || _largeTextPasteLineCount(value)>=LARGE_TEXT_PASTE_LINE_THRESHOLD;
+}
+function _largeTextPasteFileName(now){
+  const d=new Date(now||Date.now());
+  const stamp=d.toISOString().replace(/[:.]/g,'-').replace('T','_').replace('Z','');
+  const existing=new Set((S.pendingFiles||[]).map(f=>f&&f.name).filter(Boolean));
+  let name=`pasted-text-${stamp}.md`;
+  for(let i=2;existing.has(name);i++)name=`pasted-text-${stamp}-${i}.md`;
+  return name;
+}
+function _largeTextPasteFile(text,now){
+  const name=_largeTextPasteFileName(now||Date.now());
+  return new File([String(text||'')],name,{type:'text/markdown;charset=utf-8'});
+}
+function _largeTextPasteFitsUploadLimit(file){
+  return !(file&&typeof MAX_UPLOAD_BYTES==='number'&&file.size>MAX_UPLOAD_BYTES);
+}
+function _attachLargePastedText(file){
+  addFiles([file]);
+  if(typeof setStatus==='function')setStatus(t('text_pasted')+file.name);
+  return file;
+}
 $('msg').addEventListener('paste',e=>{
   const items=Array.from(e.clipboardData?.items||[]);
   // Extract image items (kind==='file' filter avoids misclassifying text/html
   // with embedded data URIs as images).
   const imageItems=items.filter(i=>i.kind==='file'&&i.type.startsWith('image/'));
-  if(!imageItems.length)return;
-  // If text is also present (common when copying images from browsers, Notes,
-  // Slack, etc.), let the browser paste the text normally AND attach the image.
-  // Only preventDefault when the clipboard is image-only (true screenshot paste).
-  const hasText=items.some(i=>i.kind==='string'&&(i.type==='text/plain'||i.type==='text/html'));
-  if(!hasText)e.preventDefault();
-  const pasteTs=Date.now();
-  const files=imageItems.map((i,idx)=>{
-    const blob=i.getAsFile();
-    const ext=i.type.split('/')[1]||'png';
-    const suffix=imageItems.length>1?`-${idx+1}`:'';
-    return new File([blob],`screenshot-${pasteTs}${suffix}.${ext}`,{type:i.type});
-  });
-  addFiles(files);
-  setStatus(t('image_pasted')+files.map(f=>f.name).join(', '));
+  if(imageItems.length){
+    // If text is also present (common when copying images from browsers, Notes,
+    // Slack, etc.), let the browser paste the text normally AND attach the image.
+    // Only preventDefault when the clipboard is image-only (true screenshot paste).
+    const hasText=items.some(i=>i.kind==='string'&&(i.type==='text/plain'||i.type==='text/html'));
+    if(!hasText)e.preventDefault();
+    const pasteTs=Date.now();
+    const files=imageItems.map((i,idx)=>{
+      const blob=i.getAsFile();
+      const ext=i.type.split('/')[1]||'png';
+      const suffix=imageItems.length>1?`-${idx+1}`:'';
+      return new File([blob],`screenshot-${pasteTs}${suffix}.${ext}`,{type:i.type});
+    });
+    addFiles(files);
+    setStatus(t('image_pasted')+files.map(f=>f.name).join(', '));
+    return;
+  }
+  const plainText=e.clipboardData?.getData('text/plain')||'';
+  if(!_shouldAttachLargePastedText(plainText))return;
+  const pastedTextFile=_largeTextPasteFile(plainText);
+  if(!_largeTextPasteFitsUploadLimit(pastedTextFile))return;
+  e.preventDefault();
+  _attachLargePastedText(pastedTextFile);
 });
 document.querySelectorAll('.suggestion').forEach(btn=>{
   btn.onclick=()=>{$('msg').value=btn.dataset.msg;send();};
@@ -1608,7 +1874,24 @@ function applyEmptyStateSuggestionPref(){
 window.addEventListener('resize',()=>{
   _syncWorkspacePanelInlineWidth();
   syncWorkspacePanelState();
+  if(!window.visualViewport) _forceMobileViewportReflow();
 });
+
+// On PWAs / mobile browsers that expose visualViewport, keyboard show/hide and
+// URL-bar collapse fire visualViewport resize/scroll rather than window resize.
+// Debounce a reflow so the phone layout repaints against the new geometry.
+if(window.visualViewport){
+  let _mobileViewportReflowTimer=0;
+  const _scheduleMobileViewportReflow=()=>{
+    if(_mobileViewportReflowTimer) clearTimeout(_mobileViewportReflowTimer);
+    _mobileViewportReflowTimer=setTimeout(()=>{
+      _mobileViewportReflowTimer=0;
+      _forceMobileViewportReflow();
+    },60);
+  };
+  window.visualViewport.addEventListener('resize', _scheduleMobileViewportReflow);
+  window.visualViewport.addEventListener('scroll', _scheduleMobileViewportReflow);
+}
 
 // Boot: restore last session or start fresh
 // ── Resizable panels ──────────────────────────────────────────────────────
@@ -1674,6 +1957,9 @@ const _SKINS=[
   {name:'Ares',     colors:['#FF4444','#CC3333','#992222']},
   {name:'Mono',     colors:['#CCCCCC','#999999','#666666']},
   {name:'Graphite', colors:['#FFFFFF','#D6D6D6','#242424']},
+  {name:'GitHub', colors:['#0969DA','#1F883D','#242424']},
+  {name:'Codex', colors:['#72B39A','#242624','#ECEBE4']},
+  {name:'Terracotta', colors:['#D97757','#F0EEE6','#141413']},
   {name:'Slate',    colors:['#334155','#475569','#64748b']},
   {name:'Poseidon', colors:['#0EA5E9','#0284C7','#0369A1']},
   {name:'Sisyphus', colors:['#A78BFA','#8B5CF6','#7C3AED']},
@@ -1857,13 +2143,131 @@ function _buildSkinPicker(activeSkin){
     btn.dataset.skinVal=key;
     btn.style.cssText='border:1px solid var(--border2);border-radius:8px;padding:8px 4px;text-align:center;cursor:pointer;background:none;transition:all .15s';
     btn.onclick=()=>_pickSkin(key);
-    const dots=skin.colors.map(c=>`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${c}"></span>`).join('');
-    const label=skin.label||skin.name;
-    btn.innerHTML=`<div style="display:flex;gap:3px;justify-content:center;margin-bottom:4px">${dots}</div><span style="font-size:11px;color:var(--text)">${label}</span>`;
+    // Build with DOM nodes + textContent so an extension-registered skin's
+    // label/name (registerHermesSkin descriptor) can never inject markup into
+    // the picker. Swatch colors are already value-sanitized upstream, but set
+    // them via element.style.background (not interpolated HTML) as defense in depth.
+    const dotRow=document.createElement('div');
+    dotRow.style.cssText='display:flex;gap:3px;justify-content:center;margin-bottom:4px';
+    for(const c of (skin.colors||[])){
+      const dot=document.createElement('span');
+      dot.style.cssText='display:inline-block;width:10px;height:10px;border-radius:50%';
+      dot.style.background=c;
+      dotRow.appendChild(dot);
+    }
+    const labelEl=document.createElement('span');
+    labelEl.style.cssText='font-size:11px;color:var(--text)';
+    labelEl.textContent=skin.label||skin.name||'';
+    btn.appendChild(dotRow);
+    btn.appendChild(labelEl);
     grid.appendChild(btn);
   }
   _syncSkinPicker((activeSkin||'default').toLowerCase());
 }
+
+// ── Extension-registered skins (theme-registration capability) ───────────────
+// Lets a trusted local extension contribute a custom skin that appears in the
+// NATIVE skin picker (rather than bolting on a parallel theme switcher). An
+// extension calls window.registerHermesSkin(descriptor); core validates +
+// sanitizes it, injects a managed <style> rule for its CSS-variable tokens,
+// appends it to _SKINS so the picker renders it, and re-applies the persisted
+// selection if it was waiting on this (late-registered) skin.
+//
+// Security: token values are written into CSS, so every value is sanitized
+// against a strict allowlist HERE, once, so all theme extensions inherit the
+// guard safe-by-construction. Reserved core skin keys cannot be overwritten.
+const _EXT_SKIN_STYLE_ID='hermesExtensionSkinStyles';
+const _EXT_SKIN_KEYS=new Set();                 // keys we registered (for idempotent re-register)
+const _RESERVED_SKIN_KEYS=new Set((_SKINS||[]).map(s=>(s.value||s.name).toLowerCase()));
+// CSS custom-property names a skin is allowed to set. Mirrors the documented
+// design-token contract; anything outside this set is dropped.
+const _ALLOWED_SKIN_TOKENS=new Set([
+  '--bg','--surface','--surface2','--surface-subtle','--text','--text2','--muted',
+  '--accent','--accent2','--accent3','--accent-contrast','--accent-hover',
+  '--accent-text','--accent-bg','--accent-bg-strong','--accent-rgb',
+  '--border','--border2','--hover-bg','--code-bg','--code-text',
+  '--sidebar','--sidebar-text','--user-bubble','--assistant-bubble',
+  '--success','--warning','--danger','--info','--link'
+]);
+// Accept only safe color / simple numeric-with-unit values, OR a bare RGB triple
+// (e.g. "0, 0, 0" for --accent-rgb, consumed inside rgba(...)). Rejects anything
+// with url(), expression(), semicolons, braces, or other CSS-injection vectors.
+const _SAFE_SKIN_VALUE_RE=/^(#(?:[0-9a-fA-F]{3,8})|rg(?:b|ba)\(\s*[0-9.,%\s/]+\)|hsl(?:a)?\(\s*[0-9.,%\s/deg]+\)|[0-9]{1,3}\s*,\s*[0-9]{1,3}\s*,\s*[0-9]{1,3}|[a-zA-Z]{3,20}|[0-9.]+(?:px|em|rem|%)?)$/;
+
+function _sanitizeSkinTokens(tokens){
+  const out={};
+  if(!tokens||typeof tokens!=='object') return out;
+  for(const rawKey of Object.keys(tokens)){
+    const key=String(rawKey).trim();
+    if(!_ALLOWED_SKIN_TOKENS.has(key)) continue;          // unknown token → drop
+    const val=String(tokens[rawKey]).trim();
+    if(val.length>64) continue;                            // absurd length → drop
+    if(!_SAFE_SKIN_VALUE_RE.test(val)) continue;          // unsafe value → drop
+    out[key]=val;
+  }
+  return out;
+}
+
+function _renderExtensionSkinStyles(){
+  let styleEl=document.getElementById(_EXT_SKIN_STYLE_ID);
+  if(!styleEl){
+    styleEl=document.createElement('style');
+    styleEl.id=_EXT_SKIN_STYLE_ID;
+    document.head.appendChild(styleEl);
+  }
+  const blocks=[];
+  for(const skin of _SKINS){
+    if(!skin||!skin._extToken) continue;                  // only ext-registered skins
+    const key=(skin.value||skin.name).toLowerCase();
+    const decls=Object.keys(skin._extToken).map(k=>`${k}:${skin._extToken[k]}`).join(';');
+    if(decls) blocks.push(`:root[data-skin="${key}"]{${decls}}`);
+  }
+  styleEl.textContent=blocks.join('\n');
+}
+
+// Public API for extensions. Returns true on success, false if rejected.
+function registerHermesSkin(descriptor){
+  try{
+    if(!descriptor||typeof descriptor!=='object') return false;
+    const name=String(descriptor.name||'').trim();
+    if(!name) return false;
+    const rawVal=String(descriptor.value||name).trim().toLowerCase();
+    // key must be a simple slug (safe as a data-skin attr + CSS attr selector)
+    const key=rawVal.replace(/[^a-z0-9_-]/g,'');
+    if(!key) return false;
+    if(_RESERVED_SKIN_KEYS.has(key)) return false;        // never shadow a core skin
+    const tokens=_sanitizeSkinTokens(descriptor.tokens);
+    if(Object.keys(tokens).length===0) return false;      // nothing valid to apply
+    // 3 swatch colors for the picker (sanitized); fall back to accent/bg/text.
+    let colors=Array.isArray(descriptor.colors)?descriptor.colors.slice(0,3):[];
+    colors=colors.map(c=>String(c).trim()).filter(c=>_SAFE_SKIN_VALUE_RE.test(c));
+    while(colors.length<3) colors.push(tokens['--accent']||tokens['--bg']||tokens['--text']||'#888');
+    const label=String(descriptor.label||name).slice(0,40);
+    const entry={name:name.slice(0,40),value:key,label,colors,_extToken:tokens,_extension:true};
+
+    const existingIdx=_SKINS.findIndex(s=>(s.value||s.name).toLowerCase()===key);
+    if(existingIdx>=0&&_EXT_SKIN_KEYS.has(key)){
+      _SKINS[existingIdx]=entry;                           // idempotent update
+    }else if(existingIdx>=0){
+      return false;                                        // collides w/ a non-ext skin
+    }else{
+      _SKINS.push(entry);
+    }
+    _EXT_SKIN_KEYS.add(key);
+    _VALID_SKINS.add(key);
+    _renderExtensionSkinStyles();
+    // Refresh the picker if it's already built.
+    if(document.getElementById('skinPickerGrid')){
+      _buildSkinPicker((localStorage.getItem('hermes-skin')||'default').toLowerCase());
+    }
+    // If the user had previously selected this (now-available) skin, apply it.
+    if((localStorage.getItem('hermes-skin')||'').toLowerCase()===key){
+      _applySkin(key);
+    }
+    return true;
+  }catch(_){ return false; }
+}
+if(typeof window!=='undefined') window.registerHermesSkin=registerHermesSkin;
 
 function applyBotName(){
   // The saved assistant name applies to the default profile only.
@@ -1879,6 +2283,87 @@ function applyBotName(){
   const msg=$('msg');
   if(msg) msg.placeholder='Message '+name+'\u2026';
 }
+
+const _COMPOSER_CONTROL_TOGGLE_DEFS=[
+  {key:'hide_composer_attach',label:'Attach',labelKey:'composer_control_attach',selectors:['#btnAttach']},
+  {key:'hide_composer_saved_prompts',label:'Saved prompts',labelKey:'composer_control_saved_prompts',selectors:['#btnSavedPrompts']},
+  {key:'hide_composer_mic',label:'Mic',labelKey:'composer_control_mic',selectors:['#btnMic']},
+  {key:'hide_composer_profile',label:'Profile',labelKey:'composer_control_profile',selectors:['#profileChipWrap']},
+  {key:'hide_composer_workspace',label:'Workspace',labelKey:'composer_control_workspace',selectors:['.composer-ws-wrap','#composerMobileWorkspaceAction']},
+  {key:'hide_composer_model',label:'Model',labelKey:'composer_control_model',selectors:['.composer-model-wrap','#composerMobileModelAction']},
+  {key:'hide_composer_reasoning',label:'Reasoning',labelKey:'composer_control_reasoning',selectors:['#composerReasoningWrap','#composerMobileReasoningAction']},
+  {key:'hide_composer_context',label:'Context',labelKey:'composer_control_context',selectors:['#ctxIndicatorWrap','#composerMobileContextAction']},
+];
+window._COMPOSER_CONTROL_TOGGLE_DEFS=_COMPOSER_CONTROL_TOGGLE_DEFS;
+
+const _COMPOSER_SITUATIONAL_CONTROL_TOGGLE_DEFS=[
+  {key:'hide_composer_voice_mode',label:'Voice mode',labelKey:'composer_control_voice_mode',selectors:['#btnVoiceMode']},
+  {key:'hide_composer_yolo',label:'YOLO',labelKey:'composer_control_yolo',selectors:['#yoloPill']},
+  {key:'hide_composer_bg_badge',label:'Background badge',labelKey:'composer_control_bg_badge',selectors:['#bgBadge']},
+  {key:'hide_composer_mobile_config',label:'Mobile config',labelKey:'composer_control_mobile_config',selectors:['#composerMobileConfigBtn']},
+  {key:'hide_composer_quota_chip',label:'Quota chip',labelKey:'composer_control_quota_chip',selectors:['#providerQuotaChip','#composerMobileQuotaAction']},
+  {key:'hide_composer_toolsets',label:'Toolsets',labelKey:'composer_control_toolsets',selectors:['#composerToolsetsWrap']},
+  {key:'hide_composer_status',label:'Status',labelKey:'composer_control_status',selectors:['#composerStatus']},
+];
+window._COMPOSER_SITUATIONAL_CONTROL_TOGGLE_DEFS=_COMPOSER_SITUATIONAL_CONTROL_TOGGLE_DEFS;
+
+function _allComposerControlToggleDefs(){
+  return _COMPOSER_CONTROL_TOGGLE_DEFS.concat(_COMPOSER_SITUATIONAL_CONTROL_TOGGLE_DEFS);
+}
+
+function _composerControlVisibilityFromSettings(settings){
+  const next={};
+  for(const def of _allComposerControlToggleDefs()){
+    next[def.key]=!!(settings&&settings[def.key]);
+  }
+  return next;
+}
+window._composerControlVisibilityFromSettings=_composerControlVisibilityFromSettings;
+
+function _setComposerControlHidden(el, hidden){
+  if(!el) return;
+  el.classList.toggle('composer-control-hidden', !!hidden);
+  if(hidden) el.setAttribute('aria-hidden','true');
+  else el.removeAttribute('aria-hidden');
+}
+
+function _applyComposerFooterVisibilitySettings(){
+  const hidden=window._composerControlVisibility||{};
+  for(const def of _allComposerControlToggleDefs()){
+    const isHidden=!!hidden[def.key];
+    for(const selector of def.selectors){
+      document.querySelectorAll(selector).forEach(el=>_setComposerControlHidden(el,isHidden));
+    }
+  }
+
+  const hideMic=!!hidden.hide_composer_mic;
+  if(hideMic&&window._micActive&&typeof window._stopMic==='function'){
+    try{window._stopMic();}catch(_){ }
+  }
+
+  const hideSavedPrompts=!!hidden.hide_composer_saved_prompts;
+  const savedBtn=$('btnSavedPrompts');
+  const savedPopup=$('savedPromptsPopup');
+  if(hideSavedPrompts&&savedPopup){
+    savedPopup.style.display='none';
+    if(savedBtn) savedBtn.setAttribute('aria-expanded','false');
+  }
+
+  if(hidden.hide_composer_workspace&&typeof closeWsDropdown==='function') closeWsDropdown();
+  if(hidden.hide_composer_profile&&typeof closeProfileDropdown==='function') closeProfileDropdown();
+  if(hidden.hide_composer_model&&typeof closeModelDropdown==='function') closeModelDropdown();
+  if(hidden.hide_composer_reasoning&&typeof closeReasoningDropdown==='function') closeReasoningDropdown();
+  if(hidden.hide_composer_toolsets&&typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
+  if(hidden.hide_composer_mobile_config&&typeof closeMobileComposerConfig==='function') closeMobileComposerConfig();
+}
+window._applyComposerFooterVisibilitySettings=_applyComposerFooterVisibilitySettings;
+
+function _applyTitlebarProfileVisibility(){
+  const btn=$('titlebarProfileBtn');
+  if(!btn) return;
+  btn.style.display=window._showTitlebarProfile?'':'none';
+}
+window._applyTitlebarProfileVisibility=_applyTitlebarProfileVisibility;
 
 (async()=>{
   // Load send key preference
@@ -1932,6 +2417,9 @@ function applyBotName(){
     window._busyInputMode=(s.busy_input_mode||'queue');
     window._sessionEndlessScrollEnabled=!!s.session_endless_scroll;
     window._autoScrollFollow=s.auto_scroll_follow!==false;
+    window._composerControlVisibility=_composerControlVisibilityFromSettings(s);
+    window._showTitlebarProfile=!!s.show_titlebar_profile;
+    _applyTitlebarProfileVisibility();
     window._botName=s.bot_name||'Hermes';
     if(s.default_model_provider) window._activeProvider=s.default_model_provider;
     if(s.default_model){
@@ -1959,6 +2447,12 @@ function applyBotName(){
       }
     }
     window._sessionJumpButtonsEnabled=!!s.session_jump_buttons;
+    window._renderUserMarkdown=!!s.render_user_markdown;
+    // JSON/YAML structured code-block default view (#484): auto | on | off,
+    // plus the 'auto'-mode line threshold (sanitized int 1..1000, fallback 10).
+    window._structuredCodeDefaultView=['on','off','auto'].includes(s.structured_code_default_view)?s.structured_code_default_view:'auto';
+    const _sctLines=parseInt(s.structured_code_auto_tree_lines,10);
+    window._structuredCodeAutoTreeLines=(Number.isFinite(_sctLines)&&_sctLines>=1&&_sctLines<=1000)?_sctLines:10;
     // Reconcile appearance: prefer localStorage (what the user last saw) over
     // the server.  If they diverge (e.g. a previous autosave POST failed),
     // push the localStorage values back to the server so settings.json stays
@@ -1976,17 +2470,26 @@ function applyBotName(){
     const lsTheme=(localStorage.getItem('hermes-theme')||'').trim().toLowerCase();
     const lsSkin=(localStorage.getItem('hermes-skin')||'').trim().toLowerCase();
     const lsAppearance=_normalizeAppearance(lsTheme||null,lsSkin||null);
+    // An unknown non-default persisted skin is most likely an extension-provided
+    // skin (registerHermesSkin) whose extension script hasn't registered it yet
+    // at this point in boot. Preserve it verbatim instead of normalizing it away
+    // to 'default' — the extension's registerHermesSkin() will inject the CSS and
+    // re-apply it once it loads. Without this, the boot sync would clobber the
+    // saved choice before the extension runs.
+    const lsSkinIsPendingExt=!!lsSkin&&lsSkin!=='default'&&!_VALID_SKINS.has(lsSkin)&&!_LEGACY_THEME_MAP[lsSkin];
     const lsHasExplicitSkin=lsSkin&&lsSkin!=='default';
     const lsHasExplicitTheme=lsTheme&&['system','light','dark'].includes(lsTheme);
     const theme=lsHasExplicitTheme?lsAppearance.theme:srvAppearance.theme;
-    const skin=lsHasExplicitSkin?lsAppearance.skin:srvAppearance.skin;
+    const skin=lsHasExplicitSkin?(lsSkinIsPendingExt?lsSkin:lsAppearance.skin):srvAppearance.skin;
     localStorage.setItem('hermes-theme',theme);
     _applyTheme(theme);
     localStorage.setItem('hermes-skin',skin);
     _applySkin(skin);
     // Reconcile: if localStorage and server disagree, push localStorage
-    // values to the server so the next refresh won't revert.
-    if((lsHasExplicitTheme||lsHasExplicitSkin)&&(theme!==srvAppearance.theme||skin!==srvAppearance.skin)){
+    // values to the server so the next refresh won't revert. Skip the push for a
+    // still-pending extension skin (don't persist it server-side until it's a
+    // confirmed-registered skin — avoids writing a skin the server can't validate).
+    if((lsHasExplicitTheme||lsHasExplicitSkin)&&!lsSkinIsPendingExt&&(theme!==srvAppearance.theme||skin!==srvAppearance.skin)){
       try{
         api('/api/settings',{method:'POST',body:JSON.stringify({theme,skin})});
       }catch(_){}
@@ -2001,6 +2504,7 @@ function applyBotName(){
       setLocale(_lang);
       if(typeof applyLocaleToDOM==='function')applyLocaleToDOM();
     }
+    _applyComposerFooterVisibilitySettings();
     // TTS: apply enabled state on boot so buttons show/hide correctly (#499)
     if(typeof _applyTtsEnabled==='function') _applyTtsEnabled(localStorage.getItem('hermes-tts-enabled')==='true');
   }catch(e){
@@ -2027,11 +2531,14 @@ function applyBotName(){
     window._workspaceTodosTab=false;
     if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
     window._sessionJumpButtonsEnabled=false;
+    window._structuredCodeDefaultView='auto';
+    window._structuredCodeAutoTreeLines=10;
     window._sidebarDensity='compact';
     window._pinnedSessionsLimit=3;
     window._busyInputMode='queue';
     window._sessionEndlessScrollEnabled=false;
     window._autoScrollFollow=true;
+    window._composerControlVisibility=_composerControlVisibilityFromSettings(null);
     window._botName='Hermes';
     _bootSettings={check_for_updates:false};
     if(typeof setLocale==='function'){
@@ -2041,6 +2548,7 @@ function applyBotName(){
       setLocale(_lang);
       if(typeof applyLocaleToDOM==='function')applyLocaleToDOM();
     }
+    _applyComposerFooterVisibilitySettings();
     if(typeof _applyTtsEnabled==='function') _applyTtsEnabled(localStorage.getItem('hermes-tts-enabled')==='true');
   }
   // Non-blocking update check (fire-and-forget, once per tab session)
@@ -2050,16 +2558,115 @@ function applyBotName(){
     const _checkUrl='api/updates/check'+(_testUpdates?'?simulate=1':'');
     api(_checkUrl,{method:_testUpdates?'GET':'POST',body:_testUpdates?undefined:JSON.stringify({force:false})}).then(d=>{if(!_testUpdates)sessionStorage.setItem('hermes-update-checked','1');if((d.webui&&d.webui.behind>0)||(d.agent&&d.agent.behind>0))_showUpdateBanner(d);}).catch(()=>{});
   }
+  const _bootActiveProfileUnauthRedirectBudget=(()=>{
+    const markerKey='hermes-webui-active-profile-bootstrap-401';
+    let consumed=false;
+    const readAttempted=(storage=sessionStorage)=>{
+      try{
+        const attempted=storage&&storage.getItem?storage.getItem(markerKey)==='1':false;
+        if(attempted) consumed=true;
+        return attempted;
+      }catch(_){
+        return false;
+      }
+    };
+    const markAttempted=(storage=sessionStorage)=>{
+      consumed=true;
+      try{
+        if(storage&&storage.setItem) storage.setItem(markerKey,'1');
+      }catch(_){}
+    };
+    const clearAttempted=(storage=sessionStorage)=>{
+      try{
+        if(storage&&storage.removeItem) storage.removeItem(markerKey);
+      }catch(_){}
+    };
+    const spendOnFallback=(storage=sessionStorage)=>{
+      consumed=true;
+      clearAttempted(storage);
+    };
+    const spendOnRedirect=(storage=sessionStorage)=>{
+      if(consumed) return false;
+      markAttempted(storage);
+      return true;
+    };
+    const redirectToLogin=(nextUrl)=>{
+      window.location.href='login?next='+encodeURIComponent(nextUrl);
+    };
+    return {
+      readAttempted,
+      clearAttempted,
+      spendOnFallback,
+      spendOnRedirect,
+      redirectToLogin,
+      isConsumed:()=>consumed,
+    };
+  })();
+  async function _resolveActiveProfileBootstrapState({
+    loadActiveProfile = () => api('/api/profile/active', {redirect401: false}),
+    getNextUrl = () => window.location.pathname + window.location.search,
+    redirectToLogin = (nextUrl) => {
+      _bootActiveProfileUnauthRedirectBudget.redirectToLogin(nextUrl);
+    },
+    markerStorage = sessionStorage,
+  } = {}) {
+    const alreadyAttempted = _bootActiveProfileUnauthRedirectBudget.readAttempted(markerStorage);
+    try {
+      const p = await loadActiveProfile();
+      if (p && typeof p === 'object' && typeof p.name === 'string') {
+        _bootActiveProfileUnauthRedirectBudget.clearAttempted(markerStorage);
+        if (p.default_workspace) S._profileDefaultWorkspace = p.default_workspace;
+        return {status: 'resolved', profile: p.name || 'default', isDefault: !!p.is_default};
+      }
+      if (p === undefined && !alreadyAttempted) {
+        if (_bootActiveProfileUnauthRedirectBudget.spendOnRedirect(markerStorage)) {
+          redirectToLogin(getNextUrl());
+        }
+        return {status: 'recovery-redirect'};
+      }
+      if (p === undefined) _bootActiveProfileUnauthRedirectBudget.spendOnFallback(markerStorage);
+      else _bootActiveProfileUnauthRedirectBudget.clearAttempted(markerStorage);
+      return {status: 'fallback', profile: 'default', isDefault: true};
+    } catch (e) {
+      _bootActiveProfileUnauthRedirectBudget.clearAttempted(markerStorage);
+      if (!alreadyAttempted && e && e.status === 401) {
+        if (_bootActiveProfileUnauthRedirectBudget.spendOnRedirect(markerStorage)) {
+          redirectToLogin(getNextUrl());
+        }
+        return {status: 'recovery-redirect'};
+      }
+      if (e && e.status === 401) _bootActiveProfileUnauthRedirectBudget.spendOnFallback(markerStorage);
+      return {status: 'fallback', profile: 'default', isDefault: true};
+    }
+  }
+
   // Fetch active profile
-  try{const p=await api('/api/profile/active');S.activeProfile=p.name||'default';S.activeProfileIsDefault=!!p.is_default;}catch(e){S.activeProfile='default';S.activeProfileIsDefault=true;}
+  const activeProfileState = await _resolveActiveProfileBootstrapState();
+  if (activeProfileState.status === 'recovery-redirect') return;
+  S.activeProfile = activeProfileState.profile;
+  S.activeProfileIsDefault = activeProfileState.isDefault;
   applyBotName();
   // Update profile chip label immediately
   const profileLabel=$('profileChipLabel');
   if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
+  const titleLabel=$('titlebarProfileLabel');
+  if(titleLabel) titleLabel.textContent=S.activeProfile||'default';
   // Fetch available models without blocking session restore. The static HTML
   // options are enough for first paint; the dynamic provider list can settle
   // after the saved session is visible.
-  const _hydrateBootModelDropdown=()=>populateModelDropdown({preferProfileDefaultOnFreshBoot:true}).then(()=>{
+  const _redirectBootModelDropdownIfUnauth=(res)=>{
+    if(!res||res.status!==401) return false;
+    window._modelDropdownReady=null;
+    if(_bootActiveProfileUnauthRedirectBudget.isConsumed()) return true;
+    if(_bootActiveProfileUnauthRedirectBudget.spendOnRedirect(sessionStorage)){
+      _bootActiveProfileUnauthRedirectBudget.redirectToLogin(window.location.pathname+window.location.search);
+    }
+    return true;
+  };
+  const _hydrateModelDropdown=({redirectIfUnauth=null}={})=>populateModelDropdown({
+    preferProfileDefaultOnFreshBoot:true,
+    ...(redirectIfUnauth?{redirectIfUnauth}:{}),
+  }).then(()=>{
     const sessionModelState=S.session&&S.session.model
       ? {model:S.session.model,model_provider:S.session.model_provider||null}
       : null;
@@ -2097,15 +2704,23 @@ function applyBotName(){
     window._modelDropdownReady=null;
     throw e;
   });
+  const _startModelDropdown=()=>{
+    const ready=window._modelDropdownReady;
+    if(ready&&typeof ready.then==='function') return ready;
+    const next=_hydrateModelDropdown();
+    window._modelDropdownReady=next;
+    return next;
+  };
   const _startBootModelDropdown=()=>{
     const ready=window._modelDropdownReady;
     if(ready&&typeof ready.then==='function') return ready;
-    const next=_hydrateBootModelDropdown();
+    const next=_hydrateModelDropdown({redirectIfUnauth:_redirectBootModelDropdownIfUnauth});
     window._modelDropdownReady=next;
     return next;
   };
   window._modelDropdownReady=null;
-  window._ensureModelDropdownReady=_startBootModelDropdown;
+  window._startBootModelDropdown=_startBootModelDropdown;
+  window._ensureModelDropdownReady=_startModelDropdown;
   setTimeout(()=>{
     try{Promise.resolve(_startBootModelDropdown()).catch(()=>{});}catch(_){}
   },0);
@@ -2147,7 +2762,13 @@ function applyBotName(){
   const saved=urlSession||savedLocal;
   if(saved){
     try{
-      if(!urlSession&&savedLocal&&await _savedSessionShouldStaySidebarOnly(savedLocal)){
+      const savedSidebarOnlyState=(!urlSession&&savedLocal)
+        ? await _savedSessionSidebarOnlyState(savedLocal)
+        : null;
+      if(savedSidebarOnlyState&&savedSidebarOnlyState.sidebarOnly){
+        if(savedSidebarOnlyState.archived){
+          try{localStorage.removeItem('hermes-webui-session');}catch(_){}
+        }
         S.session=null; S.messages=[]; S.activeStreamId=null; S.busy=false;
         S._bootReady=true;
         syncTopbar();syncWorkspacePanelState();
@@ -2155,7 +2776,7 @@ function applyBotName(){
         await renderSessionList();if(typeof startGatewaySSE==='function')startGatewaySSE();
         return;
       }
-      await loadSession(saved);
+      await loadSession(saved, {preserveActiveInput:true});
       // Hard refresh starts from the static HTML model list. Hydrate the live
       // catalog after the saved session is known, then re-apply that session's
       // model before S._bootReady lets syncModelChip reveal the composer label.
@@ -2187,6 +2808,7 @@ function applyBotName(){
         const _ephPanelPref=localStorage.getItem('hermes-webui-workspace-panel-pref')==='open'
           || localStorage.getItem('hermes-webui-workspace-panel')==='open';
         if(_ephPanelPref&&!_isCompactWorkspaceViewport()) _workspacePanelMode='browse';
+        await _maybeBindFreshDefaultWorkspaceSession();
         syncTopbar();syncWorkspacePanelState();
         $('emptyState').style.display='';
         await renderSessionList();if(typeof startGatewaySSE==='function')startGatewaySSE();
@@ -2212,6 +2834,7 @@ function applyBotName(){
   const _freshPanelPref=localStorage.getItem('hermes-webui-workspace-panel-pref')==='open'
     || localStorage.getItem('hermes-webui-workspace-panel')==='open';
   if(_freshPanelPref&&!_isCompactWorkspaceViewport()) _workspacePanelMode='browse';
+  await _maybeBindFreshDefaultWorkspaceSession();
   syncWorkspacePanelState();
   $('emptyState').style.display='';
   await renderSessionList();

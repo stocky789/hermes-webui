@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -23,6 +24,7 @@ from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse
 
+from api.gateway_restart import restart_active_profile_gateway
 from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
 
 logger = logging.getLogger(__name__)
@@ -43,7 +45,19 @@ CACHE_TTL = 1800  # 30 minutes
 _GIT_DIAGNOSTIC_MAX_CHARS = 300
 _CREDENTIAL_IN_URL_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s'\"]+)@")
 _GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
-_QUERY_SECRET_RE = re.compile(r"([?&](?:access_token|token|password|auth|key)=)[^&\s'\"]+", re.IGNORECASE)
+_QUERY_SECRET_RE = re.compile(r"([?&](?:access_token|oauth_token|private_token|client_secret|app_secret|api[_-]?key|token|password|secret|auth|key)=)[^&\s'\"]+", re.IGNORECASE)
+_FETCH_NETWORK_FAILURE_SIGNATURES = (
+    'could not resolve host',
+    'failed to connect',
+    'network is unreachable',
+    'no route to host',
+    'connection timed out',
+    'timed out after',
+    'connection reset by peer',
+    'remote end hung up unexpectedly',
+    'tls connection was non-properly terminated',
+    'ssl certificate problem',
+)
 
 
 def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CHARS) -> str:
@@ -62,6 +76,17 @@ def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CH
     if len(sanitized) > limit:
         sanitized = sanitized[:limit].rstrip() + "…"
     return sanitized
+
+
+def _apply_fetch_failure_message(fetch_out: str, network_message: str) -> str:
+    """Return the apply-path fetch failure message for the given stderr."""
+    detail = _sanitize_git_diagnostic(fetch_out)
+    if not detail:
+        return network_message
+    detail_lower = detail.lower()
+    if any(signature in detail_lower for signature in _FETCH_NETWORK_FAILURE_SIGNATURES):
+        return network_message
+    return f'fetch failed: {detail}'
 
 
 def _restart_blocker_snapshot() -> dict:
@@ -163,9 +188,12 @@ def _run_git(args, cwd, timeout=10):
     On failure, returns stderr (or stdout as fallback) so callers can
     surface actionable git error messages instead of empty strings.
     """
+    git_executable = _resolve_git_executable()
+    if not git_executable:
+        return 'git executable not found', False
     try:
         r = subprocess.run(
-            ['git'] + args, cwd=str(cwd), capture_output=True,
+            [git_executable] + args, cwd=str(cwd), capture_output=True,
             text=True, timeout=timeout,
             encoding='utf-8', errors='replace',
         )
@@ -184,6 +212,15 @@ def _run_git(args, cwd, timeout=10):
         return 'git executable not found', False
     except OSError as exc:
         return f'git failed to start: {exc}', False
+
+
+def _resolve_git_executable():
+    git_executable = shutil.which('git')
+    if git_executable:
+        return git_executable
+    if sys.platform == 'darwin' and os.path.exists('/usr/bin/git'):
+        return '/usr/bin/git'
+    return None
 
 
 def _dirty_suffix(path: Path, timeout=1) -> str:
@@ -1174,12 +1211,33 @@ def _schedule_restart(delay: float = 2.0) -> None:
                         args = sys.argv
                     else:
                         args = [sys.executable] + sys.argv
-                    # Start new process detached, redirect all stdio to
-                    # avoid broken-pipe errors when the parent exits.
+                    # Prefer pythonw.exe over python.exe so the restarted
+                    # server does not create a visible console window.
+                    # sys.executable may point at python.exe (console
+                    # subsystem); substitute pythonw.exe if it exists
+                    # next to python.exe.
+                    _exe = sys.executable
+                    if _exe.lower().endswith('python.exe'):
+                        _w_exe = _exe[:-4] + 'w.exe'  # python.exe -> pythonw.exe
+                        if os.path.isfile(_w_exe):
+                            if getattr(sys, "frozen", False):
+                                args = sys.argv
+                            else:
+                                args = [_w_exe] + sys.argv
+                    # Start new process fully detached with NO console
+                    # window.  DETACHED_PROCESS alone is not sufficient
+                    # on modern Windows — without CREATE_NO_WINDOW a
+                    # python.exe (console-subsystem) child still flashes
+                    # an empty terminal window, which the user then
+                    # manually kills (taking the WebUI with it).
                     subprocess.Popen(
                         args,
                         cwd=os.getcwd(),
-                        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                        creationflags=(
+                            subprocess.DETACHED_PROCESS
+                            | subprocess.CREATE_NEW_PROCESS_GROUP
+                            | subprocess.CREATE_NO_WINDOW
+                        ),
                         close_fds=True,
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
@@ -1199,6 +1257,33 @@ def _schedule_restart(delay: float = 2.0) -> None:
                 os._exit(0)
 
     threading.Thread(target=_do, daemon=True).start()
+
+
+def _ensure_gateway_restart_for_agent_update() -> tuple[bool, dict]:
+    """Run the active-profile gateway restart when agent checkout changed.
+
+    Returns:
+        (ok, restart_payload) where:
+        - ok is False when restart did not complete and callers must abort success.
+        - restart_payload contains helper status fields for response shaping.
+    """
+    restart_result = restart_active_profile_gateway()
+    status = str(restart_result.get("status") or "")
+    if status in {"completed", "in_progress"}:
+        return True, restart_result
+    return False, restart_result
+
+
+def _agent_gateway_restart_failure_message(target: str, restart_result: dict) -> str:
+    if restart_result.get("message"):
+        return (
+            f'{target} updated, but gateway restart did not complete: '
+            f'{restart_result["message"]}. Run `hermes gateway restart` manually.'
+        )
+    return (
+        f'{target} updated, but gateway restart did not complete. '
+        'Run `hermes gateway restart` manually.'
+    )
 
 
 def apply_force_update(target: str) -> dict:
@@ -1233,17 +1318,38 @@ def apply_force_update(target: str) -> dict:
         # --force so a remote re-tag (e.g. squash-merge that re-points an
         # existing release tag) doesn't jam the apply path with "would clobber
         # existing tag". See #2756.
-        _, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
+        fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
         if not fetch_ok:
             return {
                 'ok': False,
-                'message': 'Could not reach the remote repository. Check your connection.',
+                'message': _apply_fetch_failure_message(
+                    fetch_out,
+                    'Could not reach the remote repository. Check your connection.',
+                ),
             }
 
         compare_ref = _select_apply_compare_ref(path)
 
-        # Discard local modifications then reset to remote HEAD
+        # Discard local modifications and untracked colliders before resetting.
+        # Do not use -x: ignored build/cache artifacts should survive force update.
         _run_git(['checkout', '.'], path)
+        # Best-effort clean: a `git clean -fd` failure is NOT fatal. The
+        # following `reset --hard` overwrites any tracked-file collisions
+        # regardless, and residual untracked files that git can't delete are
+        # harmless. In particular, on Windows a file named after a reserved
+        # device name (nul, con, prn, aux, com1-9, lpt1-9) — which can appear
+        # in the working tree when a shell command redirects to `> nul` under
+        # Git Bash — cannot be removed via the normal Win32 path that git uses,
+        # so `clean` exits non-zero. Aborting the whole force update over that
+        # left users stuck (issue #4914). Log the stderr for diagnostics and
+        # proceed to the reset, which is what actually applies the update.
+        clean_out, clean_ok = _run_git(['clean', '-fd'], path)
+        if not clean_ok:
+            logger.warning(
+                'force_apply_update: `git clean -fd` failed (non-fatal, '
+                'continuing to reset --hard): %s',
+                clean_out,
+            )
         _, ok = _run_git(['reset', '--hard', compare_ref], path)
         if not ok:
             return {'ok': False, 'message': f'Force reset to {compare_ref} failed'}
@@ -1251,14 +1357,27 @@ def apply_force_update(target: str) -> dict:
         with _cache_lock:
             _update_cache['checked_at'] = 0
 
+        if target == 'agent':
+            gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
+            if not gateway_ok:
+                return {
+                    'ok': False,
+                    'message': _agent_gateway_restart_failure_message(target, gateway_result),
+                    'target': target,
+                    'gateway_restart': gateway_result.get('status'),
+                }
+
         _schedule_restart()
 
-        return {
+        response = {
             'ok': True,
             'message': f'{target} force-updated to {compare_ref}',
             'target': target,
             'restart_scheduled': True,
         }
+        if target == 'agent':
+            response['gateway_restart'] = gateway_result.get('status')
+        return response
     finally:
         _apply_lock.release()
 
@@ -1291,13 +1410,13 @@ def _apply_update_inner(target):
 
     # Fetch before attempting pull, so the remote ref is current.
     # --force so a remote re-tag doesn't block the update path (see #2756).
-    _, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
+    fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
     if not fetch_ok:
         return {
             'ok': False,
-            'message': (
-                'Could not reach the remote repository. '
-                'Check your internet connection and try again.'
+            'message': _apply_fetch_failure_message(
+                fetch_out,
+                'Could not reach the remote repository. Check your internet connection and try again.',
             ),
         }
 
@@ -1343,6 +1462,9 @@ def _apply_update_inner(target):
     if not pull_ok:
         pull_lower = pull_out.lower()
         detail = pull_out.strip()[:300] if pull_out.strip() else '(no output from git)'
+        untracked_collision = (
+            'untracked working tree files would be overwritten' in pull_lower
+        )
         diverged_failure = (
             'not possible to fast-forward' in pull_lower or 'diverged' in pull_lower
         )
@@ -1436,7 +1558,10 @@ def _apply_update_inner(target):
         message_parts = [f'Pull failed: {detail}']
         if restored_note:
             message_parts.append(restored_note)
-        return {'ok': False, 'message': ' '.join(message_parts)}
+        response = {'ok': False, 'message': ' '.join(message_parts)}
+        if untracked_collision:
+            response['conflict'] = True
+        return response
 
     # Re-apply stash if we stashed.
     stash_drop_failed = False
@@ -1461,8 +1586,18 @@ def _apply_update_inner(target):
                 }
             with _cache_lock:
                 _update_cache['checked_at'] = 0
+
+            if target == 'agent':
+                gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
+                if not gateway_ok:
+                    return {
+                        'ok': False,
+                        'message': _agent_gateway_restart_failure_message(target, gateway_result),
+                        'target': target,
+                        'gateway_restart': gateway_result.get('status'),
+                    }
             _schedule_restart()
-            return {
+            response = {
                 'ok': True,
                 'message': (
                     f'{target} updated to the latest version. Your local '
@@ -1476,10 +1611,23 @@ def _apply_update_inner(target):
                 'restart_scheduled': True,
                 'stash_conflict': True,
             }
+            if target == 'agent':
+                response['gateway_restart'] = gateway_result.get('status')
+            return response
 
     # Invalidate cache
     with _cache_lock:
         _update_cache['checked_at'] = 0
+
+    if target == 'agent':
+        gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
+        if not gateway_ok:
+            return {
+                'ok': False,
+                'message': _agent_gateway_restart_failure_message(target, gateway_result),
+                'target': target,
+                'gateway_restart': gateway_result.get('status'),
+            }
 
     # Schedule a self-restart so the updated code is loaded fresh.  A plain
     # git pull leaves stale Python modules in sys.modules — agent imports that
@@ -1500,9 +1648,12 @@ def _apply_update_inner(target):
             'entry may still be present because git stash drop failed.'
         )
 
-    return {
+    response = {
         'ok': True,
         'message': message,
         'target': target,
         'restart_scheduled': True,
     }
+    if target == 'agent':
+        response['gateway_restart'] = gateway_result.get('status')
+    return response

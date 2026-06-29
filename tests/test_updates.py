@@ -92,6 +92,152 @@ def test_check_repo_fetch_failure_without_tags_is_not_up_to_date(tmp_path):
     assert info['error'] == 'fetch failed: network unavailable'
 
 
+def test_apply_force_update_fetch_failure_reports_local_diagnostic(tmp_path):
+    """Force update should surface local git fetch failures."""
+    (tmp_path / '.git').mkdir()
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['fetch', 'origin', '--quiet', '--tags', '--force']:
+            return "fatal: cannot lock ref 'refs/tags/v0.51.106': is at 123 but expected 456", False
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    with patch.object(updates, '_run_git', side_effect=fake_git), \
+         patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}):
+        result = updates.apply_force_update('webui')
+
+    assert result == {
+        'ok': False,
+        'message': "fetch failed: fatal: cannot lock ref 'refs/tags/v0.51.106': is at 123 but expected 456",
+    }
+
+
+def test_apply_update_fetch_failure_reports_local_diagnostic(tmp_path):
+    """Update should surface local git fetch failures."""
+    (tmp_path / '.git').mkdir()
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['fetch', 'origin', '--quiet', '--tags', '--force']:
+            return "fatal: cannot lock ref 'refs/tags/v0.51.106': is at 123 but expected 456", False
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    with patch.object(updates, '_run_git', side_effect=fake_git), \
+         patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}):
+        result = updates.apply_update('webui')
+
+    assert result == {
+        'ok': False,
+        'message': "fetch failed: fatal: cannot lock ref 'refs/tags/v0.51.106': is at 123 but expected 456",
+    }
+
+
+def test_apply_fetch_failure_keeps_connectivity_guidance_for_network_errors(tmp_path):
+    """Known network fetch failures should keep the connectivity guidance."""
+    (tmp_path / '.git').mkdir()
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['fetch', 'origin', '--quiet', '--tags', '--force']:
+            return 'fatal: unable to access https://github.com/nesquena/hermes-webui.git/: Could not resolve host: github.com', False
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    cases = [
+        (updates.apply_force_update, 'Could not reach the remote repository. Check your connection.'),
+        (updates.apply_update, 'Could not reach the remote repository. Check your internet connection and try again.'),
+    ]
+
+    for apply_fn, expected_message in cases:
+        with patch.object(updates, '_run_git', side_effect=fake_git), \
+             patch.object(updates, 'REPO_ROOT', tmp_path), \
+             patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}):
+            result = apply_fn('webui')
+
+        assert result == {'ok': False, 'message': expected_message}
+
+
+def test_apply_fetch_failure_keeps_connectivity_guidance_for_timeout_shape(tmp_path):
+    """The _run_git timeout string should stay on the network-guidance branch."""
+    (tmp_path / '.git').mkdir()
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['fetch', 'origin', '--quiet', '--tags', '--force']:
+            return 'git fetch origin --quiet --tags --force timed out after 15s', False
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    cases = [
+        (updates.apply_force_update, 'Could not reach the remote repository. Check your connection.'),
+        (updates.apply_update, 'Could not reach the remote repository. Check your internet connection and try again.'),
+    ]
+
+    for apply_fn, expected_message in cases:
+        with patch.object(updates, '_run_git', side_effect=fake_git), \
+             patch.object(updates, 'REPO_ROOT', tmp_path), \
+             patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}):
+            result = apply_fn('webui')
+
+        assert result == {'ok': False, 'message': expected_message}
+
+
+def test_apply_force_update_fetch_failure_redacts_credentials(tmp_path):
+    """Apply-path fetch diagnostics must redact credential-bearing URLs."""
+    (tmp_path / '.git').mkdir()
+    secret = 'ghp_' + 'A' * 36
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['fetch', 'origin', '--quiet', '--tags', '--force']:
+            return (
+                "fatal: cannot lock ref 'refs/tags/v0.51.106': is at 123 but expected 456 "
+                f"from https://ash:{secret}@github.com/private/repo.git/"
+            ), False
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    with patch.object(updates, '_run_git', side_effect=fake_git), \
+         patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}):
+        result = updates.apply_force_update('webui')
+
+    assert secret not in result['message']
+    assert 'ash:' not in result['message']
+    assert result['message'] == (
+        "fetch failed: fatal: cannot lock ref 'refs/tags/v0.51.106': is at 123 but expected 456 "
+        'from https://<redacted>@github.com/private/repo.git/'
+    )
+
+
+def test_apply_force_update_fetch_failure_redacts_query_secrets(tmp_path):
+    """Apply-path diagnostics must redact secret-bearing query params, not just
+    credential-in-URL and GitHub tokens. The apply path now surfaces sanitized
+    non-network stderr, so query secrets like client_secret/private_token/
+    oauth_token/api_key must be redacted before reaching the user."""
+    (tmp_path / '.git').mkdir()
+    secrets = {
+        'client_secret': 'CS_s3cr3t',
+        'private_token': 'PT_s3cr3t',
+        'oauth_token': 'OA_s3cr3t',
+        'api_key': 'AK_s3cr3t',
+    }
+    remote = (
+        'https://gitlab.example.com/group/repo.git/?'
+        + '&'.join(f'{k}={v}' for k, v in secrets.items())
+    )
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['fetch', 'origin', '--quiet', '--tags', '--force']:
+            return (f"fatal: repository not found at {remote}"), False
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    with patch.object(updates, '_run_git', side_effect=fake_git), \
+         patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}):
+        result = updates.apply_force_update('webui')
+
+    for name, value in secrets.items():
+        assert value not in result['message'], f'{name} value leaked: {result["message"]!r}'
+    # The fetch failure (non-network) is still surfaced as a diagnostic.
+    assert result['message'].startswith('fetch failed:')
+    assert '<redacted>' in result['message']
+
+
 def test_check_for_updates_can_skip_agent_repo(tmp_path):
     """Ignoring Agent updates should still check WebUI but avoid touching Agent git."""
     webui_path = tmp_path / 'webui'
@@ -142,7 +288,8 @@ def test_update_cache_is_scoped_by_agent_inclusion(tmp_path):
 
 def test_run_git_returns_stderr_on_failure(tmp_path):
     """When a git command fails, _run_git should return stderr (not empty string)."""
-    with patch('subprocess.run') as mock_run:
+    with patch.object(updates.shutil, 'which', return_value='C:/Tools/git.exe'), \
+         patch('subprocess.run') as mock_run:
         mock_run.return_value = MagicMock(
             returncode=1,
             stdout='',
@@ -156,7 +303,8 @@ def test_run_git_returns_stderr_on_failure(tmp_path):
 
 def test_run_git_returns_stdout_when_no_stderr(tmp_path):
     """If stderr is empty on failure, fall back to stdout."""
-    with patch('subprocess.run') as mock_run:
+    with patch.object(updates.shutil, 'which', return_value='C:/Tools/git.exe'), \
+         patch('subprocess.run') as mock_run:
         mock_run.return_value = MagicMock(
             returncode=128,
             stdout='Already up to date.',
@@ -170,7 +318,8 @@ def test_run_git_returns_stdout_when_no_stderr(tmp_path):
 
 def test_run_git_returns_exit_code_when_no_output(tmp_path):
     """If both stdout and stderr are empty, report the exit code."""
-    with patch('subprocess.run') as mock_run:
+    with patch.object(updates.shutil, 'which', return_value='C:/Tools/git.exe'), \
+         patch('subprocess.run') as mock_run:
         mock_run.return_value = MagicMock(
             returncode=1,
             stdout='',
@@ -184,7 +333,8 @@ def test_run_git_returns_exit_code_when_no_output(tmp_path):
 
 def test_run_git_uses_utf8_replacement_for_windows_console_output(tmp_path):
     """Git output can contain Unicode even when Windows' active code page cannot."""
-    with patch('subprocess.run') as mock_run:
+    with patch.object(updates.shutil, 'which', return_value='C:/Tools/git.exe'), \
+         patch('subprocess.run') as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stdout='v0.51.184\n', stderr=None)
 
         out, ok = updates._run_git(['describe', '--tags'], tmp_path)
@@ -198,7 +348,8 @@ def test_run_git_uses_utf8_replacement_for_windows_console_output(tmp_path):
 
 def test_run_git_handles_missing_stdout_after_decode_thread_failure(tmp_path):
     """A subprocess reader failure must not make version detection crash on import."""
-    with patch('subprocess.run') as mock_run:
+    with patch.object(updates.shutil, 'which', return_value='C:/Tools/git.exe'), \
+         patch('subprocess.run') as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stdout=None, stderr=None)
 
         out, ok = updates._run_git(['diff', '--binary', 'HEAD', '--'], tmp_path)

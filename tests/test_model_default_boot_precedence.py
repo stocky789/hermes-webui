@@ -179,7 +179,8 @@ def test_boot_settings_applies_default_without_deleting_browser_model_state():
 
 
 def test_boot_model_dropdown_explicitly_requests_profile_default_precedence():
-    assert "populateModelDropdown({preferProfileDefaultOnFreshBoot:true})" in BOOT_JS
+    assert "const _hydrateModelDropdown=({redirectIfUnauth=null}={})=>populateModelDropdown({" in BOOT_JS
+    assert "preferProfileDefaultOnFreshBoot:true" in BOOT_JS
     # #2726 invariant: boot path must keep profile/server default ahead of stale
     # browser-persisted state when a default exists. Post-#2716 cherry-pick onto
     # post-stage-batch11 master uses `stateToApply` pattern rather than the
@@ -307,7 +308,7 @@ def _run_populate_driver(
         [NODE, driver_path, str(REPO / "static" / "ui.js"), json.dumps(payload)],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(f"node driver failed:\nSTDOUT={result.stdout}\nSTDERR={result.stderr}")

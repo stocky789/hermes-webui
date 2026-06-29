@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -157,6 +158,7 @@ class QuietHTTPServer(ThreadingHTTPServer):
         server_address = args[0] if args else kwargs.get('server_address', None)
         if server_address and ':' in server_address[0]:
             self.address_family = socket.AF_INET6
+        self.ssl_context: object | None = None
         super().__init__(*args, **kwargs)
         self.accept_loop_requests_total = 0
         self.accept_loop_last_request_at = 0.0
@@ -185,6 +187,31 @@ class QuietHTTPServer(ThreadingHTTPServer):
         else:
             super().server_bind()
 
+    def get_request(self):
+        """Accept a connection without letting TLS handshakes block the loop.
+
+        ``ssl.wrap_socket(listening_socket)`` performs the TLS handshake inside
+        ``accept()``. A browser/network probe that opens TCP but never sends a
+        ClientHello can then freeze the one accept loop, leaving the process
+        alive but unable to serve any later clients. Accept the raw socket here
+        and wrap the accepted connection with ``do_handshake_on_connect=False``
+        so any slow/broken handshake times out in its own request thread.
+        """
+        request, client_address = self.socket.accept()
+        ssl_context = getattr(self, "ssl_context", None)
+        if ssl_context is None:
+            return request, client_address
+        try:
+            tls_request = ssl_context.wrap_socket(
+                request,
+                server_side=True,
+                do_handshake_on_connect=False,
+            )
+        except Exception:
+            request.close()
+            raise
+        return tls_request, client_address
+
     def _handle_request_noblock(self):
         """Record accept-loop progress before dispatching a request handler.
 
@@ -207,7 +234,10 @@ class QuietHTTPServer(ThreadingHTTPServer):
         exc_type, exc_value, _ = sys.exc_info()
         
         # Silently ignore common connection errors caused by client disconnects
-        if exc_type in (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, TimeoutError):
+        if exc_type in (
+            ConnectionResetError, BrokenPipeError, ConnectionAbortedError,
+            TimeoutError, ssl.SSLError, ssl.SSLEOFError,
+        ):
             return
         
         # Also handle socket errors that indicate client disconnect
@@ -262,12 +292,13 @@ class Handler(BaseHTTPRequestHandler):
     _CSP_REPORT_TO = '{"group":"csp-endpoint","max_age":10886400,"endpoints":[{"url":"/api/csp-report"}]}'
 
     @classmethod
-    def csp_report_only_policy(cls, extra_connect_src=None) -> str:
-        return _build_csp_report_only_policy(extra_connect_src)
+    def csp_report_only_policy(cls, extra_connect_src=None, extra_frame_src=None) -> str:
+        return _build_csp_report_only_policy(extra_connect_src, extra_frame_src)
 
     def end_headers(self) -> None:
         extra_connect_src = getattr(self, "_csp_extra_connect_src", None)
-        self.send_header("Content-Security-Policy-Report-Only", self.csp_report_only_policy(extra_connect_src))
+        extra_frame_src = getattr(self, "_csp_extra_frame_src", None)
+        self.send_header("Content-Security-Policy-Report-Only", self.csp_report_only_policy(extra_connect_src, extra_frame_src))
         self.send_header("Report-To", self._CSP_REPORT_TO)
         super().end_headers()
 
@@ -560,15 +591,15 @@ def main() -> None:
     from api.auth import is_auth_enabled
     if HOST not in ('127.0.0.1', '::1', 'localhost') and not is_auth_enabled():
         print(f'[!!] WARNING: Binding to {HOST} with NO PASSWORD SET.', flush=True)
-        print(f'     Anyone on the network can access your filesystem and agent.', flush=True)
-        print(f'     Set a password via Settings or HERMES_WEBUI_PASSWORD env var.', flush=True)
-        print(f'     To suppress: bind to 127.0.0.1 or set a password.', flush=True)
+        print('     Anyone on the network can access your filesystem and agent.', flush=True)
+        print('     Set a password via Settings or HERMES_WEBUI_PASSWORD env var.', flush=True)
+        print('     To suppress: bind to 127.0.0.1 or set a password.', flush=True)
         if within_container:
-            print(f'     Note: You are running within a container, must bind to 0.0.0.0 (IPv4) or :: (IPv6) to publish the port.', flush=True)
+            print('     Note: You are running within a container, must bind to 0.0.0.0 (IPv4) or :: (IPv6) to publish the port.', flush=True)
     elif not is_auth_enabled():
-        print(f'  [tip] No password set. Any process on this machine can read sessions', flush=True)
-        print(f'        and memory via the local API. Set HERMES_WEBUI_PASSWORD to', flush=True)
-        print(f'        enable authentication.', flush=True)
+        print('  [tip] No password set. Any process on this machine can read sessions', flush=True)
+        print('        and memory via the local API. Set HERMES_WEBUI_PASSWORD to', flush=True)
+        print('        enable authentication.', flush=True)
 
     ok, missing, errors = verify_hermes_imports()
     if not ok and _HERMES_FOUND:
@@ -648,7 +679,7 @@ def main() -> None:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx.load_cert_chain(TLS_CERT, TLS_KEY)
-            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+            httpd.ssl_context = ctx
             print(f'  TLS enabled: cert={TLS_CERT}, key={TLS_KEY}', flush=True)
         except Exception as e:
             print(f'[!!] WARNING: TLS setup failed ({e}), falling back to HTTP', flush=True)
